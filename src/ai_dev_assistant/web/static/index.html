@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<style data-omelette-injected>html,body{background:transparent}</style><script data-omelette-injected>(()=>{var j=["https://claude.ai","https://preview.claude.ai","https://0e0d40d9-04d6-4aaf-a342-1b973f376e90.claudeusercontent.com"];var x=true;var S=30000;var f=3000;document.addEventListener("DOMContentLoaded",()=>{const H=window.Babel;const G="om-src-id";if(H&&H.registerPlugin&&!(H.availablePlugins&&H.availablePlugins[G])){H.registerPlugin(G,({types:Y})=>({visitor:{JSXOpeningElement(U,Q){const J=U.node;if(J.name&&J.name.type==="JSXMemberExpression")return;for(let V=0;V<J.attributes.length;V++){const L=J.attributes[V];if(L.type==="JSXAttribute"&&L.name&&L.name.name==="data-om-id")return}const W=Q.file&&Q.file.opts&&Q.file.opts.filename||"?";const Z=J.loc&&J.loc.start;const z=`jsx:${W}:${J.start??0}:${Z?Z.line:0}:${Z?Z.column+1:0}`;J.attributes.push(Y.jsxAttribute(Y.jsxIdentifier("data-om-id"),Y.stringLiteral(z)))}}}))}const k="om-text-extract";let A=false;if(x&&H&&H.registerPlugin&&!(H.availablePlugins&&H.availablePlugins[k])){const Y=window.React;if(Y&&Y.useSyncExternalStore&&Y.createElement){A=true;const U={};const Q=new Set;let J=0;window.__omTextO=U;window.__omTextSet=(z)=>{for(const V in z){const L=z[V];if(L==null)delete U[V];else U[V]=L}J++;Q.forEach((V)=>V())};const W=(z)=>{Q.add(z);return()=>Q.delete(z)};const Z=()=>J;window.__OmT=function z(V){Y.useSyncExternalStore(W,Z,Z);return Y.createElement("span",{"data-om-text":V.i,className:"__om-t"},V.i in U?U[V.i]:V.children)};H.registerPlugin(k,({types:z})=>{const V={style:1,script:1,noscript:1,textarea:1,title:1,option:1,text:1,tspan:1,textPath:1};const L={placeholder:1,alt:1,title:1,label:1,"aria-label":1,"aria-description":1,"aria-placeholder":1};const _=($,C)=>z.logicalExpression("??",z.memberExpression(z.logicalExpression("||",z.memberExpression(z.identifier("window"),z.identifier("__omTextO")),z.objectExpression([])),z.stringLiteral($),true),C);const E=($)=>$.file&&$.file.opts&&$.file.opts.filename||"?";const B=($)=>$.file&&$.file.code||"";const b=($,C)=>{const X=(F)=>F&&F.start!=null&&F.end!=null&&(F.type==="StringLiteral"||F.type==="TemplateLiteral"&&F.expressions.length===0)?[F.start,F.end]:null;const N=X(C);if(N)return N;if(C&&C.type==="Identifier"){const F=$.scope.getBinding(C.name);if(F&&F.constant&&F.path.node.type==="VariableDeclarator"){return X(F.path.node.init)}}return null};const M=($,C,X)=>{const N=$.node;let F=false;const w=(K,q)=>{F=true;return z.jsxElement(z.jsxOpeningElement(z.jsxIdentifier("__OmT"),[z.jsxAttribute(z.jsxIdentifier("i"),z.stringLiteral(K))],false),z.jsxClosingElement(z.jsxIdentifier("__OmT")),[q],false)};const D=N.children.map((K)=>{if(K.type==="JSXText"){if(K.start==null||K.end==null)return K;const q=X.slice(K.start,K.end);const R=q.length-q.trimStart().length;const m=q.length-q.trimEnd().length;if(R+m>=q.length)return K;return w(`txt:${C}:${K.start+R}:${K.end-m}`,K)}if(K.type==="JSXExpressionContainer"){const q=b($,K.expression);if(q)return w(`str:${C}:${q[0]}:${q[1]}`,K)}return K});if(F)N.children=D};return{visitor:{JSXOpeningElement($,C){const X=$.node;const N=E(C);const F={};for(let w=0;w<X.attributes.length;w++){const D=X.attributes[w];if(D.type!=="JSXAttribute"||!D.name)continue;const K=D.name.name;if(!L[K])continue;if(!D.value||D.value.type!=="StringLiteral")continue;if(D.value.start==null||D.value.end==null)continue;const q=`txt:${N}:${D.value.start}:${D.value.end}`;F[K]=q;D.value=z.jsxExpressionContainer(_(q,z.stringLiteral(D.value.value)))}if(Object.keys(F).length){X.attributes.push(z.jsxAttribute(z.jsxIdentifier("data-om-text-attrs"),z.stringLiteral(JSON.stringify(F))))}},JSXElement($,C){const X=$.node.openingElement;const N=X&&X.name&&X.name.name;if(N==="__OmT")return;if(typeof N==="string"&&V[N])return;M($,E(C),B(C))},JSXFragment($,C){M($,E(C),B(C))}}}})}}const u=A?["transform-react-jsx-source",G,k]:["transform-react-jsx-source",G];document.querySelectorAll('script[type="text/babel"],script[type="text/jsx"]').forEach((Y,U)=>{const Q=Y.getAttribute("data-plugins")||"";const J=u.filter((W)=>Q.indexOf(W)<0);if(J.length){Y.setAttribute("data-plugins",Q?`${Q},${J.join(",")}`:J.join(","))}if(!Y.hasAttribute("data-filename")){Y.setAttribute("data-filename",Y.getAttribute("src")||`inline-${U}`)}})});var y=window.parent;if(y&&y!==window){const H=(Q,J)=>{try{y.postMessage({__omelette_log:true,type:Q,data:J},"*")}catch{}};["log","warn","error"].forEach((Q)=>{const J=console[Q];console[Q]=(...W)=>{const Z=W.map((z)=>{try{return typeof z==="object"?JSON.stringify(z):String(z)}catch{try{return String(z)}catch{return"[unstringifiable]"}}}).join(" ");H(Q,Z);J.apply(console,W)}});window.addEventListener("error",(Q)=>{const J=Q.target;if(J&&J!==window&&J.tagName){const W=J.src||J.href||"";H("resource_error",`${J.tagName} failed to load: ${W}`)}else{H("error",`${Q.message||"Unknown error"} at ${Q.filename||"?"}:${Q.lineno||0}:${Q.colno||0}`)}},true);window.addEventListener("unhandledrejection",(Q)=>{const J=Q.reason;const W=J instanceof Error?`${J.message} ${J.stack}`:String(J);H("error",`Unhandled rejection: ${W}`)});const G=()=>{try{y.postMessage({type:"omelette:height",height:document.documentElement.scrollHeight},"*")}catch{}};if(document.readyState==="complete")G();else window.addEventListener("load",G);if(window.ResizeObserver)new ResizeObserver(G).observe(document.documentElement);const k={};let A=0;window.claude={complete(Q){return new Promise((J,W)=>{if(!j.length){W(new Error("claude.complete: no parent origin"));return}const Z=`c${++A}`;const z=()=>setTimeout(()=>{delete k[Z];W(new Error(`claude.complete: no data for ${S/1000}s`))},S);const V=z();k[Z]={resolve:J,reject:W,text:"",t:V,arm:z};try{for(const L of j){y.postMessage({__om_api:true,id:Z,body:Q},L)}}catch(L){clearTimeout(V);delete k[Z];W(L)}})}};const u={};let Y=0;window.omelette={writeFile:(Q,J)=>new Promise((W,Z)=>{if(!j.length){W();return}const z=`f${++Y}`;const V=setTimeout(()=>{delete u[z];W()},f);u[z]={resolve:W,reject:Z,t:V};try{for(const L of j){y.postMessage({__om_file:true,id:z,op:"write",path:Q,content:J},L)}}catch{clearTimeout(V);delete u[z];W()}})};const U=(Q)=>{try{return JSON.stringify(Q)}catch{return JSON.stringify(String(Q))}};window.addEventListener("message",(Q)=>{if(j.indexOf(Q.origin)<0)return;if(Q.source!==y)return;const J=Q.data;if(!J)return;if(J.type==="omelette-preview-refresh"){if(typeof J.token!=="string"||!/^[0-9a-f.-]+(\.(rc|pr-[0-9]+))?(\.[0-9]+\.[0-9a-f]{16})?$/.test(J.token))return;const z=Math.max(1,Math.floor((J.expiresAt||0)-Date.now()/1000));document.cookie="__Host-omelette-preview="+J.token+"; Path=/; Secure; SameSite=None; Partitioned; Max-Age="+z;return}if(J.__om_file_r){const z=u[J.id];if(!z)return;clearTimeout(z.t);delete u[J.id];if(J.ok)z.resolve();else z.reject(new Error(J.error||"write failed"));return}if(J.__om_api_r){const z=k[J.id];if(!z)return;if(J.error!=null){clearTimeout(z.t);delete k[J.id];z.reject(new Error(J.error));return}if(J.chunk!=null){clearTimeout(z.t);z.t=z.arm();z.text+=J.chunk;return}if(J.done){clearTimeout(z.t);delete k[J.id];z.resolve(J.text!=null?J.text:z.text);return}return}if(!J.__om_eval)return;const W=J;const Z=(z)=>{Q.source.postMessage({...z,__om_eval_r:1,id:W.id},Q.origin)};try{const z=(0,eval)(W.code);if(z&&typeof z.then==="function"){z.then((V)=>Z({ok:1,v:U(V)}),(V)=>Z({ok:0,e:String(V)}))}else{Z({ok:1,v:U(z)})}}catch(z){Z({ok:0,e:String(z)})}})}})();
+</script>
+
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Dev Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script>
+    /* set theme before first paint to avoid flash */
+    (function () {
+      try {
+        var pref = localStorage.getItem('ada-theme') || 'system';
+        var dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.setAttribute('data-theme', pref === 'system' ? (dark ? 'dark' : 'light') : pref);
+        document.documentElement.setAttribute('data-theme-pref', pref);
+      } catch (e) {}
+    })();
+  </script>
+</head>
+<body>
+  <div class="app">
+
+    <!-- ===== TOP BAR ===== -->
+    <header class="topbar">
+      <div class="top-left">
+        <button id="sidebar-toggle" class="sidebar-toggle" type="button" title="Hide / show sidebar" aria-label="Toggle sidebar" aria-expanded="true">«</button>
+        <div class="brand">
+          <div class="logo">◆</div>
+          <div>
+            <h1>AI Dev Assistant</h1>
+            <p class="tagline">orchestrator · 14 specialist agents · memory · graph</p>
+          </div>
+        </div>
+      </div>
+      <div class="top-right">
+        <span id="queue-chip" class="badge badge-muted hidden" title="Task queue">queue: idle</span>
+        <span id="backend-badge" class="badge badge-muted">backend: …</span>
+        <span id="conn" class="badge badge-idle">idle</span>
+        <button id="theme-btn" type="button" title="Toggle theme (light · dark · auto)">◐ Auto</button>
+      </div>
+    </header>
+
+    <!-- ===== BODY ===== -->
+    <div class="layout">
+
+      <!-- ===== SIDEBAR ===== -->
+      <aside class="sidebar">
+        <div class="sidebar-inner">
+
+          <section class="composer card">
+            <label for="prompt">New task</label>
+            <textarea id="prompt" rows="4" placeholder="e.g. Add input validation to a sample function and document it"></textarea>
+            <input id="task-title" class="title-input" type="text" maxlength="80"
+                   placeholder="Title (optional) — auto-generated from the task if left blank" />
+            <label class="ctl ctl-project" title="Memory & knowledge graph are scoped to this project">Project
+              <div class="proj-row">
+                <select id="project" class="select"></select>
+                <button id="new-project" class="ghost" type="button" title="Create a new project">＋</button>
+              </div>
+            </label>
+            <div class="controls">
+              <label class="ctl" title="Lower effort uses a cheaper model and fewer agent turns">Effort
+                <select id="effort" class="select">
+                  <option value="high">High · Opus</option>
+                  <option value="medium">Medium · Sonnet</option>
+                  <option value="low">Low · fast</option>
+                </select>
+              </label>
+              <label class="ctl" title="Where new memories are written. Recall always reads project + global. The knowledge graph is always project-scoped.">Memory
+                <select id="mem-scope" class="select">
+                  <option value="project">Project</option>
+                  <option value="global">Global</option>
+                </select>
+              </label>
+              <label class="ctl" title="Stop scheduling new work once this run's cost exceeds the cap">Budget $
+                <input id="budget" class="num" type="number" min="0" step="0.5" placeholder="none" />
+              </label>
+            </div>
+            <button id="run-btn">Run task →</button>
+            <label class="check"><input type="checkbox" id="review-plan" /> Review plan before running</label>
+            <p class="hint">Runs via your Claude Code login — no API key needed.</p>
+          </section>
+
+          <nav class="nav">
+            <span class="nav-label">Workspace</span>
+            <button class="vtab" data-view="agents"><svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><circle cx="4" cy="4" r="2"/><circle cx="12" cy="4" r="2"/><circle cx="4" cy="12" r="2"/><circle cx="12" cy="12" r="2"/></svg>Agents</button>
+            <button class="vtab" data-view="memory"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2.5" y="3" width="11" height="3" rx="1"/><rect x="2.5" y="9.5" width="11" height="3" rx="1"/></svg>Memory</button>
+            <button class="vtab" data-view="graph"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="3.5" cy="12" r="2" fill="currentColor" stroke="none"/><circle cx="12.5" cy="11" r="2" fill="currentColor" stroke="none"/><circle cx="8" cy="3.5" r="2" fill="currentColor" stroke="none"/><path d="M8 4.5l-4 6.5M8 4.5l4 5.5"/></svg>Knowledge&nbsp;Graph</button>
+            <button class="vtab" data-view="files"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 2.5h5l3 3v8H4z"/><path d="M9 2.5v3h3"/></svg>Files</button>
+          </nav>
+
+          <section class="queue hidden" id="queue-section">
+            <span class="recent-label">Queue
+              <span class="q-controls">
+                <label class="q-conc" title="How many tasks run at once">conc
+                  <select id="q-concurrency"><option>1</option><option>2</option><option>3</option><option>4</option></select>
+                </label>
+                <button id="q-pause" class="ghost" title="Pause / resume starting new tasks">⏸</button>
+              </span>
+            </span>
+            <ul id="queue-list"></ul>
+          </section>
+
+          <section class="recent">
+            <span class="recent-label">Recent tasks <button id="refresh" class="ghost" title="Refresh">⟳</button></span>
+            <ul id="recent-list"><li class="muted">none yet</li></ul>
+          </section>
+
+        </div>
+      </aside>
+
+      <!-- drag to resize the sidebar -->
+      <div id="sidebar-resizer" class="sidebar-resizer" role="separator" aria-orientation="vertical" title="Drag to resize"></div>
+
+      <!-- ===== MAIN ===== -->
+      <section class="main-col">
+        <div class="content">
+
+          <!-- ============ RUN VIEW ============ -->
+          <div id="view-run" class="view">
+            <div class="view-header">
+              <div>
+                <h1>Latest run</h1>
+                <p>Submit a task — the orchestrator plans it and routes the pieces to specialist agents in parallel.</p>
+              </div>
+              <div class="seg-wrap">
+                <span class="seg-label">Layout</span>
+                <div class="seg" id="layout-seg">
+                  <button class="lseg active" data-layout="focus">Focus</button>
+                  <button class="lseg" data-layout="split">Split</button>
+                  <button class="lseg" data-layout="board">Board</button>
+                </div>
+              </div>
+            </div>
+
+            <div id="empty" class="empty">
+              <div class="empty-mark">◆</div>
+              <h2>Describe a task to begin</h2>
+              <p>The orchestrator will break it down and route the pieces to specialized agents running in parallel.</p>
+              <div class="examples">
+                <button class="ex-chip">Build a REST API for notes (create/list) with pytest tests and a Dockerfile</button>
+                <button class="ex-chip">Write a Python CLI to-do app (add/list/done) with tests and a README</button>
+                <button class="ex-chip">Implement a rate limiter class with unit tests and a security review</button>
+              </div>
+            </div>
+
+            <div id="plan-editor" class="card hidden">
+              <span class="kicker">Review plan — edit titles/agents or remove steps, then approve</span>
+              <p id="pe-summary" class="plan-summary"></p>
+              <div id="pe-list" class="pe-list"></div>
+              <div class="pe-actions">
+                <button id="approve-btn">Approve &amp; Run</button>
+                <button id="discard-btn" class="ghost-btn">Discard</button>
+              </div>
+            </div>
+
+            <div id="run-view" class="hidden" data-layout="focus">
+
+              <div class="rv-head">
+                <div class="run-head card">
+                  <div>
+                    <span class="kicker">Task</span>
+                    <p id="run-prompt" class="run-prompt"></p>
+                  </div>
+                  <div class="run-status">
+                    <span id="timer" class="timer">0.0s</span>
+                    <span id="status-pill" class="pill pill-running">running</span>
+                    <button id="cancel-btn" class="cancel hidden">Cancel</button>
+                  </div>
+                </div>
+
+                <div class="pipeline hidden" id="pipeline">
+                  <div class="pstep" data-phase="plan"><span class="pnum">1</span><span>Plan</span></div>
+                  <div class="pstep" data-phase="execute"><span class="pnum">2</span><span>Execute</span></div>
+                  <div class="pstep" data-phase="verify"><span class="pnum">3</span><span>Verify</span></div>
+                  <div class="pstep" data-phase="document"><span class="pnum">4</span><span>Document</span></div>
+                  <div class="pstep" data-phase="done"><span class="pnum">5</span><span>Done</span></div>
+                </div>
+                <div class="progress-row hidden" id="progress-row">
+                  <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
+                  <span id="progress-label" class="progress-label"></span>
+                </div>
+              </div>
+
+              <div id="metrics">
+                <div class="metrics">
+                  <div class="metric" title="Subtasks the orchestrator created"><span class="m-val" id="m-agents">0</span><span class="m-label">agents</span></div>
+                  <div class="metric" title="Agent sessions the pool spawned"><span class="m-val" id="m-sessions">0</span><span class="m-label">sessions</span></div>
+                  <div class="metric" title="Idle sessions terminated by the pool reaper"><span class="m-val" id="m-reaped">0</span><span class="m-label">reaped</span></div>
+                  <div class="metric" title="Entities in the knowledge graph"><span class="m-val" id="m-kg">0</span><span class="m-label">KG nodes</span></div>
+                  <div class="metric" title="Relationships in the knowledge graph"><span class="m-val" id="m-edges">0</span><span class="m-label">KG edges</span></div>
+                  <div class="metric" title="Notes agents saved to working memory"><span class="m-val" id="m-mem">0</span><span class="m-label">memories</span></div>
+                  <div class="metric" title="Messages agents sent each other"><span class="m-val" id="m-msgs">0</span><span class="m-label">messages</span></div>
+                  <div class="metric" title="Did the generated tests pass when actually run?"><span class="m-val" id="m-tests">—</span><span class="m-label">tests</span></div>
+                  <div class="metric" title="Total LLM cost for this run (USD)"><span class="m-val" id="m-cost">—</span><span class="m-label">cost</span></div>
+                </div>
+                <div id="usage-line" class="usage-line"></div>
+              </div>
+
+              <div class="rv-flow">
+                <div class="card plan-card hidden" id="plan-card">
+                  <span class="kicker">Plan</span>
+                  <p id="plan-summary" class="plan-summary"></p>
+                </div>
+                <div class="card plan-dag-card hidden" id="plan-dag-card">
+                  <span class="kicker">Plan flow — columns run in parallel · arrows are dependencies</span>
+                  <div class="dag-wrap"><svg id="plan-dag" preserveAspectRatio="xMinYMid meet"></svg></div>
+                </div>
+              </div>
+
+              <div class="rv-agents">
+                <h2 class="section-title hidden" id="agents-title">Agents · this run</h2>
+                <div id="agents" class="agents-grid"></div>
+              </div>
+
+              <div class="card brief-card hidden" id="brief-card">
+                <span class="kicker">Brief</span>
+                <p id="brief-tldr" class="brief-tldr"></p>
+                <ul id="brief-points" class="brief-points"></ul>
+                <a id="docs-link" class="docs-link" href="#">View full report →</a>
+              </div>
+
+              <div class="card timeline-card hidden" id="timeline-card">
+                <span class="kicker">Run timeline — when each agent ran</span>
+                <div id="timeline" class="timeline"></div>
+              </div>
+
+              <details class="feed card">
+                <summary>Activity feed</summary>
+                <ul id="feed" class="feed-list"></ul>
+              </details>
+
+            </div><!-- /run-view -->
+          </div><!-- /view-run -->
+
+          <!-- ============ AGENTS ============ -->
+          <div id="view-agents" class="view hidden">
+            <div class="view-header">
+              <div>
+                <h1>Agent roster</h1>
+                <p>The specialist team the orchestrator routes work to, by capability match.</p>
+              </div>
+            </div>
+            <div id="agents-roster" class="agents-grid"></div>
+          </div>
+
+          <!-- ============ MEMORY ============ -->
+          <div id="view-memory" class="view hidden">
+            <div class="view-header">
+              <div>
+                <h1>Working memory</h1>
+                <p>Durable notes and facts agents saved during their runs.</p>
+              </div>
+              <button id="mem-refresh" class="ghost" title="Refresh">⟳</button>
+            </div>
+            <div id="memory-list" class="mem-list"><p class="muted">No memories yet — run a task.</p></div>
+          </div>
+
+          <!-- ============ GRAPH ============ -->
+          <div id="view-graph" class="view hidden">
+            <div class="view-header">
+              <div>
+                <h1>Knowledge graph</h1>
+                <p>Entities and relationships the agents recorded. Click a node to trace its facts.</p>
+              </div>
+              <div class="seg-wrap"><span id="graph-stats" class="muted"></span><button id="graph-refresh" class="ghost" title="Refresh">⟳</button></div>
+            </div>
+            <div class="graph-wrap"><svg id="graph-svg" viewBox="0 0 800 520" preserveAspectRatio="xMidYMid meet"></svg></div>
+            <div id="graph-legend" class="legend"></div>
+            <div id="node-detail" class="node-detail muted">Click a node to see its facts.</div>
+          </div>
+
+          <!-- ============ FILES ============ -->
+          <div id="view-files" class="view hidden">
+            <div class="view-header">
+              <div>
+                <h1>Workspace files</h1>
+                <p>Artifacts the agents wrote to disk — code, tests, and config the team can run and verify.</p>
+              </div>
+              <div class="seg-wrap"><span id="files-stats" class="muted"></span><select id="files-task" class="select" title="Filter by task"></select><button id="files-refresh" class="ghost" title="Refresh">⟳</button></div>
+            </div>
+            <div class="files-pane">
+              <ul id="file-list" class="file-list"><li class="muted">No files yet — run a task that writes code.</li></ul>
+              <div class="file-view">
+                <div class="file-view-head">
+                  <span id="file-name" class="muted">No file selected</span>
+                  <a id="file-download" class="dl hidden" download>↓ Download</a>
+                </div>
+                <pre id="file-content" class="file-content muted">Select a file to view its contents.</pre>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Doc viewer modal -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <div class="tabs">
+          <button class="tab active" data-doc="brief">Brief</button>
+          <button class="tab" data-doc="plan">Plan</button>
+          <button class="tab" data-doc="report">Report</button>
+        </div>
+        <button id="modal-close" class="ghost">✕</button>
+      </div>
+      <pre id="modal-content" class="modal-content"></pre>
+    </div>
+  </div>
+
+  <!-- Per-agent detail modal -->
+  <div id="agent-modal" class="modal hidden">
+    <div class="modal-box am-box">
+      <div class="modal-head">
+        <div class="am-headline">
+          <span id="am-id" class="chip"></span>
+          <span id="am-agent" class="ac-agent"></span>
+          <span id="am-status" class="pill"></span>
+        </div>
+        <button id="agent-modal-close" class="ghost">✕</button>
+      </div>
+      <div class="am-body">
+        <h3 id="am-title" class="am-title"></h3>
+        <div id="am-meta" class="am-meta"></div>
+        <div id="am-review" class="am-review hidden"></div>
+        <span id="am-result-label" class="kicker hidden">Result</span>
+        <pre id="am-result" class="am-result hidden"></pre>
+        <span class="kicker">Activity</span>
+        <div id="am-stream" class="ac-stream am-stream"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Agent-roster detail modal -->
+  <div id="roster-modal" class="modal hidden">
+    <div class="modal-box am-box">
+      <div class="modal-head">
+        <div class="am-headline">
+          <span id="rm-name" class="ac-agent"></span>
+          <span id="rm-tools-count" class="chip chip-tools"></span>
+        </div>
+        <button id="roster-modal-close" class="ghost">✕</button>
+      </div>
+      <div class="am-body">
+        <div>
+          <span class="kicker">Description</span>
+          <p id="rm-desc" class="rm-text"></p>
+        </div>
+        <div>
+          <span class="kicker">When to use</span>
+          <p id="rm-when" class="rm-text"></p>
+        </div>
+        <div>
+          <span class="kicker">Tools</span>
+          <div id="rm-tools" class="tool-chips"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toasts" class="toasts"></div>
+
+  <script src="/static/ui.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

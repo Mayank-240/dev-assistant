@@ -1,0 +1,45 @@
+# --- Build hygiene: keep the image small and the context clean ---
+# Version control & CI
+.git/
+.gitignore
+.github/
+
+# Python virtualenvs & caches
+.venv/
+venv/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local SQLite databases (must NOT leak into the image; created at runtime)
+*.db
+*.db-wal
+*.db-shm
+notes.db*
+
+# Tests, docs, and unrelated source trees (not needed to run the API)
+tests/
+docs/
+src/
+
+# Secrets & local env
+.env
+.env.*
+!.env.example
+
+# Agent/tooling state & lockfiles not used by the Docker build
+.ada_data/
+uv.lock
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Build artifacts
+dist/
+build/
