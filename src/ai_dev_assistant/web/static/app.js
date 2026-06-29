@@ -741,9 +741,10 @@ async function renderPlanEditor(plan) {
   });
 }
 
-function approvePlan() {
+// Collect the current (possibly hand-edited) plan from the editor rows, so refine + approve
+// both build on what the user sees.
+function collectEditedPlan() {
   const rows = [...document.querySelectorAll("#pe-list .pe-row")];
-  if (!rows.length) return;
   const keep = new Set(rows.map(r => r.querySelector(".chip").textContent));
   const subtasks = rows.map(r => {
     const id = r.querySelector(".chip").textContent;
@@ -755,9 +756,46 @@ function approvePlan() {
       depends_on: (orig.depends_on || []).filter(d => keep.has(d)),
     };
   });
+  return { title: state.currentPlan.title, summary: state.currentPlan.summary, subtasks };
+}
+
+// Interactive plan mode: revise the plan from a natural-language instruction, in place.
+async function refinePlan() {
+  const instruction = $("pe-instruction").value.trim();
+  if (!instruction) return;
+  const btn = $("refine-btn");
+  btn.disabled = true; btn.textContent = "↻ Refining…";
+  $("pe-warning").classList.add("hidden");
+  const prevSummary = $("pe-summary").textContent;
+  $("pe-summary").textContent = "Refining the plan…";
+  let data;
+  try {
+    data = await (await fetch("/api/plan/refine", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: state.currentPrompt, plan: collectEditedPlan(), instruction, ...getControls() }),
+    })).json();
+  } catch (e) { $("pe-summary").textContent = prevSummary; showToast("Refine failed: " + e, "warn"); btn.disabled = false; btn.textContent = "↻ Refine"; return; }
+  if (data.error) { $("pe-summary").textContent = prevSummary; showToast("Refine failed: " + data.error, "warn"); }
+  else {
+    state.currentPlan = data.plan;
+    state.currentPlanId = data.plan_id;
+    await renderPlanEditor(data.plan);
+    if (!$("task-title").value.trim() && data.plan.title) $("task-title").value = data.plan.title;
+    $("pe-instruction").value = "";
+    if (data.warning) { const w = $("pe-warning"); w.textContent = "⚠ " + data.warning; w.classList.remove("hidden"); }
+    showToast("Plan revised", "success");
+  }
+  btn.disabled = false; btn.textContent = "↻ Refine";
+  $("pe-instruction").focus();
+}
+
+function approvePlan() {
+  const rows = [...document.querySelectorAll("#pe-list .pe-row")];
+  if (!rows.length) return;
+  const plan = collectEditedPlan();
   $("plan-editor").classList.add("hidden");
   showToast("Plan approved · running", "success");
-  launchRun({ prompt: state.currentPrompt, plan: { title: state.currentPlan.title, summary: state.currentPlan.summary, subtasks }, task_id: state.currentPlanId, ...getControls() }, state.currentPrompt);
+  launchRun({ prompt: state.currentPrompt, plan, task_id: state.currentPlanId, ...getControls() }, state.currentPrompt);
 }
 
 function discardPlan() {
@@ -1405,6 +1443,8 @@ $("run-btn").onclick = runTask;
 document.querySelectorAll(".ex-chip").forEach(b => b.onclick = () => { $("prompt").value = b.textContent; $("prompt").focus(); });
 $("approve-btn").onclick = approvePlan;
 $("discard-btn").onclick = discardPlan;
+$("refine-btn").onclick = refinePlan;
+$("pe-instruction").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); refinePlan(); } });
 $("cancel-btn").onclick = cancelRun;
 $("mem-refresh").onclick = loadMemory;
 $("graph-refresh").onclick = loadGraph;

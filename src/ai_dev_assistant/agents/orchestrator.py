@@ -40,6 +40,18 @@ _SYSTEM = (
 )
 
 
+_REFINE_SYSTEM = (
+    "You are refining an EXISTING plan for a team of specialized AI agents, based on the "
+    "user's instruction. Apply the requested change and return the COMPLETE revised plan "
+    "(not a diff). Keep everything the user did not ask to change. Preserve subtask ids that "
+    "still apply so dependencies stay valid; only add, remove, reorder, re-route, re-scope, "
+    "or re-depend subtasks as the instruction implies. Keep the same rules as normal planning: "
+    "2-5 concrete subtasks, explicit checkable acceptance_criteria on each, correct depends_on "
+    "(a test/doc subtask depends on the work it covers), and valid agent names from the roster. "
+    "Refer to files by RELATIVE path only."
+)
+
+
 class Orchestrator:
     def __init__(self, settings: Settings, provider: LLMProvider) -> None:
         self._settings = settings
@@ -76,6 +88,36 @@ class Orchestrator:
             max_tokens=4000,
         )
         return self._sanitize(plan, agents)
+
+    async def refine_plan(
+        self, prompt: str, plan: Plan, instruction: str, agents: dict[str, BaseAgent],
+    ) -> Plan:
+        """Revise an existing plan per a natural-language instruction (interactive plan mode)."""
+        catalog = capability_catalog(agents)
+        user = (
+            f"ORIGINAL TASK:\n{prompt}\n\n"
+            f"CURRENT PLAN:\n{self._plan_text(plan)}\n\n"
+            f"USER INSTRUCTION (apply this to the plan):\n{instruction}\n\n"
+            f"AGENT ROSTER (choose 'agent' for each subtask from these names only):\n{catalog}\n\n"
+            "Return the complete revised plan."
+        )
+        revised = await self._provider.structured(
+            system=_REFINE_SYSTEM, user=user, schema=Plan,
+            model=self._settings.orchestrator_model, effort=self._settings.orchestrator_effort,
+            max_tokens=4000,
+        )
+        return self._sanitize(revised, agents)
+
+    @staticmethod
+    def _plan_text(plan: Plan) -> str:
+        lines = [f"Title: {getattr(plan, 'title', '') or '(none)'}", f"Summary: {plan.summary}", "Subtasks:"]
+        for st in plan.subtasks:
+            deps = ", ".join(st.depends_on) or "—"
+            lines.append(f"- [{st.id}] ({st.agent}) {st.title} | depends_on: {deps}")
+            lines.append(f"    description: {st.description}")
+            for c in st.acceptance_criteria:
+                lines.append(f"    criterion: {c}")
+        return "\n".join(lines)
 
     # Default criteria backfilled when the orchestrator emits a subtask with none — an
     # ungrounded reviewer is what makes verdicts (and the resulting cascades) meaningless.

@@ -67,6 +67,12 @@ uv run ai-dev-assistant serve
 # …or run a task headless from the terminal
 uv run ai-dev-assistant run "Add input validation to a sample function and document it"
 
+# interactive plan mode: propose a plan, refine it in plain English, then run
+uv run ai-dev-assistant run -i "Build a REST API for notes with tests"
+#   plan> add a security review step          ← orchestrator revises the DAG
+#   plan> use the database agent for the schema
+#   plan> <Enter>                              ← approve & run
+
 # work on a REAL repository and deliver the change as a branch:
 ADA_REPO_PATH=~/code/myproject ADA_GIT_FINALIZE=true \
   uv run ai-dev-assistant run "Fix the failing test in the auth module and refactor it"

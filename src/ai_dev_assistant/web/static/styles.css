@@ -518,3 +518,9 @@ body.resizing .sidebar { transition:none; }
 .ds-agent-num { color:var(--text-2); text-align:right; font-variant-numeric:tabular-nums; }
 .ds-bar { height:8px; background:var(--accent-soft); border-radius:5px; overflow:hidden; }
 .ds-bar-fill { display:block; height:100%; background:var(--accent); border-radius:5px; }
+
+/* ===== Interactive plan mode: refine box ===== */
+.pe-refine { display:flex; gap:8px; align-items:center; margin-top:10px; }
+.pe-refine .title-input { flex:1; margin:0; }
+#refine-btn { white-space:nowrap; }
+#pe-warning { color:#b45309; margin-top:6px; }

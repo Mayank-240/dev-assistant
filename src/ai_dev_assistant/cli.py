@@ -25,6 +25,8 @@ def _build_parser() -> argparse.ArgumentParser:
     runp.add_argument("prompt", help="The task to perform, in quotes")
     runp.add_argument("--ingest", action="append", default=[], metavar="FILE",
                       help="Ingest a file into the knowledge base first (repeatable)")
+    runp.add_argument("-i", "--interactive", action="store_true",
+                      help="Interactive plan mode: propose a plan, refine it in plain English, then run")
     runp.add_argument("-q", "--quiet", action="store_true", help="Hide internal INFO logs")
 
     servep = sub.add_parser("serve", help="Launch the web UI")
@@ -106,6 +108,48 @@ def _fmt(event: Event) -> str:
     return event.message
 
 
+def _print_plan(plan) -> None:
+    title = (getattr(plan, "title", "") or "").strip()
+    print("\n=== PROPOSED PLAN ===")
+    if title:
+        print(f"Title: {title}")
+    print(f"Approach: {plan.summary}\n")
+    for st in plan.subtasks:
+        deps = ", ".join(st.depends_on) or "—"
+        print(f"  [{st.id}] ({st.agent})  {st.title}")
+        print(f"        depends on: {deps}")
+        for c in st.acceptance_criteria:
+            print(f"        ✓ {c}")
+    print()
+
+
+async def _interactive_plan(engine, prompt: str):
+    """Propose a plan, let the user refine it in plain English, then approve (or abort)."""
+    print("Planning…")
+    try:
+        plan = await engine.make_plan(prompt)
+    except LLMError as exc:
+        print(f"Planning failed: {exc}", file=sys.stderr)
+        return None
+    while True:
+        _print_plan(plan)
+        print("Refine in plain English (e.g. 'add a security review step'), or press Enter to RUN, "
+              "or 'q' to abort.")
+        try:
+            instruction = (await asyncio.to_thread(input, "plan> ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if instruction.lower() in ("q", "quit", "abort"):
+            return None
+        if instruction == "" or instruction.lower() in ("run", "go", "approve", "ok", "y", "yes"):
+            return plan
+        print("Refining…")
+        try:
+            plan = await engine.refine_plan(prompt, plan, instruction)
+        except LLMError as exc:
+            print(f"Refine failed: {exc}", file=sys.stderr)
+
+
 def _run(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=logging.WARNING if args.quiet else logging.INFO,
@@ -138,7 +182,14 @@ async def _run_async(args: argparse.Namespace, settings: Settings) -> int:
             else:
                 print(f"WARNING: --ingest file not found: {path}", file=sys.stderr)
 
-        run, brief, out_dir = await engine.run(args.prompt, on_event=on_event)
+        plan = None
+        if getattr(args, "interactive", False):
+            plan = await _interactive_plan(engine, args.prompt)
+            if plan is None:
+                print("Aborted — no run started.")
+                return 0
+
+        run, brief, out_dir = await engine.run(args.prompt, plan=plan, on_event=on_event)
     except LLMError as exc:
         print(f"\nRun failed: {exc}", file=sys.stderr)
         return 1

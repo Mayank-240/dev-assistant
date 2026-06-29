@@ -101,6 +101,10 @@ class Engine:
             track_record=self._track_record_text(),
         )
 
+    async def refine_plan(self, prompt: str, plan: Plan, instruction: str) -> Plan:
+        """Revise a proposed plan from a natural-language instruction (interactive plan mode)."""
+        return await self.orchestrator.refine_plan(prompt, plan, instruction, self.agents)
+
     async def run(
         self,
         prompt: str,

@@ -72,6 +72,10 @@ ada run "<task>"
 - **DAG + plan validation** (`task.py`, `orchestrator.py`): Kahn topo-sort rejects cycles,
   duplicate ids, and dangling deps before scheduling; empty acceptance criteria are
   backfilled so the reviewer is never ungrounded.
+- **Interactive plan mode** (`orchestrator.refine_plan`, `/api/plan/refine`, `run -i`):
+  propose a plan, then refine it with natural-language instructions ("add a security review
+  step", "merge steps 2 and 3") — the orchestrator returns a revised, re-validated DAG — and
+  loop until you approve. Works in the web plan panel and the CLI.
 - **Adaptive replanning** (`engine.py`, `scheduler.py`): a bounded hook injects a repair
   subtask for a failed one (`ADA_ADAPTIVE_REPLAN`).
 - **Token-budgeted context** (`context.py`): the agent prompt is assembled to a budget
