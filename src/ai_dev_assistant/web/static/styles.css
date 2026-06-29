@@ -500,3 +500,21 @@ body.resizing .sidebar { transition:none; }
   #run-view[data-layout="split"] { grid-template-columns:minmax(0,1fr); grid-template-areas:"head" "metrics" "flow" "agents" "brief" "timeline" "feed"; }
   .files-pane { grid-template-columns:1fr; }
 }
+
+/* ===== Tier 5 additions: pause/steer, feedback, dashboard ===== */
+.pill-warn { background:color-mix(in srgb,#f59e0b 16%,transparent); color:#b45309; border-color:color-mix(in srgb,#f59e0b 35%,transparent); }
+.pill-warn::before { background:#f59e0b; }
+
+.feedback-box { margin-top:14px; padding-top:14px; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:8px; }
+.fb-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.fb-stars { display:inline-flex; gap:2px; }
+.fb-stars button { background:none; border:none; cursor:pointer; font-size:20px; line-height:1; color:var(--border); padding:0 1px; }
+.fb-stars button.on, .fb-stars button:hover { color:#f59e0b; }
+
+.dash-metrics { margin-bottom:16px; }
+.ds-agents { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
+.ds-agent-row { display:grid; grid-template-columns:130px 1fr 130px; align-items:center; gap:12px; font-size:13px; }
+.ds-agent-name { color:var(--text); font-weight:600; }
+.ds-agent-num { color:var(--text-2); text-align:right; font-variant-numeric:tabular-nums; }
+.ds-bar { height:8px; background:var(--accent-soft); border-radius:5px; overflow:hidden; }
+.ds-bar-fill { display:block; height:100%; background:var(--accent); border-radius:5px; }

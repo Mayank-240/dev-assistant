@@ -92,6 +92,7 @@
             <button class="vtab" data-view="memory"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2.5" y="3" width="11" height="3" rx="1"/><rect x="2.5" y="9.5" width="11" height="3" rx="1"/></svg>Memory</button>
             <button class="vtab" data-view="graph"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="3.5" cy="12" r="2" fill="currentColor" stroke="none"/><circle cx="12.5" cy="11" r="2" fill="currentColor" stroke="none"/><circle cx="8" cy="3.5" r="2" fill="currentColor" stroke="none"/><path d="M8 4.5l-4 6.5M8 4.5l4 5.5"/></svg>Knowledge&nbsp;Graph</button>
             <button class="vtab" data-view="files"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 2.5h5l3 3v8H4z"/><path d="M9 2.5v3h3"/></svg>Files</button>
+            <button class="vtab" data-view="dashboard"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 13h12"/><rect x="3" y="8" width="2.4" height="4"/><rect x="7" y="5" width="2.4" height="7"/><rect x="11" y="9" width="2.4" height="3"/></svg>Dashboard</button>
           </nav>
 
           <section class="queue hidden" id="queue-section">
@@ -170,6 +171,8 @@
                   <div class="run-status">
                     <span id="timer" class="timer">0.0s</span>
                     <span id="status-pill" class="pill pill-running">running</span>
+                    <button id="pause-btn" class="ghost-btn hidden" title="Pause before the next batch">⏸ Pause</button>
+                    <button id="steer-btn" class="ghost-btn hidden" title="Send a steering note to the next subtask">✎ Steer</button>
                     <button id="cancel-btn" class="cancel hidden">Cancel</button>
                   </div>
                 </div>
@@ -223,6 +226,18 @@
                 <p id="brief-tldr" class="brief-tldr"></p>
                 <ul id="brief-points" class="brief-points"></ul>
                 <a id="docs-link" class="docs-link" href="#">View full report →</a>
+                <div id="feedback-box" class="feedback-box hidden">
+                  <span class="kicker">Was this run useful?</span>
+                  <div class="fb-row">
+                    <div id="fb-stars" class="fb-stars" aria-label="Rate 1-5">
+                      <button data-r="1">★</button><button data-r="2">★</button><button data-r="3">★</button><button data-r="4">★</button><button data-r="5">★</button>
+                    </div>
+                    <button id="fb-accept" class="ghost-btn" title="Mark the delivered work as accepted">✓ Accept</button>
+                    <button id="fb-reject" class="ghost-btn" title="Mark the delivered work as not accepted">✗ Reject</button>
+                  </div>
+                  <input id="fb-comment" class="title-input" type="text" maxlength="280" placeholder="Optional comment — what was good or wrong?" />
+                  <span id="fb-thanks" class="hint hidden">Thanks — feedback recorded; it outweighs the reviewer in future planning.</span>
+                </div>
               </div>
 
               <div class="card timeline-card hidden" id="timeline-card">
@@ -237,6 +252,29 @@
 
             </div><!-- /run-view -->
           </div><!-- /view-run -->
+
+          <!-- ============ DASHBOARD ============ -->
+          <div id="view-dashboard" class="view hidden">
+            <div class="view-header">
+              <div>
+                <h1>Dashboard</h1>
+                <p>Is the assistant good — and getting better? Cost, run quality, and per-agent track record.</p>
+              </div>
+              <button id="dash-refresh" class="ghost" title="Refresh">⟳</button>
+            </div>
+            <div class="metrics dash-metrics">
+              <div class="metric"><span class="m-val" id="ds-runs">0</span><span class="m-label">runs</span></div>
+              <div class="metric"><span class="m-val" id="ds-cost">$0</span><span class="m-label">total cost</span></div>
+              <div class="metric"><span class="m-val" id="ds-quality">—</span><span class="m-label">avg quality</span></div>
+              <div class="metric"><span class="m-val" id="ds-ok">0</span><span class="m-label">completed</span></div>
+              <div class="metric"><span class="m-val" id="ds-partial">0</span><span class="m-label">partial</span></div>
+              <div class="metric"><span class="m-val" id="ds-failed">0</span><span class="m-label">failed</span></div>
+            </div>
+            <div class="card">
+              <span class="kicker">Agent track record — learned from review outcomes</span>
+              <div id="ds-agents" class="ds-agents"><p class="muted">No data yet — run a few tasks.</p></div>
+            </div>
+          </div>
 
           <!-- ============ AGENTS ============ -->
           <div id="view-agents" class="view hidden">
