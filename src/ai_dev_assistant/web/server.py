@@ -105,6 +105,7 @@ class PlanRequest(BaseModel):
     memory_scope: str | None = None
     effort: str | None = None
     budget: float | None = None
+    continue_from: str | None = None   # re-engage: plan as a continuation of this task
 
 
 class RefinePlanRequest(BaseModel):
@@ -126,6 +127,7 @@ class RunRequest(BaseModel):
     title: str | None = None  # optional; auto-derived from the prompt when blank
     project: str | None = None
     memory_scope: str | None = None  # "project" | "global"
+    continue_from: str | None = None  # re-engage: continue this completed task's workspace + context
 
 
 class ProjectRequest(BaseModel):
@@ -186,7 +188,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.tasks[task_id] = asyncio.create_task(_run_task(
             task_id, payload.get("prompt", ""), payload.get("plan"),
             payload.get("effort"), payload.get("budget"), payload.get("title"),
-            payload.get("project"), payload.get("memory_scope")))
+            payload.get("project"), payload.get("memory_scope"), payload.get("continue_from")))
 
     def _pump() -> None:
         """Start queued tasks while slots are free (auto-run); respects Pause."""
@@ -199,10 +201,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     async def _run_task(task_id: str, prompt: str, plan_dict: dict[str, Any] | None,
                         effort: str | None, budget: float | None, title: str | None = None,
-                        project: str | None = None, memory_scope: str | None = None) -> None:
+                        project: str | None = None, memory_scope: str | None = None,
+                        continue_from: str | None = None) -> None:
         broker: Broker = app.state.brokers[task_id]
         # record up front so cancels-during-planning persist (title auto-derived if blank)
         app.state.runs.start(task_id, prompt, title=(title or None))
+        if continue_from:
+            app.state.runs.set_parent(task_id, continue_from)
         engine = Engine(_settings_for(settings, effort, budget, project, memory_scope))
         control = RunControl()
         engine.control = control  # enables pause/resume/steer endpoints to reach this run
@@ -210,7 +215,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             plan = Plan.model_validate(plan_dict) if plan_dict else None
             await engine.run(prompt, plan=plan, task_id=task_id, title=(title or None),
-                             on_event=broker.publish)
+                             continue_from=continue_from, on_event=broker.publish)
         except asyncio.CancelledError:
             broker.publish(Event("error", "Run cancelled by user.", {"message": "cancelled"}))
             app.state.runs.set_status(task_id, "cancelled")
@@ -233,7 +238,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def make_plan(req: PlanRequest) -> JSONResponse:
         engine = Engine(_settings_for(settings, req.effort, req.budget, req.project, req.memory_scope))
         try:
-            plan = await engine.make_plan(req.prompt)
+            plan = await engine.make_plan(req.prompt, continue_from=req.continue_from)
         except LLMError as exc:
             return JSONResponse({"error": str(exc)}, status_code=502)
         finally:
@@ -278,6 +283,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload = {
             "prompt": req.prompt, "plan": req.plan, "effort": req.effort, "budget": req.budget,
             "title": req.title, "project": req.project, "memory_scope": req.memory_scope,
+            "continue_from": req.continue_from,
         }
         plan_title = (req.plan or {}).get("title") if req.plan else None
         app.state.runs.enqueue(task_id, req.prompt, req.title or plan_title, payload)
@@ -488,6 +494,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "tests": r.get("tests"), "cost_usd": r.get("cost_usd"),
                 "passed": r.get("subtasks_passed"), "total": r.get("subtasks_total"),
                 "quality_score": r.get("quality_score"), "run_status": r.get("run_status"),
+                "parent_id": r.get("parent_id"),
             } for r in rows])
         # Fallback: docs dirs from runs that predate the run store.
         docs = settings.docs_dir
@@ -519,6 +526,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "kg_nodes": r.get("kg_nodes"), "kg_edges": r.get("kg_edges"),
             "memories": r.get("memories"), "messages": r.get("messages"),
             "quality_score": r.get("quality_score"), "run_status": r.get("run_status"),
+            "parent_id": r.get("parent_id"),
         }
         return JSONResponse({
             "plan": _read(d / "plan.md"),

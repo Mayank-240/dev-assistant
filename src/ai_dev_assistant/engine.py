@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any, Callable
 
@@ -94,16 +95,46 @@ class Engine:
     def ingest_doc(self, doc_id: str, text: str) -> int:
         return self.kb.ingest(doc_id, text)
 
-    async def make_plan(self, prompt: str) -> Plan:
+    async def make_plan(self, prompt: str, *, continue_from: str | None = None) -> Plan:
         """Just the orchestrator step — used by the plan-approval flow."""
+        repo_context = ""
+        if continue_from:
+            parent_ws = self.settings.run_workspace(continue_from)
+            repo_context = self._continuation_summary(continue_from) + (build_repo_map(parent_ws) or "")
         return await self.orchestrator.make_plan(
             prompt, self.agents, prior_knowledge=self._recall_prior(prompt),
-            track_record=self._track_record_text(),
+            repo_context=repo_context, track_record=self._track_record_text(),
         )
 
     async def refine_plan(self, prompt: str, plan: Plan, instruction: str) -> Plan:
         """Revise a proposed plan from a natural-language instruction (interactive plan mode)."""
         return await self.orchestrator.refine_plan(prompt, plan, instruction, self.agents)
+
+    def _continuation_summary(self, parent_id: str) -> str:
+        """Framing that tells the orchestrator this run continues a prior task."""
+        parent = self.runs.get(parent_id) or {}
+        return (
+            "This task CONTINUES a previously-completed task — build on the EXISTING files in "
+            "the workspace, do not redo work that's already done.\n"
+            f"Original task: {parent.get('prompt', '')}\n"
+            f"Previous outcome: {parent.get('summary', '')}\n\n"
+        )
+
+    def _prepare_continuation(self, parent_id: str, run_ws: Path, rid: str, emit: EventFn) -> str:
+        """Carry the parent task's workspace + context forward into this run."""
+        parent_ws = self.settings.run_workspace(parent_id)
+        if parent_ws.is_dir():
+            emit(status(f"Re-engaging task {parent_id}: carrying its workspace forward…"))
+            try:
+                shutil.copytree(parent_ws, run_ws, dirs_exist_ok=True,
+                                ignore=shutil.ignore_patterns("__pycache__", ".git", ".pytest_cache"))
+            except Exception as exc:  # never let a copy hiccup abort the run
+                emit(status(f"Could not copy prior workspace ({exc}); continuing fresh."))
+            try:
+                onboard(self.kb, self.kg, run_ws, rid)
+            except Exception:
+                pass
+        return self._continuation_summary(parent_id) + (build_repo_map(run_ws) or "")
 
     async def run(
         self,
@@ -112,6 +143,7 @@ class Engine:
         plan: Plan | None = None,
         task_id: str | None = None,
         title: str | None = None,
+        continue_from: str | None = None,
         on_event: EventFn | None = None,
     ) -> tuple[TaskRun, BriefDoc, Path]:
         base_emit: EventFn = on_event or (lambda _e: None)
@@ -145,6 +177,9 @@ class Engine:
                     emit(status(f"Onboarded {onb['files']} repo file(s) into the KB + graph."))
             except Exception as exc:  # never let repo setup abort the whole run
                 emit(status(f"Repository setup failed ({exc}); continuing greenfield."))
+        elif continue_from:
+            # Re-engagement: carry the prior task's workspace + outcome forward.
+            repo_context = self._prepare_continuation(continue_from, run_ws, rid, emit)
 
         if plan is None:
             prior = self._recall_prior(prompt)
@@ -168,6 +203,8 @@ class Engine:
 
         final_title = (title or "").strip() or (getattr(plan, "title", "") or "").strip() or None
         self.runs.start(run.id, prompt, title=final_title)
+        if continue_from:
+            self.runs.set_parent(run.id, continue_from)
         self._seed_kg(run)
         emit(Event("plan", f"Plan ready: {len(run.subtasks)} subtask(s).", {
             "summary": plan.summary,

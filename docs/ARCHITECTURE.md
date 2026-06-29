@@ -76,6 +76,10 @@ ada run "<task>"
   propose a plan, then refine it with natural-language instructions ("add a security review
   step", "merge steps 2 and 3") — the orchestrator returns a revised, re-validated DAG — and
   loop until you approve. Works in the web plan panel and the CLI.
+- **Re-engage a completed task** (`engine.run(continue_from=...)`, `run --continue`, web
+  "↻ Re-engage"): a finished task can be continued — its workspace is carried forward (copied
+  into the new run), its prompt + outcome frame the new plan, and the run is linked to its
+  parent (`runs.parent_id`). Each follow-up is its own run that builds on the last.
 - **Adaptive replanning** (`engine.py`, `scheduler.py`): a bounded hook injects a repair
   subtask for a failed one (`ADA_ADAPTIVE_REPLAN`).
 - **Token-budgeted context** (`context.py`): the agent prompt is assembled to a budget

@@ -524,3 +524,14 @@ body.resizing .sidebar { transition:none; }
 .pe-refine .title-input { flex:1; margin:0; }
 #refine-btn { white-space:nowrap; }
 #pe-warning { color:#b45309; margin-top:6px; }
+
+/* ===== Re-engage (continue a completed task) ===== */
+.continue-banner { display:flex; align-items:center; justify-content:space-between; gap:8px;
+  margin-bottom:8px; padding:7px 10px; border-radius:8px; font-size:12.5px;
+  background:var(--accent-soft); color:var(--accent-text);
+  border:1px solid color-mix(in srgb,var(--accent) 28%,transparent); }
+.continue-banner b { font-weight:600; }
+.continue-banner button { background:none; border:none; color:inherit; cursor:pointer; font-size:14px; opacity:.7; }
+.continue-banner button:hover { opacity:1; }
+.brief-actions { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:4px; }
+.modal-head-actions { display:flex; align-items:center; gap:8px; }
