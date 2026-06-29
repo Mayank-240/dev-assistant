@@ -33,6 +33,34 @@ def extract_json(text: str) -> str:
     return _balanced_slice(s, start)
 
 
+def _fenced_block(text: str) -> str | None:
+    """Find a ```json ... ``` (or bare ```) fenced block anywhere in the text, not just at the start."""
+    import re
+
+    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
+
+def repair_json(text: str) -> str:
+    """Best-effort recovery of a JSON object from messy model output.
+
+    Handles: a fenced block placed mid-prose, trailing commas before } or ], and smart
+    quotes. Falls back to the first balanced object/array. This is the safety net that
+    keeps a slightly-malformed plan/verdict from aborting the whole run.
+    """
+    import re
+
+    candidate = _fenced_block(text) or text
+    start = _first_open(candidate)
+    if start is not None:
+        candidate = _balanced_slice(candidate, start)
+    # normalize smart quotes that models sometimes emit
+    candidate = candidate.replace("“", '"').replace("”", '"').replace("’", "'")
+    # strip trailing commas: ",}" / ",]" (with optional whitespace/newlines)
+    candidate = re.sub(r",(\s*[}\]])", r"\1", candidate)
+    return candidate.strip()
+
+
 def _first_open(s: str) -> int | None:
     for i, ch in enumerate(s):
         if ch in "{[":
@@ -68,6 +96,9 @@ def _balanced_slice(s: str, start: int) -> str:
 
 
 def parse_model(text: str, schema: Type[T]) -> T:
-    payload = extract_json(text)
-    data = json.loads(payload)
-    return schema.model_validate(data)
+    """Parse ``text`` into ``schema``, with a repair fallback on the first failure."""
+    try:
+        return schema.model_validate(json.loads(extract_json(text)))
+    except Exception:
+        # Second chance: aggressive repair (fenced block anywhere, trailing commas, etc.).
+        return schema.model_validate(json.loads(repair_json(text)))

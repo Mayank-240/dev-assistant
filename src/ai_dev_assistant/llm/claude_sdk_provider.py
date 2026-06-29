@@ -54,12 +54,22 @@ class ClaudeSdkProvider:
         self._model = settings.sdk_model or None
         self._max_turns = settings.agent_max_turns
         self.usage = UsageTotals()
+        self._allowed_builtins = settings.allowed_builtins_list
         # Confine the SDK's built-in file/bash tools to a workspace dir, not the source tree.
         self._cwd = str(Path(settings.workspace_dir).resolve())
         Path(self._cwd).mkdir(parents=True, exist_ok=True)
 
-    def _model_kw(self) -> dict[str, Any]:
-        return {"model": self._model} if self._model else {}
+    # Built-in SDK tools we deny unless they're on the allowlist (Bash + web are the
+    # dangerous ones: arbitrary host code execution and SSRF/prompt-injection vectors).
+    _ALL_BUILTINS = ("Read", "Write", "Edit", "Bash", "Glob", "Grep", "LS", "WebSearch", "WebFetch",
+                     "NotebookEdit", "TodoWrite")
+
+    def _disallowed_builtins(self) -> list[str]:
+        return [t for t in self._ALL_BUILTINS if t not in self._allowed_builtins]
+
+    def _model_kw(self, model: str | None = None) -> dict[str, Any]:
+        chosen = model or self._model
+        return {"model": chosen} if chosen else {}
 
     async def _collect(self, *, prompt: str, options: Any, on_step=None, soft_cap: bool = False) -> str:
         sdk = self._sdk
@@ -110,11 +120,11 @@ class ClaudeSdkProvider:
         options = self._sdk.ClaudeAgentOptions(
             system_prompt=sys_prompt,
             allowed_tools=[],
-            disallowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"],
+            disallowed_tools=list(self._ALL_BUILTINS),  # planning/review needs no tools at all
             permission_mode=_PERMISSION,
             max_turns=4,  # headroom: a model occasionally needs >1 turn to emit clean JSON
             cwd=self._cwd,  # keep planning/review out of the project source tree
-            **self._model_kw(),
+            **self._model_kw(model),
         )
         attempt_user = user
         last_err: Exception | None = None
@@ -140,14 +150,18 @@ class ClaudeSdkProvider:
         mcp_allowed = [f"mcp__ada__{d['name']}" for d in defs]
         cwd = workdir or self._cwd
         Path(cwd).mkdir(parents=True, exist_ok=True)
+        # Allow our MCP tools plus the whitelisted built-ins (Read/Write/Edit/Glob/Grep by
+        # default); deny Bash + web unless explicitly enabled, so a normal run can't execute
+        # arbitrary host commands or reach the network.
         options = self._sdk.ClaudeAgentOptions(
             system_prompt=system_prompt,
             mcp_servers={"ada": server},
-            allowed_tools=mcp_allowed,
+            allowed_tools=mcp_allowed + list(self._allowed_builtins),
+            disallowed_tools=self._disallowed_builtins(),
             permission_mode=_PERMISSION,
             max_turns=max_iterations or self._max_turns,
             cwd=cwd,  # built-in file/bash tools operate inside this run's workspace
-            **self._model_kw(),
+            **self._model_kw(model),
         )
         return await self._collect(prompt=prompt, options=options, on_step=on_step, soft_cap=True)
 
