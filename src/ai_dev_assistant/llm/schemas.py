@@ -39,6 +39,14 @@ class Plan(BaseModel):
     subtasks: list[SubTask] = Field(description="The subtasks, in any order; deps define ordering.")
 
 
+class CriterionResult(BaseModel):
+    """Per-acceptance-criterion judgment, so a verdict says WHICH criterion failed and why."""
+
+    criterion: str = Field(description="The acceptance criterion being judged.")
+    met: bool = Field(description="Whether this specific criterion is satisfied.")
+    evidence: str = Field(default="", description="The concrete evidence for the judgment.")
+
+
 class Verdict(BaseModel):
     """The reviewer's verification of a single subtask result."""
 
@@ -48,6 +56,24 @@ class Verdict(BaseModel):
     suggestions: list[str] = Field(
         default_factory=list,
         description="Concrete fixes to apply on retry if it failed.",
+    )
+    # Optional richer signal (Tier 3). Default-empty so older/fake providers still validate.
+    criteria: list[CriterionResult] = Field(
+        default_factory=list, description="Per-criterion breakdown of what passed/failed."
+    )
+    objective_note: str = Field(
+        default="", description="Summary of objective signals (tests/lint) folded into this verdict."
+    )
+
+
+class RunLessons(BaseModel):
+    """A structured post-mortem distilled from a finished run (Tier 4 learning loop)."""
+
+    summary: str = Field(description="One-sentence outcome-aware summary of the run.")
+    what_worked: list[str] = Field(default_factory=list, description="Approaches that succeeded.")
+    what_to_avoid: list[str] = Field(default_factory=list, description="Mistakes / dead ends to avoid next time.")
+    routing_notes: list[str] = Field(
+        default_factory=list, description="Which agent suited (or didn't suit) which kind of subtask."
     )
 
 

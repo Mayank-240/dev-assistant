@@ -9,6 +9,7 @@ Kuzu/Neo4j backend can replace it later without touching agent code.
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -35,19 +36,26 @@ class NetworkXKnowledgeGraph:
     def __init__(self, path: Path | None = None) -> None:
         self._path = Path(path) if path else None
         self._g: nx.MultiDiGraph = nx.MultiDiGraph()
+        self._lock = threading.RLock()
         if self._path and self._path.exists():
             self._load()
 
     # ---- writes ----
     def add_node(self, node_id: str, node_type: str = "concept", **attrs: Any) -> None:
-        self._g.add_node(node_id, node_type=node_type, **attrs)
+        with self._lock:
+            # don't downgrade a known type back to the default "concept"
+            if node_id in self._g and node_type == "concept":
+                node_type = self._g.nodes[node_id].get("node_type", "concept")
+            self._g.add_node(node_id, node_type=node_type, **attrs)
 
-    def add_fact(self, subject: str, relation: str, obj: str, **attrs: Any) -> None:
-        if subject not in self._g:
-            self.add_node(subject)
-        if obj not in self._g:
-            self.add_node(obj)
-        self._g.add_edge(subject, obj, key=relation, relation=relation, **attrs)
+    def add_fact(self, subject: str, relation: str, obj: str, *, obj_type: str = "concept",
+                 **attrs: Any) -> None:
+        with self._lock:
+            if subject not in self._g:
+                self.add_node(subject)
+            if obj not in self._g:
+                self.add_node(obj, obj_type)
+            self._g.add_edge(subject, obj, key=relation, relation=relation, **attrs)
 
     # ---- reads ----
     def facts_about(self, node_id: str) -> list[Triple]:
@@ -92,7 +100,12 @@ class NetworkXKnowledgeGraph:
         if not self._path:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
+        with self._lock:
+            data = self._serialize()
+        self._path.write_text(json.dumps(data, indent=2))
+
+    def _serialize(self) -> dict:
+        return {
             "nodes": [{"id": n, "attrs": dict(d)} for n, d in self._g.nodes(data=True)],
             "edges": [
                 {"src": s, "dst": d, "relation": data.get("relation", "related_to"),
@@ -100,7 +113,6 @@ class NetworkXKnowledgeGraph:
                 for s, d, data in self._g.edges(data=True)
             ],
         }
-        self._path.write_text(json.dumps(data, indent=2))
 
     def _load(self) -> None:
         data = json.loads(self._path.read_text())

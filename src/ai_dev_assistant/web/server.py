@@ -27,6 +27,7 @@ from ..knowledge.graph import NetworkXKnowledgeGraph
 from ..llm.errors import LLMError
 from ..llm.schemas import Plan
 from ..orchestration.events import Event
+from ..orchestration.run_control import RunControl
 from ..orchestration.run_store import RunStore, derive_title
 from ..orchestration.task import new_task_id
 
@@ -111,6 +112,16 @@ class QueueConfigRequest(BaseModel):
     concurrency: int
 
 
+class SteerRequest(BaseModel):
+    note: str
+
+
+class FeedbackRequest(BaseModel):
+    rating: int | None = None       # 1-5
+    accepted: bool | None = None    # was the delivered work accepted?
+    comment: str | None = None
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.load()
     app = FastAPI(title="AI Dev Assistant")
@@ -123,6 +134,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.concurrency = max(1, settings.max_concurrent_runs)
     app.state.paused = False
     app.state.running = set()  # task_ids currently executing
+    app.state.controls = {}  # task_id -> RunControl (in-run pause/steer)
 
     @app.middleware("http")
     async def no_cache(request, call_next):  # static assets should never be cached in dev
@@ -164,6 +176,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # record up front so cancels-during-planning persist (title auto-derived if blank)
         app.state.runs.start(task_id, prompt, title=(title or None))
         engine = Engine(_settings_for(settings, effort, budget, project, memory_scope))
+        control = RunControl()
+        engine.control = control  # enables pause/resume/steer endpoints to reach this run
+        app.state.controls[task_id] = control
         try:
             plan = Plan.model_validate(plan_dict) if plan_dict else None
             await engine.run(prompt, plan=plan, task_id=task_id, title=(title or None),
@@ -173,12 +188,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.runs.set_status(task_id, "cancelled")
         except LLMError as exc:
             broker.publish(Event("error", f"Run failed: {exc}", {"message": str(exc)}))
+            app.state.runs.set_status(task_id, "failed")  # don't strand it 'running'
         except Exception as exc:  # don't leave the socket hanging on unexpected failures
             broker.publish(Event("error", f"Unexpected error: {exc}", {"message": str(exc)}))
+            app.state.runs.set_status(task_id, "failed")
         finally:
             await engine.aclose()
             app.state.tasks.pop(task_id, None)
             app.state.running.discard(task_id)
+            app.state.controls.pop(task_id, None)
             if not broker.done:
                 broker.publish(Event("done", "Run ended.", {}))
             _pump()  # a slot just freed — start the next queued task
@@ -222,6 +240,92 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return JSONResponse({"ok": False, "error": "no running task"}, status_code=404)
         t.cancel()
         return JSONResponse({"ok": True})
+
+    # ---- in-run control (Tier 5): pause / resume / steer ----
+    @app.post("/api/run/{task_id}/pause")
+    async def pause_run(task_id: str) -> JSONResponse:
+        ctrl: RunControl | None = app.state.controls.get(task_id)
+        if ctrl is None:
+            return JSONResponse({"ok": False, "error": "no running task"}, status_code=404)
+        ctrl.pause()
+        b = app.state.brokers.get(task_id)
+        if b:
+            b.publish(Event("control", "Run paused — will halt before the next batch.", {"paused": True}))
+        return JSONResponse({"ok": True, "paused": True})
+
+    @app.post("/api/run/{task_id}/resume")
+    async def resume_run(task_id: str) -> JSONResponse:
+        ctrl: RunControl | None = app.state.controls.get(task_id)
+        if ctrl is None:
+            return JSONResponse({"ok": False, "error": "no running task"}, status_code=404)
+        ctrl.resume()
+        b = app.state.brokers.get(task_id)
+        if b:
+            b.publish(Event("control", "Run resumed.", {"paused": False}))
+        return JSONResponse({"ok": True, "paused": False})
+
+    @app.post("/api/run/{task_id}/steer")
+    async def steer_run(task_id: str, req: SteerRequest) -> JSONResponse:
+        ctrl: RunControl | None = app.state.controls.get(task_id)
+        if ctrl is None:
+            return JSONResponse({"ok": False, "error": "no running task"}, status_code=404)
+        ctrl.steer(req.note)
+        b = app.state.brokers.get(task_id)
+        if b:
+            b.publish(Event("control", f"Steering note queued: {req.note[:80]}", {"note": req.note}))
+        return JSONResponse({"ok": True})
+
+    # ---- human feedback (Tier 4 learning input) ----
+    @app.post("/api/run/{task_id}/feedback")
+    async def submit_feedback(task_id: str, req: FeedbackRequest) -> JSONResponse:
+        app.state.runs.set_feedback(task_id, rating=req.rating, accepted=req.accepted,
+                                    comment=req.comment or "")
+        return JSONResponse({"ok": True})
+
+    @app.get("/api/run/{task_id}/feedback")
+    async def get_run_feedback(task_id: str) -> JSONResponse:
+        return JSONResponse(app.state.runs.get_feedback(task_id) or {})
+
+    # ---- observability (Tier 5): durable event log + trace + quality + stats ----
+    @app.get("/api/tasks/{task_id}/events")
+    async def get_events(task_id: str) -> JSONResponse:
+        return JSONResponse(_read_jsonl(settings.docs_dir / task_id / "events.jsonl"))
+
+    @app.get("/api/tasks/{task_id}/trace")
+    async def get_trace(task_id: str) -> JSONResponse:
+        return JSONResponse(_read_jsonl(settings.docs_dir / task_id / "trace.jsonl"))
+
+    @app.get("/api/quality")
+    async def get_quality() -> JSONResponse:
+        return JSONResponse({
+            "trend": app.state.runs.quality_trend(limit=30),
+            "agents": app.state.runs.agent_track_record(),
+        })
+
+    @app.get("/api/stats")
+    async def get_stats() -> JSONResponse:
+        rows = app.state.runs.list(limit=500)
+        total_cost = sum(float(r.get("cost_usd") or 0) for r in rows)
+        scored = [r for r in rows if r.get("quality_score") is not None]
+        avg_q = round(sum(float(r["quality_score"]) for r in scored) / len(scored), 1) if scored else None
+        by_status: dict[str, int] = {}
+        for r in rows:
+            by_status[r.get("status") or "?"] = by_status.get(r.get("status") or "?", 0) + 1
+        return JSONResponse({
+            "runs": len(rows), "total_cost_usd": round(total_cost, 4),
+            "avg_quality": avg_q, "by_status": by_status,
+            "agents": app.state.runs.agent_track_record(),
+        })
+
+    @app.get("/healthz")
+    async def healthz() -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
+    @app.get("/readyz")
+    async def readyz() -> JSONResponse:
+        ready = settings.data_dir.exists()
+        return JSONResponse({"status": "ready" if ready else "starting", "backend": settings.llm_backend},
+                            status_code=200 if ready else 503)
 
     @app.delete("/api/tasks/{task_id}")
     async def delete_task(task_id: str) -> JSONResponse:
@@ -330,6 +434,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "tldr": r.get("summary") or "", "status": r.get("status"),
                 "tests": r.get("tests"), "cost_usd": r.get("cost_usd"),
                 "passed": r.get("subtasks_passed"), "total": r.get("subtasks_total"),
+                "quality_score": r.get("quality_score"), "run_status": r.get("run_status"),
             } for r in rows])
         # Fallback: docs dirs from runs that predate the run store.
         docs = settings.docs_dir
@@ -360,6 +465,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "sessions_spawned": r.get("sessions_spawned"), "sessions_reaped": r.get("sessions_reaped"),
             "kg_nodes": r.get("kg_nodes"), "kg_edges": r.get("kg_edges"),
             "memories": r.get("memories"), "messages": r.get("messages"),
+            "quality_score": r.get("quality_score"), "run_status": r.get("run_status"),
         }
         return JSONResponse({
             "plan": _read(d / "plan.md"),
@@ -367,6 +473,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "brief": _read(d / "brief.md"),
             "activity": activity,
             "meta": meta,
+            "feedback": app.state.runs.get_feedback(task_id) or {},
         })
 
     @app.get("/api/agents")
@@ -479,6 +586,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 def _read(path: Path) -> str:
     return path.read_text() if path.is_file() else ""
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
 
 
 def _first_tldr(brief: Path) -> str:

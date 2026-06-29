@@ -12,11 +12,15 @@ def test_extract_python_entities(tmp_path):
     n = enrich_kg_from_workspace(kg, tmp_path, "task1")
     assert n == 1
     triples = {(t.subject, t.relation, t.object) for t in kg.all_triples()}
-    assert ("app.py", "defines", "add") in triples
-    assert ("app.py", "defines", "Foo") in triples
+    # symbols are qualified by file (app.py::add) so same-named symbols across files don't collide
+    assert ("app.py", "defines", "app.py::add") in triples
+    assert ("app.py", "defines", "app.py::Foo") in triples
     assert ("app.py", "imports", "os") in triples
     assert ("app.py", "imports", "collections") in triples
     assert ("task1", "produced_file", "app.py") in triples
+    # the defined symbol carries the right node type (not the default "concept")
+    assert kg.node_types().get("app.py::add") == "function"
+    assert kg.node_types().get("app.py::Foo") == "class"
 
 
 def test_extract_skips_pycache(tmp_path):

@@ -41,9 +41,27 @@ CREATE TABLE IF NOT EXISTS queue (
     position INTEGER NOT NULL,
     enqueued_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS feedback (
+    run_id TEXT PRIMARY KEY,
+    rating INTEGER,
+    accepted INTEGER,
+    comment TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT,
+    agent TEXT NOT NULL,
+    passed INTEGER NOT NULL,
+    score INTEGER,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outcomes_agent ON agent_outcomes(agent);
 """
 
-_TERMINAL = {"completed", "failed", "cancelled", "over_budget", "interrupted"}
+_TERMINAL = {"completed", "partial", "failed", "cancelled", "over_budget", "interrupted"}
 
 
 def derive_title(prompt: str) -> str:
@@ -65,7 +83,8 @@ class RunStore:
         self._conn.executescript(_SCHEMA)
         # migrate older DBs that predate newer columns
         for col, decl in (("title", "TEXT"), ("kg_nodes", "INTEGER"), ("kg_edges", "INTEGER"),
-                          ("memories", "INTEGER"), ("messages", "INTEGER")):
+                          ("memories", "INTEGER"), ("messages", "INTEGER"),
+                          ("quality_score", "REAL"), ("run_status", "TEXT")):
             try:
                 self._conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError:
@@ -116,7 +135,48 @@ class RunStore:
     def delete(self, run_id: str) -> None:
         self._conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
         self._conn.execute("DELETE FROM queue WHERE task_id = ?", (run_id,))
+        self._conn.execute("DELETE FROM feedback WHERE run_id = ?", (run_id,))
+        self._conn.execute("DELETE FROM agent_outcomes WHERE run_id = ?", (run_id,))
         self._conn.commit()
+
+    # ---- human feedback (Tier 4) ----
+    def set_feedback(self, run_id: str, *, rating: int | None = None,
+                     accepted: bool | None = None, comment: str = "") -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO feedback(run_id, rating, accepted, comment, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (run_id, rating, None if accepted is None else int(accepted), comment, time.time()),
+        )
+        self._conn.commit()
+
+    def get_feedback(self, run_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM feedback WHERE run_id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+    # ---- learned routing signal (Tier 4) ----
+    def record_agent_outcome(self, run_id: str, agent: str, passed: bool, score: int | None) -> None:
+        self._conn.execute(
+            "INSERT INTO agent_outcomes(run_id, agent, passed, score, created_at) VALUES (?, ?, ?, ?, ?)",
+            (run_id, agent, int(passed), score, time.time()),
+        )
+        self._conn.commit()
+
+    def agent_track_record(self) -> dict[str, dict[str, float | int]]:
+        rows = self._conn.execute(
+            "SELECT agent, COUNT(*) n, SUM(passed) p FROM agent_outcomes GROUP BY agent"
+        ).fetchall()
+        out: dict[str, dict[str, float | int]] = {}
+        for r in rows:
+            n, p = int(r["n"]), int(r["p"] or 0)
+            out[r["agent"]] = {"n": n, "passed": p, "pass_rate": round(p / n, 3) if n else 0.0}
+        return out
+
+    def quality_trend(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT id, created_at, quality_score, status FROM runs "
+            "WHERE quality_score IS NOT NULL ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ---- task queue ----
     def enqueue(self, task_id: str, prompt: str, title: str | None, payload: dict[str, Any]) -> None:

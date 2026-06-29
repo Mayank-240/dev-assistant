@@ -46,15 +46,23 @@ class Orchestrator:
         self._provider = provider
 
     async def make_plan(
-        self, prompt: str, agents: dict[str, BaseAgent], prior_knowledge: str = ""
+        self, prompt: str, agents: dict[str, BaseAgent], prior_knowledge: str = "",
+        repo_context: str = "", track_record: str = "",
     ) -> Plan:
         catalog = capability_catalog(agents)
+        if track_record:
+            catalog += f"\n\nAGENT TRACK RECORD (empirical pass rates from past runs):\n{track_record}"
         prior = (
             f"RELEVANT PRIOR KNOWLEDGE (lessons from past runs — use if helpful):\n{prior_knowledge}\n\n"
             if prior_knowledge else ""
         )
+        repo = (
+            f"EXISTING REPOSITORY (you are modifying this real codebase — reference real files):\n"
+            f"{repo_context}\n\n" if repo_context else ""
+        )
         user = (
             f"TASK:\n{prompt}\n\n"
+            f"{repo}"
             f"{prior}"
             f"AGENT ROSTER (choose 'agent' for each subtask from these names only):\n{catalog}\n\n"
             "Produce the plan."
@@ -69,8 +77,15 @@ class Orchestrator:
         )
         return self._sanitize(plan, agents)
 
-    @staticmethod
-    def _sanitize(plan: Plan, agents: dict[str, BaseAgent]) -> Plan:
+    # Default criteria backfilled when the orchestrator emits a subtask with none — an
+    # ungrounded reviewer is what makes verdicts (and the resulting cascades) meaningless.
+    _DEFAULT_CRITERIA = [
+        "The subtask's stated deliverable is actually produced.",
+        "The result is correct, complete, and self-contained.",
+    ]
+
+    @classmethod
+    def _sanitize(cls, plan: Plan, agents: dict[str, BaseAgent]) -> Plan:
         default_agent = "researcher" if "researcher" in agents else next(iter(agents))
         ids = {st.id for st in plan.subtasks}
         for st in plan.subtasks:
@@ -79,4 +94,7 @@ class Orchestrator:
                 st.agent = default_agent
             # drop dangling / self dependencies
             st.depends_on = [d for d in st.depends_on if d in ids and d != st.id]
+            # semantic backfill: never leave the reviewer with no criteria to check
+            if not [c for c in st.acceptance_criteria if c.strip()]:
+                st.acceptance_criteria = list(cls._DEFAULT_CRITERIA)
         return plan

@@ -23,16 +23,16 @@ class AnthropicProvider:
     name = "anthropic"
 
     def __init__(self, settings: Settings) -> None:
-        self._client = LLMClient(settings)
-        self._max_turns = settings.agent_max_turns
         self.usage = UsageTotals()
+        self._client = LLMClient(settings, usage=self.usage)  # one place records tokens + cost
+        self._max_turns = settings.agent_max_turns
 
     async def structured(
         self, *, system: str, user: str, schema: Type[T], model: str,
         effort: str | None = None, max_tokens: int = 4000,
     ) -> T:
         return await self._client.parse(
-            system=system, user=user, schema=schema, model=model, max_tokens=max_tokens
+            system=system, user=user, schema=schema, model=model, effort=effort, max_tokens=max_tokens
         )
 
     async def run_agent(
@@ -48,12 +48,7 @@ class AnthropicProvider:
                 system=system_prompt, messages=messages, model=model, effort=effort,
                 tools=toolbox.definitions(allowed_tools) or None, max_tokens=max_tokens,
             )
-            u = getattr(resp, "usage", None)
-            if u is not None:
-                self.usage.add(
-                    input_tokens=getattr(u, "input_tokens", 0) or 0,
-                    output_tokens=getattr(u, "output_tokens", 0) or 0,
-                )
+            # usage (tokens + cost) is recorded inside LLMClient.create
             messages.append({"role": "assistant", "content": resp.content})
             last_text = _text_of(resp) or last_text
             if on_step:
