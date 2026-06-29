@@ -71,6 +71,13 @@ class ClaudeSdkProvider:
         chosen = model or self._model
         return {"model": chosen} if chosen else {}
 
+    # The SDK's ClaudeAgentOptions.effort is Literal['low','medium','high','xhigh','max'] —
+    # forward the per-role effort so reasoning depth actually scales on this backend too.
+    _VALID_EFFORT = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+    def _effort_kw(self, effort: str | None) -> dict[str, Any]:
+        return {"effort": effort} if effort in self._VALID_EFFORT else {}
+
     async def _collect(self, *, prompt: str, options: Any, on_step=None, soft_cap: bool = False) -> str:
         sdk = self._sdk
         result: str | None = None
@@ -125,6 +132,7 @@ class ClaudeSdkProvider:
             max_turns=4,  # headroom: a model occasionally needs >1 turn to emit clean JSON
             cwd=self._cwd,  # keep planning/review out of the project source tree
             **self._model_kw(model),
+            **self._effort_kw(effort),
         )
         attempt_user = user
         last_err: Exception | None = None
@@ -162,6 +170,7 @@ class ClaudeSdkProvider:
             max_turns=max_iterations or self._max_turns,
             cwd=cwd,  # built-in file/bash tools operate inside this run's workspace
             **self._model_kw(model),
+            **self._effort_kw(effort),
         )
         return await self._collect(prompt=prompt, options=options, on_step=on_step, soft_cap=True)
 
