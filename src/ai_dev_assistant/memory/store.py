@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +20,8 @@ from typing import Any
 from ..config import Settings
 from .embeddings import get_embedder
 from .vector import VectorStore
+
+_HALF_LIFE_S = 14 * 24 * 3600.0  # recall relevance halves after ~two weeks
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory (
@@ -68,7 +72,8 @@ class MemoryStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
-        self.vectors = VectorStore(self._conn, get_embedder(settings))
+        self._lock = threading.RLock()
+        self.vectors = VectorStore(self._conn, get_embedder(settings), self._lock)
 
     # ---- construction helpers (handy for tests) ----
     @classmethod
@@ -82,7 +87,8 @@ class MemoryStore:
         obj._conn.commit()
         from .embeddings import HashingEmbedder
 
-        obj.vectors = VectorStore(obj._conn, HashingEmbedder())
+        obj._lock = threading.RLock()
+        obj.vectors = VectorStore(obj._conn, HashingEmbedder(), obj._lock)
         return obj
 
     # ---- memory ----
@@ -94,23 +100,50 @@ class MemoryStore:
         key: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> int:
-        cur = self._conn.execute(
-            "INSERT INTO memory(scope, key, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-            (scope, key, content, json.dumps(metadata or {}), time.time()),
-        )
-        self._conn.commit()
-        mem_id = int(cur.lastrowid)
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO memory(scope, key, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
+                (scope, key, content, json.dumps(metadata or {}), time.time()),
+            )
+            self._conn.commit()
+            mem_id = int(cur.lastrowid)
         self.vectors.add(f"memory:{scope}", str(mem_id), content)
         return mem_id
 
-    def recall(self, scope: str, query: str, top_k: int = 5) -> list[MemoryEntry]:
-        hits = self.vectors.search(f"memory:{scope}", query, top_k=top_k)
+    def remember_unique(
+        self,
+        scope: str,
+        content: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        dup_threshold: float = 0.92,
+    ) -> int:
+        """Like ``remember`` but skips writing a near-duplicate (cosine ≥ threshold).
+
+        Keeps the long-term pile from filling with the same lesson every run. Returns the
+        existing entry's id when a duplicate is found, else the new id.
+        """
+        hits = self.vectors.search(f"memory:{scope}", content, top_k=1, min_score=dup_threshold)
+        if hits:
+            return int(hits[0][0])
+        return self.remember(scope, content, metadata=metadata)
+
+    def recall(self, scope: str, query: str, top_k: int = 5,
+               min_score: float = 0.0, decay: bool = False) -> list[MemoryEntry]:
+        # Over-fetch so re-ranking by recency has something to work with.
+        hits = self.vectors.search(f"memory:{scope}", query, top_k=top_k * 3, min_score=min_score)
         entries: list[MemoryEntry] = []
         for ref_id, score, _text in hits:
             row = self._conn.execute("SELECT * FROM memory WHERE id = ?", (int(ref_id),)).fetchone()
             if row:
                 entries.append(self._row_to_entry(row, score))
-        return entries
+        if decay:
+            now = time.time()
+            entries.sort(
+                key=lambda e: (e.score or 0.0) * math.exp(-(now - e.created_at) / _HALF_LIFE_S),
+                reverse=True,
+            )
+        return entries[:top_k]
 
     def recent(self, scope: str, limit: int = 10) -> list[MemoryEntry]:
         rows = self._conn.execute(
@@ -120,11 +153,12 @@ class MemoryStore:
 
     # ---- blackboard ----
     def blackboard_put(self, key: str, value: str, author: str = "") -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO blackboard(key, value, author, updated_at) VALUES (?, ?, ?, ?)",
-            (key, value, author, time.time()),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO blackboard(key, value, author, updated_at) VALUES (?, ?, ?, ?)",
+                (key, value, author, time.time()),
+            )
+            self._conn.commit()
 
     def blackboard_get(self, key: str) -> str | None:
         row = self._conn.execute("SELECT value FROM blackboard WHERE key = ?", (key,)).fetchone()
@@ -176,8 +210,16 @@ class ScopedMemory:
         md.setdefault("mem_scope", self.write_scope)
         return target.remember(scope, content, key=key, metadata=md)
 
-    def recall(self, scope: str, query: str, top_k: int = 5) -> list[MemoryEntry]:
-        merged = self.project.recall(scope, query, top_k=top_k) + self.glob.recall(scope, query, top_k=top_k)
+    def remember_unique(self, scope: str, content: str, *, metadata: dict[str, Any] | None = None) -> int:
+        target = self.glob if self.write_scope == "global" else self.project
+        md = dict(metadata or {})
+        md.setdefault("mem_scope", self.write_scope)
+        return target.remember_unique(scope, content, metadata=md)
+
+    def recall(self, scope: str, query: str, top_k: int = 5,
+               min_score: float = 0.0, decay: bool = False) -> list[MemoryEntry]:
+        merged = (self.project.recall(scope, query, top_k=top_k, min_score=min_score, decay=decay)
+                  + self.glob.recall(scope, query, top_k=top_k, min_score=min_score, decay=decay))
         merged.sort(key=lambda e: (e.score if e.score is not None else 0.0), reverse=True)
         return merged[:top_k]
 

@@ -1,42 +1,45 @@
 # syntax=docker/dockerfile:1
-# ---- Notes API container ---------------------------------------------------
-# Runs the FastAPI notes app (notes_app package) via uvicorn on port 8000.
-# Build context is the repo root so the notes_app/ package is importable.
+# ---- AI Dev Assistant container --------------------------------------------
+# Runs the FastAPI web UI (ai_dev_assistant.web.server:app) via uvicorn on :8000.
+# Build context is the repo root. Use the 'anthropic' backend in a container (the Claude
+# Agent SDK backend needs an interactive Claude Code login, which isn't available here):
+#   docker build -t ai-dev-assistant .
+#   docker run -p 8000:8000 -e ADA_LLM_BACKEND=anthropic -e ANTHROPIC_API_KEY=sk-... \
+#              -v ada-data:/data ai-dev-assistant
 FROM python:3.12-slim AS runtime
 
-# Sensible Python defaults for containers:
-#  - no .pyc files, unbuffered stdout/stderr for live logs
-#  - pip: no cache, no version-check chatter
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    # SQLite DB lives on a writable volume (WAL mode also writes -wal/-shm sidecars here)
-    NOTES_DB_PATH=/data/notes.db
+    ADA_LLM_BACKEND=anthropic \
+    ADA_EMBEDDINGS_BACKEND=hash \
+    ADA_DATA_DIR=/data/.ada_data \
+    ADA_DOCS_DIR=/data/docs \
+    ADA_WORKSPACE_DIR=/data/workspace
 
 WORKDIR /app
 
-# 1) Install dependencies first (cached layer — only re-runs when requirements change)
-COPY notes_app/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# git is needed for the repo-binding + branch/commit delivery features.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 
-# 2) Copy the application package
-COPY notes_app/ ./notes_app/
+# 1) Install the package (deps resolve from pyproject) — cached unless sources change.
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+RUN pip install --no-cache-dir .
 
-# 3) Run as an unprivileged user and give it ownership of the data dir
+# 2) Run as an unprivileged user; give it the writable data volume.
 RUN useradd --create-home --uid 10001 appuser \
     && mkdir -p /data \
     && chown -R appuser:appuser /app /data
 USER appuser
 
-# SQLite data directory (DB + WAL/SHM sidecars). Mount a volume to persist.
 VOLUME ["/data"]
-
 EXPOSE 8000
 
-# Liveness/readiness probe against the app's healthcheck endpoint (no curl needed).
+# Liveness/readiness against the real /healthz endpoint (no curl needed).
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"]
 
-# Start the FastAPI app via uvicorn, bound to all interfaces on the exposed port.
-CMD ["uvicorn", "notes_app.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "ai_dev_assistant.web.server:app", "--host", "0.0.0.0", "--port", "8000"]

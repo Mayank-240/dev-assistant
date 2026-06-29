@@ -25,12 +25,15 @@ _COLLAB = (
 )
 
 _FULL_TOOLS = [
-    "recall", "remember", "kb_search", "kg_query", "kg_write", "read_file",
+    "recall", "remember", "kb_search", "kg_query", "kg_write",
+    "read_file", "write_file", "edit_file", "apply_patch", "list_dir", "grep",
+    "run_command", "install_packages", "git_status", "git_diff",
     "send_message", "read_messages", "blackboard_read", "blackboard_write", "run_tests",
 ]
 
 _READONLY_TOOLS = [
-    "recall", "kb_search", "kg_query", "read_file", "read_messages", "blackboard_read",
+    "recall", "kb_search", "kg_query", "read_file", "list_dir", "grep",
+    "read_messages", "blackboard_read",
 ]
 
 # Agents that produce code/artifacts must persist them to disk so they can be executed
@@ -40,9 +43,10 @@ _WRITES_FILES = {
     "frontend", "integrator",
 }
 _WRITE_FILES_NOTE = (
-    " Write your code and tests as ACTUAL FILES in the current working directory using your "
-    "file tools (create/write/edit) — not only in your reply — so the team can run and verify "
-    "them. Then call run_tests to check they pass."
+    " Write your code and tests as ACTUAL FILES in the workspace using the write_file / "
+    "edit_file / apply_patch tools (relative paths) — not only in your reply — so the team can "
+    "run and verify them. Use read_file / list_dir / grep to inspect existing files first when "
+    "modifying a repository. Then call run_tests (or run_command) to check they pass."
 )
 
 

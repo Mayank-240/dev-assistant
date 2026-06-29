@@ -32,6 +32,11 @@ def _build_parser() -> argparse.ArgumentParser:
     servep.add_argument("--port", type=int, default=8000)
     servep.add_argument("--reload", action="store_true",
                         help="Auto-restart the server when source files change (dev)")
+
+    evalp = sub.add_parser("eval", help="Run the golden-task eval harness and score the assistant")
+    evalp.add_argument("--only", action="append", default=[], metavar="TASK_ID",
+                       help="Run only these golden task ids (repeatable)")
+    evalp.add_argument("--json", action="store_true", help="Emit the scorecard as JSON")
     return parser
 
 
@@ -41,7 +46,28 @@ def main(argv: list[str] | None = None) -> int:
         return _run(args)
     if args.cmd == "serve":
         return _serve(args)
+    if args.cmd == "eval":
+        return _eval(args)
     return 1
+
+
+def _eval(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from .evals.harness import run_eval_sync
+
+    logging.basicConfig(level=logging.WARNING, format="%(message)s", stream=sys.stderr)
+    settings = Settings.load()
+    if settings.requires_api_key and not settings.has_api_key:
+        print("ERROR: the eval harness needs a working LLM backend (set a key or use claude_sdk).",
+              file=sys.stderr)
+        return 2
+    report = run_eval_sync(settings, only=args.only or None)
+    if args.json:
+        print(_json.dumps([c.to_dict() for c in report.cards], indent=2))
+    else:
+        print(report.summary())
+    return 0 if report.passed == len(report.cards) else 1
 
 
 def _serve(args: argparse.Namespace) -> int:

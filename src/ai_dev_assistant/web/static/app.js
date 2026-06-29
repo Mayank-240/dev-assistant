@@ -75,6 +75,9 @@ function resetRunView(prompt) {
   $("usage-line").textContent = "";
   $("plan-editor").classList.add("hidden");
   const cb = $("cancel-btn"); cb.classList.remove("hidden"); cb.disabled = false;
+  $("feedback-box").classList.add("hidden"); _fbRating = null;
+  if ($("fb-comment")) $("fb-comment").value = "";
+  updateRunControls();
   $("pipeline").classList.remove("hidden");
   $("progress-row").classList.remove("hidden");
   $("plan-dag-card").classList.add("hidden");
@@ -498,6 +501,7 @@ function handleEvent(ev) {
         $("progress-row").classList.remove("hidden");
         loadQueue();
       }
+      updateRunControls();
       $("plan-card").classList.remove("hidden");
       $("plan-summary").textContent = d.summary || "";
       $("agents-title").classList.remove("hidden");
@@ -561,10 +565,11 @@ function handleEvent(ev) {
         if (d.result) a.result = d.result;
         a.end = ev.ts;
       }
+      if (a) { a.objective_note = d.objective_note || ""; a.cost = d.cost || null; }
       if (state.openAgentId === d.id) renderAgentModal(state.agentData[d.id]);
       updateProgress();
       setMetricsFrom(d);
-      feed((d.passed ? "✓ " : "✗ ") + ev.message);
+      feed((d.passed ? "✓ " : "✗ ") + ev.message + (d.objective_note ? "  ·  " + d.objective_note : ""));
       break;
     }
     case "message":
@@ -579,6 +584,27 @@ function handleEvent(ev) {
     case "budget":
       showToast("⚠ " + (ev.message || "Budget exceeded"), "warn", 7000);
       feed("⚠ " + ev.message);
+      break;
+    case "diff": {
+      const added = (d.added || []).length, mod = (d.modified || []).length;
+      feed(`✎ ${d.id}: +${added} file(s), ~${mod} changed`);
+      const a = state.agentData[d.id];
+      if (a) a.diff = { added: d.added || [], modified: d.modified || [] };
+      break;
+    }
+    case "git":
+      showToast("⎇ " + (ev.message || "Committed to a branch"), "success", 6000);
+      feed("⎇ " + ev.message);
+      break;
+    case "reflection":
+      state.reflection = d;
+      feed("✦ Lessons: " + (d.summary || ""));
+      break;
+    case "control":
+      feed("⏸ " + (ev.message || ""));
+      if (d.paused === true) { $("status-pill").className = "pill"; $("status-pill").textContent = "paused"; }
+      else if (d.paused === false) { $("status-pill").className = "pill pill-running"; $("status-pill").textContent = "running"; }
+      updateRunControls();
       break;
     case "execution": {
       setPhase("verify");
@@ -603,15 +629,23 @@ function handleEvent(ev) {
       setMetricsFrom(d);
       if (d.cost_usd !== undefined) $("m-cost").textContent = "$" + Number(d.cost_usd).toFixed(4);
       $("cancel-btn").classList.add("hidden");
+      $("pause-btn").classList.add("hidden"); $("steer-btn").classList.add("hidden");
       if (d.tests && d.tests !== "n/a") {
         const el = $("m-tests");
         el.textContent = d.tests === "passed" ? "✓" : "✗";
         el.style.color = d.tests === "passed" ? "var(--green)" : "var(--red)";
       }
       if ("passed" in d) {
-        $("status-pill").className = "pill pill-done";
-        $("status-pill").textContent = `${d.passed}/${d.total} passed`;
+        const soft = d.run_status === "partial";
+        $("status-pill").className = "pill " + (soft ? "pill-warn" : "pill-done");
+        $("status-pill").textContent = `${d.passed}/${d.total} passed` + (soft ? " · partial" : "");
+        if (d.quality_score != null) $("status-pill").title = "quality " + d.quality_score + "/100";
       }
+      if (d.quality_score != null) {
+        const ul = $("usage-line");
+        if (ul) ul.textContent = (ul.textContent ? ul.textContent + "  ·  " : "") + "quality " + d.quality_score + "/100";
+      }
+      revealFeedback(d.task_id);
       if (d.over_budget) {
         $("status-pill").className = "pill pill-err";
         $("status-pill").textContent = "over budget";
@@ -1031,7 +1065,7 @@ async function openTask(id, meta) {
 
 // ---- view tabs (Run / Agents / Memory / Graph) ----
 let currentView = "run";
-const VIEWS = { run: "view-run", agents: "view-agents", memory: "view-memory", graph: "view-graph", files: "view-files" };
+const VIEWS = { run: "view-run", agents: "view-agents", memory: "view-memory", graph: "view-graph", files: "view-files", dashboard: "view-dashboard" };
 
 function switchView(name) {
   currentView = name;
@@ -1041,6 +1075,79 @@ function switchView(name) {
   if (name === "memory") loadMemory();
   if (name === "graph") loadGraph();
   if (name === "files") loadFiles();
+  if (name === "dashboard") loadDashboard();
+}
+
+// ---- Dashboard (Tier 5) ----
+async function loadDashboard() {
+  let s;
+  try { s = await (await fetch("/api/stats")).json(); } catch (e) { return; }
+  $("ds-runs").textContent = s.runs ?? 0;
+  $("ds-cost").textContent = "$" + Number(s.total_cost_usd || 0).toFixed(2);
+  $("ds-quality").textContent = s.avg_quality != null ? s.avg_quality : "—";
+  const by = s.by_status || {};
+  $("ds-ok").textContent = by.completed || 0;
+  $("ds-partial").textContent = by.partial || 0;
+  $("ds-failed").textContent = (by.failed || 0) + (by.over_budget || 0);
+  const wrap = $("ds-agents");
+  const agents = s.agents || {};
+  const names = Object.keys(agents).sort((a, b) => agents[b].pass_rate - agents[a].pass_rate);
+  if (!names.length) { wrap.innerHTML = '<p class="muted">No data yet — run a few tasks.</p>'; return; }
+  wrap.innerHTML = "";
+  names.forEach(n => {
+    const a = agents[n];
+    const row = document.createElement("div");
+    row.className = "ds-agent-row";
+    const pct = Math.round((a.pass_rate || 0) * 100);
+    row.innerHTML = `<span class="ds-agent-name">${n}</span>`
+      + `<span class="ds-bar"><span class="ds-bar-fill" style="width:${pct}%"></span></span>`
+      + `<span class="ds-agent-num">${pct}% · ${a.passed}/${a.n}${a.n < 5 ? " (low data)" : ""}</span>`;
+    wrap.appendChild(row);
+  });
+}
+
+// ---- In-run control (Tier 5): pause / resume / steer ----
+function updateRunControls() {
+  const running = $("status-pill").textContent === "running" || $("status-pill").textContent === "paused";
+  const paused = $("status-pill").textContent === "paused";
+  const pb = $("pause-btn"), sb = $("steer-btn");
+  if (!pb || !sb) return;
+  pb.classList.toggle("hidden", !running);
+  sb.classList.toggle("hidden", !running);
+  pb.textContent = paused ? "▶ Resume" : "⏸ Pause";
+}
+async function pauseResume() {
+  if (!state.taskId) return;
+  const paused = $("status-pill").textContent === "paused";
+  try { await fetch(`/api/run/${state.taskId}/${paused ? "resume" : "pause"}`, { method: "POST" }); }
+  catch (e) { showToast("Control failed", "warn"); }
+}
+async function steerRun() {
+  if (!state.taskId) return;
+  const note = prompt("Steering note for the next subtask:");
+  if (!note) return;
+  try { await fetch(`/api/run/${state.taskId}/steer`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note }) }); showToast("Steering note queued", "success"); }
+  catch (e) { showToast("Steer failed", "warn"); }
+}
+
+// ---- Feedback (Tier 4) ----
+let _fbRating = null;
+function revealFeedback(taskId) {
+  const box = $("feedback-box");
+  if (!box) return;
+  box.dataset.task = taskId || state.taskId || "";
+  box.classList.remove("hidden");
+  $("fb-thanks").classList.add("hidden");
+}
+async function sendFeedback(extra) {
+  const box = $("feedback-box");
+  const tid = box && box.dataset.task;
+  if (!tid) return;
+  const body = { rating: _fbRating, comment: $("fb-comment").value || "", ...extra };
+  try {
+    await fetch(`/api/run/${tid}/feedback`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    $("fb-thanks").classList.remove("hidden");
+  } catch (e) { showToast("Feedback failed", "warn"); }
 }
 document.querySelectorAll(".vtab").forEach(b => b.onclick = () => switchView(b.dataset.view));
 
@@ -1323,6 +1430,17 @@ $("project").onchange = onProjectChange;
 $("new-project").onclick = createProject;
 $("q-pause").onclick = togglePause;
 $("q-concurrency").onchange = setConcurrency;
+// in-run control + feedback + dashboard
+$("pause-btn").onclick = pauseResume;
+$("steer-btn").onclick = steerRun;
+$("dash-refresh").onclick = loadDashboard;
+$("fb-accept").onclick = () => sendFeedback({ accepted: true });
+$("fb-reject").onclick = () => sendFeedback({ accepted: false });
+document.querySelectorAll("#fb-stars button").forEach(b => b.onclick = () => {
+  _fbRating = parseInt(b.dataset.r);
+  document.querySelectorAll("#fb-stars button").forEach(x => x.classList.toggle("on", parseInt(x.dataset.r) <= _fbRating));
+  sendFeedback({});
+});
 loadProjects();
 loadRecent();
 loadQueue();
