@@ -108,7 +108,7 @@ class Settings:
     # --- Observability (Tier 5) ---
     trace: bool = True              # record an LLM/tool span log per run
     record_dir: str = ""           # if set, record provider calls as replay cassettes here
-    replay_dir: str = ""           # if set, serve provider calls from cassettes here (offline)
+    replay_dir: str = ""           # if set, server provider calls from cassettes here (offline)
 
     # --- Storage / embeddings ---
     embeddings_backend: str = "fastembed"  # "fastembed" | "hash"
