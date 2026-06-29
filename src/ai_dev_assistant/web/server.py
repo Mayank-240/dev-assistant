@@ -89,6 +89,16 @@ class PlanRequest(BaseModel):
     budget: float | None = None
 
 
+class RefinePlanRequest(BaseModel):
+    prompt: str
+    plan: dict[str, Any]          # the current (possibly hand-edited) plan
+    instruction: str              # natural-language refinement, e.g. "add a security review"
+    project: str | None = None
+    memory_scope: str | None = None
+    effort: str | None = None
+    budget: float | None = None
+
+
 class RunRequest(BaseModel):
     prompt: str
     plan: dict[str, Any] | None = None  # an approved/edited plan (skips re-planning)
@@ -214,6 +224,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "plan_id": new_task_id(),
             "plan": {"title": plan.title, "summary": plan.summary,
                      "subtasks": [st.model_dump() for st in plan.subtasks]},
+        })
+
+    @app.post("/api/plan/refine")
+    async def refine_plan(req: RefinePlanRequest) -> JSONResponse:
+        if not (req.instruction or "").strip():
+            return JSONResponse({"error": "instruction is required"}, status_code=400)
+        engine = Engine(_settings_for(settings, req.effort, req.budget, req.project, req.memory_scope))
+        try:
+            current = Plan.model_validate(req.plan)
+            plan = await engine.refine_plan(req.prompt, current, req.instruction)
+        except LLMError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=502)
+        finally:
+            await engine.aclose()
+        warning = ""
+        try:  # surface a structural problem in the proposed plan without blocking the editor
+            from ..orchestration.task import TaskRun
+            TaskRun.from_plan(req.prompt, plan).validate()
+        except Exception as exc:  # noqa: BLE001
+            warning = str(exc)
+        return JSONResponse({
+            "plan_id": new_task_id(),
+            "plan": {"title": plan.title, "summary": plan.summary,
+                     "subtasks": [st.model_dump() for st in plan.subtasks]},
+            "warning": warning,
         })
 
     @app.post("/api/run")

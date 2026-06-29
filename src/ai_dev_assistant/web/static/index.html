@@ -151,9 +151,15 @@
             </div>
 
             <div id="plan-editor" class="card hidden">
-              <span class="kicker">Review plan — edit titles/agents or remove steps, then approve</span>
+              <span class="kicker">Review plan — edit fields inline, or refine in plain English, then approve</span>
               <p id="pe-summary" class="plan-summary"></p>
               <div id="pe-list" class="pe-list"></div>
+              <div class="pe-refine">
+                <input id="pe-instruction" class="title-input" type="text"
+                       placeholder="Refine the plan — e.g. “add a security review step”, “merge steps 2 and 3”, “use the database agent for the schema”" />
+                <button id="refine-btn" class="ghost-btn" title="Ask the orchestrator to revise the plan">↻ Refine</button>
+              </div>
+              <p id="pe-warning" class="hint hidden"></p>
               <div class="pe-actions">
                 <button id="approve-btn">Approve &amp; Run</button>
                 <button id="discard-btn" class="ghost-btn">Discard</button>
