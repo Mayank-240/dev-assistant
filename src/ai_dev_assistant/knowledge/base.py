@@ -43,6 +43,11 @@ class KnowledgeBase:
             self._vectors.add(_KB_NAMESPACE, f"{doc_id}#{i}", chunk)
         return len(chunks)
 
-    def search(self, query: str, top_k: int = 5) -> list[KBHit]:
-        hits = self._vectors.search(_KB_NAMESPACE, query, top_k=top_k)
+    def reingest(self, doc_id: str, text: str) -> int:
+        """Re-index a document, dropping its prior chunks first (avoids orphaned chunks)."""
+        self._vectors.delete_prefix(_KB_NAMESPACE, f"{doc_id}#")
+        return self.ingest(doc_id, text)
+
+    def search(self, query: str, top_k: int = 5, min_score: float = 0.0) -> list[KBHit]:
+        hits = self._vectors.search(_KB_NAMESPACE, query, top_k=top_k, min_score=min_score)
         return [KBHit(ref_id=r, score=s, text=t) for r, s, t in hits]

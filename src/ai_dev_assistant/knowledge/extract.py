@@ -46,10 +46,12 @@ def _extract_python(kg: KnowledgeGraph, rel: str, path: Path) -> None:
         if defs >= _MAX_DEFS_PER_FILE:
             break
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            kg.add_fact(rel, "defines", node.name, kind="function")
+            # qualify the symbol id by file so same-named funcs across files don't collapse,
+            # and set the node's type (not just an edge attr) so node_types() is correct.
+            kg.add_fact(rel, "defines", f"{rel}::{node.name}", obj_type="function", kind="function")
             defs += 1
         elif isinstance(node, ast.ClassDef):
-            kg.add_fact(rel, "defines", node.name, kind="class")
+            kg.add_fact(rel, "defines", f"{rel}::{node.name}", obj_type="class", kind="class")
             defs += 1
         elif isinstance(node, ast.Import):
             for alias in node.names:
