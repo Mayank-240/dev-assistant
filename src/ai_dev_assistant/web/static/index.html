@@ -54,6 +54,10 @@
 
           <section class="composer card">
             <label for="prompt">New task</label>
+            <div id="continue-banner" class="continue-banner hidden">
+              <span>↻ Continuing <b id="continue-ref"></b> — your prompt builds on its workspace &amp; context</span>
+              <button id="continue-clear" type="button" title="Start a fresh task instead">✕</button>
+            </div>
             <textarea id="prompt" rows="4" placeholder="e.g. Add input validation to a sample function and document it"></textarea>
             <input id="task-title" class="title-input" type="text" maxlength="80"
                    placeholder="Title (optional) — auto-generated from the task if left blank" />
@@ -233,7 +237,10 @@
                 <span class="kicker">Brief</span>
                 <p id="brief-tldr" class="brief-tldr"></p>
                 <ul id="brief-points" class="brief-points"></ul>
-                <a id="docs-link" class="docs-link" href="#">View full report →</a>
+                <div class="brief-actions">
+                  <a id="docs-link" class="docs-link" href="#">View full report →</a>
+                  <button id="reengage-btn" class="ghost-btn" title="Continue this task with a follow-up instruction">↻ Re-engage this task</button>
+                </div>
                 <div id="feedback-box" class="feedback-box hidden">
                   <span class="kicker">Was this run useful?</span>
                   <div class="fb-row">
@@ -356,7 +363,10 @@
           <button class="tab" data-doc="plan">Plan</button>
           <button class="tab" data-doc="report">Report</button>
         </div>
-        <button id="modal-close" class="ghost">✕</button>
+        <div class="modal-head-actions">
+          <button id="modal-reengage" class="ghost-btn" title="Continue this task with a follow-up instruction">↻ Re-engage</button>
+          <button id="modal-close" class="ghost">✕</button>
+        </div>
       </div>
       <pre id="modal-content" class="modal-content"></pre>
     </div>

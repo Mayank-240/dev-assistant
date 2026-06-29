@@ -26,6 +26,7 @@ const state = {
   timer: null,
   startedAt: 0,
   docsId: null,      // run.id used for the docs folder
+  continueFrom: null, // task id being re-engaged (continuation), or null for a fresh task
 };
 
 function setConn(text, cls) {
@@ -311,7 +312,27 @@ function getControls() {
   return {
     effort: $("effort").value, budget: (b && b > 0) ? b : null, title: t || null,
     project: selectedProject(), memory_scope: $("mem-scope").value,
+    continue_from: state.continueFrom || null,
   };
+}
+
+// ---- re-engage: continue a completed task with a follow-up prompt ----
+function setContinue(taskId, label) {
+  if (!taskId) return;
+  state.continueFrom = taskId;
+  $("continue-ref").textContent = label || taskId;
+  $("continue-banner").classList.remove("hidden");
+  if (!$("modal").classList.contains("hidden")) $("modal").classList.add("hidden");
+  const p = $("prompt");
+  p.placeholder = "What should the assistant do next on this task? e.g. “add error handling and tests”";
+  p.focus();
+  p.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function clearContinue() {
+  state.continueFrom = null;
+  $("continue-banner").classList.add("hidden");
+  $("prompt").placeholder = "e.g. Add input validation to a sample function and document it";
 }
 
 // ---- projects (scope memory + knowledge graph) ----
@@ -802,6 +823,7 @@ function discardPlan() {
   $("plan-editor").classList.add("hidden");
   $("empty").classList.remove("hidden");
   $("run-btn").disabled = false;
+  clearContinue();
 }
 
 async function launchRun(body, prompt) {
@@ -815,6 +837,7 @@ async function launchRun(body, prompt) {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     })).json()).task_id;
   } catch (e) { feed("✗ could not start run: " + e); $("run-btn").disabled = false; return; }
+  clearContinue();  // the continuation context was captured in `body`; reset for the next task
   connectWS(taskId);
 }
 
@@ -947,10 +970,12 @@ function showUndoToast(msg, onUndo, ms = 6000) {
 }
 
 let currentDocs = null;
+let currentDocsId = null;
 async function openDocs(id) {
   try {
     currentDocs = await (await fetch("/api/tasks/" + id)).json();
   } catch (e) { return; }
+  currentDocsId = id;
   $("modal").classList.remove("hidden");
   selectTab("brief");
 }
@@ -1444,6 +1469,10 @@ document.querySelectorAll(".ex-chip").forEach(b => b.onclick = () => { $("prompt
 $("approve-btn").onclick = approvePlan;
 $("discard-btn").onclick = discardPlan;
 $("refine-btn").onclick = refinePlan;
+// re-engage (continue a completed task)
+$("continue-clear").onclick = clearContinue;
+$("reengage-btn").onclick = () => setContinue(state.docsId, state.docsId);
+$("modal-reengage").onclick = () => setContinue(currentDocsId, currentDocsId);
 $("pe-instruction").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); refinePlan(); } });
 $("cancel-btn").onclick = cancelRun;
 $("mem-refresh").onclick = loadMemory;

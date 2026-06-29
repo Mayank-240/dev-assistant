@@ -27,9 +27,11 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Ingest a file into the knowledge base first (repeatable)")
     runp.add_argument("-i", "--interactive", action="store_true",
                       help="Interactive plan mode: propose a plan, refine it in plain English, then run")
+    runp.add_argument("--continue", dest="continue_from", metavar="TASK_ID", default=None,
+                      help="Re-engage a completed task: continue its workspace + context with this prompt")
     runp.add_argument("-q", "--quiet", action="store_true", help="Hide internal INFO logs")
 
-    servep = sub.add_parser("serve", help="Launch the web UI")
+    servep = sub.add_parser("server", help="Launch the web UI")
     servep.add_argument("--host", default="127.0.0.1")
     servep.add_argument("--port", type=int, default=8000)
     servep.add_argument("--reload", action="store_true",
@@ -46,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.cmd == "run":
         return _run(args)
-    if args.cmd == "serve":
+    if args.cmd == "server":
         return _serve(args)
     if args.cmd == "eval":
         return _eval(args)
@@ -123,11 +125,11 @@ def _print_plan(plan) -> None:
     print()
 
 
-async def _interactive_plan(engine, prompt: str):
+async def _interactive_plan(engine, prompt: str, continue_from: str | None = None):
     """Propose a plan, let the user refine it in plain English, then approve (or abort)."""
     print("Planning…")
     try:
-        plan = await engine.make_plan(prompt)
+        plan = await engine.make_plan(prompt, continue_from=continue_from)
     except LLMError as exc:
         print(f"Planning failed: {exc}", file=sys.stderr)
         return None
@@ -183,13 +185,16 @@ async def _run_async(args: argparse.Namespace, settings: Settings) -> int:
                 print(f"WARNING: --ingest file not found: {path}", file=sys.stderr)
 
         plan = None
+        cont = getattr(args, "continue_from", None)
+        if cont:
+            print(f"Continuing task {cont} — its workspace and outcome will be carried forward.")
         if getattr(args, "interactive", False):
-            plan = await _interactive_plan(engine, args.prompt)
+            plan = await _interactive_plan(engine, args.prompt, cont)
             if plan is None:
                 print("Aborted — no run started.")
                 return 0
 
-        run, brief, out_dir = await engine.run(args.prompt, plan=plan, on_event=on_event)
+        run, brief, out_dir = await engine.run(args.prompt, plan=plan, continue_from=cont, on_event=on_event)
     except LLMError as exc:
         print(f"\nRun failed: {exc}", file=sys.stderr)
         return 1

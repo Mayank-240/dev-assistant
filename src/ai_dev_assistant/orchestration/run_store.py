@@ -84,7 +84,8 @@ class RunStore:
         # migrate older DBs that predate newer columns
         for col, decl in (("title", "TEXT"), ("kg_nodes", "INTEGER"), ("kg_edges", "INTEGER"),
                           ("memories", "INTEGER"), ("messages", "INTEGER"),
-                          ("quality_score", "REAL"), ("run_status", "TEXT")):
+                          ("quality_score", "REAL"), ("run_status", "TEXT"),
+                          ("parent_id", "TEXT")):
             try:
                 self._conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError:
@@ -105,6 +106,11 @@ class RunStore:
             "UPDATE runs SET status = 'interrupted', ended_at = ? WHERE status = 'running'",
             (time.time(),),
         )
+        self._conn.commit()
+
+    def set_parent(self, run_id: str, parent_id: str) -> None:
+        """Link a run to the task it continues (re-engagement chain)."""
+        self._conn.execute("UPDATE runs SET parent_id = ? WHERE id = ?", (parent_id, run_id))
         self._conn.commit()
 
     def set_status(self, run_id: str, status: str) -> None:
