@@ -61,17 +61,35 @@ class Broker:
         self._subs.discard(q)
 
 
-# effort -> (agent_max_turns, max_retries); low/medium also drop to a cheaper model
-_EFFORT = {"low": (12, 0), "medium": (24, 0), "high": (40, 1)}
+# UI effort tier -> run knobs. Higher tiers raise the per-role reasoning effort
+# (output_config.effort on the API backend), the per-agent turn budget, and review retries;
+# low/medium also drop to a cheaper model. "high" reproduces the env defaults exactly.
+_EFFORT: dict[str, dict[str, Any]] = {
+    "low":    {"turns": 12, "retries": 0, "model": "claude-sonnet-4-6",
+               "orch": "low",    "agent": "low",    "rev": "low"},
+    "medium": {"turns": 24, "retries": 0, "model": "claude-sonnet-4-6",
+               "orch": "medium", "agent": "medium", "rev": "medium"},
+    "high":   {"turns": 40, "retries": 1, "model": None,
+               "orch": "high",   "agent": "medium", "rev": "high"},
+    "xhigh":  {"turns": 60, "retries": 2, "model": None,
+               "orch": "xhigh",  "agent": "high",   "rev": "xhigh"},
+    "max":    {"turns": 80, "retries": 2, "model": None,
+               "orch": "max",    "agent": "max",    "rev": "max"},
+}
 
 
 def _settings_for(base: Settings, effort: str | None, budget: float | None,
                   project: str | None = None, memory_scope: str | None = None) -> Settings:
     overrides: dict[str, Any] = {}
-    if effort in _EFFORT:
-        overrides["agent_max_turns"], overrides["max_retries"] = _EFFORT[effort]
-        if effort in ("low", "medium"):
-            overrides["sdk_model"] = "claude-sonnet-4-6"  # cheaper than the default Opus
+    cfg = _EFFORT.get(effort or "")
+    if cfg:
+        overrides["agent_max_turns"] = cfg["turns"]
+        overrides["max_retries"] = cfg["retries"]
+        overrides["orchestrator_effort"] = cfg["orch"]
+        overrides["agent_effort"] = cfg["agent"]
+        overrides["reviewer_effort"] = cfg["rev"]
+        if cfg["model"]:
+            overrides["sdk_model"] = cfg["model"]  # cheaper than the default Opus
     if budget and budget > 0:
         overrides["budget_usd"] = budget
     if project:

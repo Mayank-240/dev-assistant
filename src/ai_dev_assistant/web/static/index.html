@@ -64,9 +64,11 @@
               </div>
             </label>
             <div class="controls">
-              <label class="ctl" title="Lower effort uses a cheaper model and fewer agent turns">Effort
+              <label class="ctl" title="Higher effort = deeper reasoning, more agent turns & review retries; lower = cheaper & faster (Sonnet)">Effort
                 <select id="effort" class="select">
-                  <option value="high">High · Opus</option>
+                  <option value="max">Max · Opus</option>
+                  <option value="xhigh">X-High · Opus</option>
+                  <option value="high" selected>High · Opus</option>
                   <option value="medium">Medium · Sonnet</option>
                   <option value="low">Low · fast</option>
                 </select>

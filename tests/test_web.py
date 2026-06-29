@@ -49,3 +49,24 @@ def test_quality_and_events_endpoints(tmp_path):
     assert "trend" in c.get("/api/quality").json()
     assert c.get("/api/tasks/does-not-exist/events").json() == []
     assert c.get("/api/tasks/does-not-exist/trace").json() == []
+
+
+def test_effort_tiers_including_xhigh_and_max():
+    from ai_dev_assistant.web.server import _EFFORT, _settings_for
+
+    base = Settings()
+    assert {"low", "medium", "high", "xhigh", "max"} <= set(_EFFORT)
+
+    # high reproduces the env-default role mix (no surprise cost change)
+    hi = _settings_for(base, "high", None)
+    assert (hi.orchestrator_effort, hi.agent_effort, hi.reviewer_effort) == ("high", "medium", "high")
+
+    # the new tiers raise reasoning effort, turns, and retries monotonically
+    xh = _settings_for(base, "xhigh", None)
+    mx = _settings_for(base, "max", None)
+    assert xh.orchestrator_effort == "xhigh" and xh.reviewer_effort == "xhigh"
+    assert mx.orchestrator_effort == "max" and mx.agent_effort == "max" and mx.reviewer_effort == "max"
+    assert hi.agent_max_turns < xh.agent_max_turns < mx.agent_max_turns
+    assert mx.max_retries >= 2
+    # higher tiers keep Opus (no cheaper-model override)
+    assert xh.sdk_model == base.sdk_model and mx.sdk_model == base.sdk_model
