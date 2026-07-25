@@ -109,6 +109,24 @@ def test_project_endpoints_require_token(tmp_path, monkeypatch):
     assert c.delete("/api/projects/default", headers=hdr).status_code == 409
 
 
+# ---- F4: review/permissions + project-runs endpoints stay behind the auth middleware ----
+
+def test_review_and_permissions_endpoints_require_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    assert c.get("/api/tasks/t1/review").status_code == 401
+    assert c.get("/api/tasks/t1/permissions").status_code == 401
+    assert c.post("/api/tasks/t1/subtasks/s1/accept").status_code == 401
+    assert c.post("/api/tasks/t1/subtasks/s1/reject", json={}).status_code == 401
+    assert c.get("/api/projects/default/runs").status_code == 401
+    # with the token, requests reach the handlers (any non-401 outcome)
+    hdr = {"Authorization": f"Bearer {TOKEN}"}
+    assert c.get("/api/tasks/t1/permissions", headers=hdr).status_code == 200
+    assert c.get("/api/tasks/t1/review", headers=hdr).status_code != 401
+    assert c.post("/api/tasks/t1/subtasks/s1/accept", headers=hdr).status_code == 404
+    assert c.get("/api/projects/default/runs", headers=hdr).status_code == 200
+
+
 # ---- W5: diff endpoint ----
 
 def _git(cwd, *args):

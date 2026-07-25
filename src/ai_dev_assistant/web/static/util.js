@@ -239,11 +239,141 @@
     return { state, text, running: running.length, queued: queued.length };
   }
 
+  // ===========================================================
+  // F4 — Reviews & Permissions panel + project home (pure models).
+  // ===========================================================
+
+  // Escaped, colored HTML for a unified diff (reuses classifyDiffLine).
+  // Returns "" for empty input; the caller wraps it in a <pre>.
+  function renderDiffHtml(text) {
+    if (!text) return "";
+    return String(text).split("\n").map(l => {
+      const esc = escapeHtml(l);
+      const kind = classifyDiffLine(l);
+      return kind === "ctx" ? esc : `<span class="d-${kind}">${esc}</span>`;
+    }).join("\n");
+  }
+
+  // One subtask row from GET /api/tasks/{id}/review -> render model for a review card.
+  function reviewCardModel(s) {
+    s = s || {};
+    const v = (s.verdict && typeof s.verdict === "object") ? s.verdict : {};
+    const passed = v.passed != null ? !!v.passed : null;
+    const rawCriteria = Array.isArray(v.criteria) ? v.criteria : [];
+    const criteria = rawCriteria.map(c => {
+      if (typeof c === "string") return { name: c, met: null };
+      c = c || {};
+      const met = c.met != null ? !!c.met : (c.passed != null ? !!c.passed : null);
+      return { name: String(c.name || c.criterion || ""), met };
+    }).filter(c => c.name);
+    const decision = s.decision === "accepted" || s.decision === "rejected" ? s.decision : null;
+    return {
+      id: String(s.id || ""), title: String(s.title || ""), agent: String(s.agent || ""),
+      status: String(s.status || ""),
+      badge: passed === true ? "passed" : passed === false ? "failed" : "pending",
+      score: v.score != null ? v.score : null,
+      reasons: Array.isArray(v.reasons) ? v.reasons : [],
+      suggestions: Array.isArray(v.suggestions) ? v.suggestions : [],
+      criteria,
+      changed: Array.isArray(s.changed) ? s.changed : [],
+      attempts: s.attempts != null ? s.attempts : null,
+      decision,
+      mergeShort: String(s.merge_commit || "").slice(0, 7),
+      hasDiff: !!s.diff,
+      canAccept: !!s.merge_commit && decision !== "accepted",
+      canReject: decision !== "rejected",
+    };
+  }
+
+  // GET /api/tasks/{id}/permissions body -> render model for the Permissions tab.
+  function permissionsModel(p) {
+    p = p || {};
+    const policy = (p.policy && typeof p.policy === "object") ? p.policy : {};
+    const policyRows = Object.keys(policy).sort().map(k => {
+      const v = policy[k];
+      return { key: k, value: (v && typeof v === "object") ? JSON.stringify(v) : String(v) };
+    });
+    const tba = (p.tools_by_agent && typeof p.tools_by_agent === "object") ? p.tools_by_agent : {};
+    const agents = Object.keys(tba).sort().map(a => ({
+      agent: a, tools: Array.isArray(tba[a]) ? tba[a] : [],
+    }));
+    const denied = (Array.isArray(p.denied) ? p.denied : []).map(d => ({
+      ts: (d && d.ts != null) ? d.ts : null,
+      agent: String((d && d.agent) || ""),
+      tool: String((d && d.tool) || ""),
+      outcome: String((d && d.outcome) || ""),
+    }));
+    return {
+      policyRows, agents, denied, deniedEmpty: !denied.length,
+      reviewTarget: String(p.review_target || ""), taskBranch: String(p.task_branch || ""),
+    };
+  }
+
+  // Project policy dict -> editor field values (strings, ready for inputs).
+  function policyFormModel(policy) {
+    policy = policy || {};
+    return {
+      budget_usd: policy.budget_usd != null ? String(policy.budget_usd) : "",
+      effort: String(policy.effort || ""),
+      git_mode: String(policy.git_mode || ""),
+      protected_paths: Array.isArray(policy.protected_paths)
+        ? policy.protected_paths.join("\n") : "",
+    };
+  }
+
+  // Editor field values -> {ok, errors, policy} for PATCH /api/projects/{slug}.
+  // Blank fields are omitted (leave the stored value alone); protected_paths is
+  // always sent so clearing the textarea clears the policy.
+  function parsePolicyForm(f) {
+    f = f || {};
+    const errors = [];
+    const policy = {};
+    const b = String(f.budget_usd == null ? "" : f.budget_usd).trim();
+    if (b) {
+      const n = Number(b);
+      if (!isFinite(n) || n < 0) errors.push("budget_usd must be a non-negative number");
+      else policy.budget_usd = n;
+    }
+    const effort = String(f.effort || "").trim();
+    if (effort) policy.effort = effort;
+    const gm = String(f.git_mode || "").trim();
+    if (gm && gm !== "merge" && gm !== "branch") {
+      errors.push('git_mode must be "merge" or "branch"');
+    } else if (gm) {
+      policy.git_mode = gm;
+    }
+    policy.protected_paths = String(f.protected_paths || "")
+      .split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+    return { ok: !errors.length, errors, policy };
+  }
+
+  // Quality scores (chronological) -> SVG polyline geometry for a sparkline.
+  // Nulls are skipped; fewer than 2 points -> not drawable (show the number instead).
+  function sparklinePoints(values, w, h, pad) {
+    w = w || 120; h = h || 28; pad = pad == null ? 2 : pad;
+    const vals = (values || []).filter(v => v != null).map(Number).filter(v => isFinite(v));
+    if (vals.length < 2) {
+      return { drawable: false, points: "", last: vals.length ? vals[0] : null,
+               min: null, max: null };
+    }
+    const min = Math.min(...vals), max = Math.max(...vals);
+    const span = max - min || 1;
+    const step = (w - pad * 2) / (vals.length - 1);
+    const points = vals.map((v, i) => {
+      const x = pad + i * step;
+      const y = h - pad - ((v - min) / span) * (h - pad * 2);
+      return x.toFixed(1) + "," + y.toFixed(1);
+    }).join(" ");
+    return { drawable: true, points, last: vals[vals.length - 1], min, max };
+  }
+
   const AdaUtil = {
     escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine,
     makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
     computeBudgetMeter, timelineRows, compareRowModel, RESUMABLE_STATUSES, isResumable,
     projectStatusLine, activityStripModel,
+    renderDiffHtml, reviewCardModel, permissionsModel, policyFormModel, parsePolicyForm,
+    sparklinePoints,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = AdaUtil;

@@ -6,6 +6,8 @@ const {
   makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
   computeBudgetMeter, timelineRows, compareRowModel, isResumable,
   projectStatusLine, activityStripModel,
+  renderDiffHtml, reviewCardModel, permissionsModel, policyFormModel, parsePolicyForm,
+  sparklinePoints,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -514,6 +516,7 @@ async function submitProjectModal() {
 function onProjectChange() {
   localStorage.setItem("ada-project", selectedProject());
   refreshProjectPulse(true);
+  if (currentView === "project") loadProjectHome();
   if (currentView === "memory") loadMemory();
   if (currentView === "graph") loadGraph();
 }
@@ -1180,7 +1183,7 @@ async function openDocs(id) {
   selectTab("brief");
 }
 function selectTab(which) {
-  document.querySelectorAll(".tab").forEach(t => {
+  document.querySelectorAll("#modal .tab").forEach(t => {
     const on = t.dataset.doc === which;
     t.classList.toggle("active", on);
     t.setAttribute("aria-selected", on ? "true" : "false");
@@ -1198,11 +1201,7 @@ async function renderDiffTab() {
   catch (e) { el.textContent = "Could not load the diff."; return; }
   if (!d.is_git) { el.textContent = "Not a git workspace — no diff available."; return; }
   if (!d.diff && !d.status) { el.textContent = "No changes — the workspace is clean."; return; }
-  const lines = (d.diff || "").split("\n").map(l => {
-    const esc = escapeHtml(l);
-    const kind = classifyDiffLine(l);
-    return kind === "ctx" ? esc : `<span class="d-${kind}">${esc}</span>`;
-  }).join("\n");
+  const lines = renderDiffHtml(d.diff || "");
   const status = d.status
     ? `<span class="d-hunk">git status --porcelain</span>\n${escapeHtml(d.status)}\n` : "";
   el.innerHTML = status + lines + (d.truncated ? "\n\n…[diff truncated at 200 KB]" : "");
@@ -1345,7 +1344,7 @@ async function openTask(id, meta) {
 
 // ---- view tabs (Run / Agents / Memory / Graph) ----
 let currentView = "run";
-const VIEWS = { run: "view-run", agents: "view-agents", memory: "view-memory", graph: "view-graph", files: "view-files", dashboard: "view-dashboard" };
+const VIEWS = { run: "view-run", project: "view-project", agents: "view-agents", memory: "view-memory", graph: "view-graph", files: "view-files", dashboard: "view-dashboard" };
 
 function switchView(name) {
   currentView = name;
@@ -1355,6 +1354,7 @@ function switchView(name) {
     if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
   });
   Object.entries(VIEWS).forEach(([n, id]) => $(id).classList.toggle("hidden", n !== name));
+  if (name === "project") loadProjectHome();
   if (name === "agents") loadAgents();
   if (name === "memory") loadMemory();
   if (name === "graph") loadGraph();
@@ -1431,6 +1431,300 @@ async function loadProjectsActivity() {
     `<th scope="col">Project</th><th scope="col">State</th>` +
     `<th scope="col">Running task</th><th scope="col">Queued</th>` +
     `</tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// ---- F4: project home (status + activity + policy editor + run history) ----
+async function loadProjectHome() {
+  const slug = selectedProject();
+  let list = [];
+  try { list = await (await fetch("/api/projects")).json(); } catch (e) { list = []; }
+  const entry = (Array.isArray(list) ? list : []).find(p => p.slug === slug) || { slug, name: slug };
+  $("ph-name").textContent = entry.name || slug;
+  renderProjectHomeStatus(slug);
+  renderProjectHomePolicy(entry);
+  renderProjectHomeRuns(slug);
+}
+
+async function renderProjectHomeStatus(slug) {
+  let st = null;
+  try {
+    const r = await fetch("/api/projects/" + encodeURIComponent(slug) + "/status");
+    if (r.ok) st = await r.json();
+  } catch (e) { /* leave placeholder */ }
+  const m = projectStatusLine(st);
+  $("ph-status").innerHTML = m.visible
+    ? `<span class="ps-branch">⎇ ${escapeHtml(m.text)}</span>` +
+      (m.dirty ? '<span class="ps-dirty" title="Uncommitted changes in the checkout">●</span>' : "") +
+      (m.archived ? '<span class="ps-archived">archived</span>' : "")
+    : '<span class="muted">No repository info for this project.</span>';
+  let act = null;
+  try {
+    const r = await fetch("/api/projects/" + encodeURIComponent(slug) + "/activity");
+    if (r.ok) act = await r.json();
+  } catch (e) { /* leave as-is */ }
+  const a = activityStripModel(act);
+  const ael = $("ph-activity");
+  ael.className = "proj-activity pa-" + a.state;
+  ael.innerHTML = `<span class="pa-dot" aria-hidden="true"></span>${escapeHtml(a.text)}`;
+}
+
+function renderProjectHomePolicy(entry) {
+  const f = policyFormModel(entry.policy || {});
+  $("ph-budget").value = f.budget_usd;
+  $("ph-effort").value = f.effort;
+  $("ph-gitmode").value = f.git_mode;
+  $("ph-protected").value = f.protected_paths;
+  $("ph-policy-error").classList.add("hidden");
+}
+
+async function saveProjectPolicy() {
+  const slug = selectedProject();
+  const parsed = parsePolicyForm({
+    budget_usd: $("ph-budget").value, effort: $("ph-effort").value,
+    git_mode: $("ph-gitmode").value, protected_paths: $("ph-protected").value,
+  });
+  const err = $("ph-policy-error");
+  if (!parsed.ok) { err.textContent = parsed.errors.join(" · "); err.classList.remove("hidden"); return; }
+  err.classList.add("hidden");
+  const btn = $("ph-policy-save");
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/api/projects/" + encodeURIComponent(slug), {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ policy: parsed.policy }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.status === 501) showToast("Policy editing is not available yet on this server", "warn", 6000);
+    else if (!resp.ok || data.error) { err.textContent = data.error || ("HTTP " + resp.status); err.classList.remove("hidden"); }
+    else showToast("Policy saved", "success");
+  } catch (e) { showToast("Save failed: " + e, "error"); }
+  btn.disabled = false;
+}
+
+async function renderProjectHomeRuns(slug) {
+  let runs = [];
+  try {
+    const r = await fetch("/api/projects/" + encodeURIComponent(slug) + "/runs");
+    if (r.ok) runs = await r.json();
+  } catch (e) { /* keep empty */ }
+  if (!Array.isArray(runs)) runs = [];
+  const svg = $("ph-sparkline");
+  svg.innerHTML = "";
+  // rows arrive newest-first; the sparkline reads oldest -> newest
+  const scores = runs.slice().reverse().map(r => r.quality_score).filter(v => v != null);
+  const sp = sparklinePoints(scores, 140, 32, 3);
+  $("ph-trend-label").textContent = sp.last != null ? `latest quality ${sp.last}/100` : "no quality data yet";
+  if (sp.drawable) {
+    const pl = document.createElementNS(SVGNS, "polyline");
+    pl.setAttribute("points", sp.points);
+    pl.setAttribute("class", "ph-spark-line");
+    svg.appendChild(pl);
+  }
+  const wrap = $("ph-runs");
+  if (!runs.length) { wrap.innerHTML = '<p class="muted">No runs yet for this project.</p>'; return; }
+  wrap.innerHTML =
+    `<table class="dsa-table"><thead><tr><th scope="col">Task</th><th scope="col">Status</th>` +
+    `<th scope="col">Quality</th><th scope="col">Tests</th><th scope="col">Cost</th></tr></thead><tbody>` +
+    runs.map(r => `<tr class="ph-run-row" data-id="${escapeAttr(r.id)}" title="Open this task">` +
+      `<td class="dsa-task">${escapeHtml(r.title || r.id)}</td>` +
+      `<td>${escapeHtml(r.status || "—")}${r.run_status && r.run_status !== r.status ? escapeHtml(" · " + r.run_status) : ""}</td>` +
+      `<td>${r.quality_score != null ? escapeHtml(r.quality_score + "/100") : "—"}</td>` +
+      `<td>${r.tests === "passed" ? "✓" : r.tests === "failed" ? "✗" : "—"}</td>` +
+      `<td>${(r.cost_usd != null && r.cost_usd > 0) ? escapeHtml(fmtCost(r.cost_usd)) : "—"}</td></tr>`).join("") +
+    `</tbody></table>`;
+  wrap.querySelectorAll(".ph-run-row").forEach(tr => {
+    makeActivatable(tr, () => openTask(tr.dataset.id, null), `Open task ${tr.dataset.id}`);
+  });
+}
+
+// ---- F4 decision #5: Reviews & Permissions panel ----
+let reviewTaskId = null;
+
+function openReviewPanel() {
+  const tid = state.docsId || state.taskId;
+  if (!tid) { showToast("No task on screen yet", "warn"); return; }
+  reviewTaskId = tid;
+  selectReviewTab("reviews");
+  $("rvp-reviews").innerHTML = '<p class="muted">Loading…</p>';
+  $("rvp-permissions").innerHTML = '<p class="muted">Loading…</p>';
+  $("rvp-branches").classList.add("hidden");
+  openModalEl("review-modal");
+  loadReviewTab();
+  loadPermissionsTab();
+}
+function closeReviewPanel() { closeModalEl("review-modal"); }
+
+function selectReviewTab(which) {
+  document.querySelectorAll("#review-modal .tab").forEach(t => {
+    const on = t.dataset.rtab === which;
+    t.classList.toggle("active", on);
+    t.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  $("rvp-reviews").classList.toggle("hidden", which !== "reviews");
+  $("rvp-permissions").classList.toggle("hidden", which !== "permissions");
+}
+
+async function loadReviewTab() {
+  const el = $("rvp-reviews");
+  let data;
+  try {
+    const resp = await fetch("/api/tasks/" + encodeURIComponent(reviewTaskId) + "/review");
+    data = await resp.json().catch(() => ({}));
+    if (resp.status === 501) { el.innerHTML = '<p class="muted">Per-subtask review is not available yet on this server.</p>'; return; }
+    if (!resp.ok || data.error) {
+      el.innerHTML = `<p class="muted">Could not load reviews: ${escapeHtml(data.error || ("HTTP " + resp.status))}</p>`;
+      return;
+    }
+  } catch (e) { el.innerHTML = '<p class="muted">Could not load reviews.</p>'; return; }
+  const br = $("rvp-branches");
+  if (data.task_branch || data.review_target) {
+    br.classList.remove("hidden");
+    br.innerHTML = `⎇ task branch <code>${escapeHtml(data.task_branch || "—")}</code>` +
+      ` · accepting merges into <code>${escapeHtml(data.review_target || "—")}</code>`;
+  }
+  const subs = data.subtasks || [];
+  if (!subs.length) { el.innerHTML = '<p class="muted">No subtask records for this task yet.</p>'; return; }
+  el.innerHTML = subs.map(reviewCardHtml).join("");
+  el.querySelectorAll(".review-card").forEach(card => {
+    const accept = card.querySelector(".rc-accept");
+    const reject = card.querySelector(".rc-reject");
+    if (accept) accept.onclick = () => acceptSubtask(card, accept.dataset.sid);
+    if (reject) reject.onclick = () => rejectSubtask(card, reject.dataset.sid);
+  });
+}
+
+function reviewCardHtml(s) {
+  const m = reviewCardModel(s);
+  const badgeCls = m.badge === "passed" ? "pill-done" : m.badge === "failed" ? "pill-err" : "";
+  const score = m.score != null ? `<span class="rc-meta-bit">score ${escapeHtml(m.score)}</span>` : "";
+  const attempts = m.attempts != null
+    ? `<span class="rc-meta-bit">${escapeHtml(m.attempts)} attempt${m.attempts === 1 ? "" : "s"}</span>` : "";
+  const decision = m.decision
+    ? `<span class="rc-decision rc-decision-${escapeAttr(m.decision)}">${escapeHtml(m.decision)}</span>` : "";
+  const criteria = m.criteria.length
+    ? `<ul class="rc-criteria">` + m.criteria.map(c =>
+        `<li class="${c.met === true ? "rc-crit-ok" : c.met === false ? "rc-crit-bad" : ""}">` +
+        `${c.met === true ? "✓ " : c.met === false ? "✗ " : "· "}${escapeHtml(c.name)}</li>`).join("") + `</ul>` : "";
+  const reasons = m.reasons.length
+    ? `<ul class="rc-reasons">` + m.reasons.map(r => `<li>${escapeHtml(r)}</li>`).join("") + `</ul>` : "";
+  const suggestions = m.suggestions.length
+    ? `<div class="rc-suggestions"><span class="kicker">Suggestions</span><ul>` +
+      m.suggestions.map(r => `<li>${escapeHtml(r)}</li>`).join("") + `</ul></div>` : "";
+  const changed = m.changed.length
+    ? `<div class="rc-files">` + m.changed.map(f => `<span class="tool-chip">${escapeHtml(f)}</span>`).join("") + `</div>`
+    : '<p class="muted rc-nofiles">No changed files recorded.</p>';
+  const diff = m.hasDiff
+    ? `<details class="rc-diff-wrap"><summary>Diff${m.mergeShort ? " · " + escapeHtml(m.mergeShort) : ""}</summary>` +
+      `<pre class="rc-diff">${renderDiffHtml(s.diff)}</pre></details>` : "";
+  return `<div class="review-card">` +
+    `<div class="rc-head"><span class="chip">${escapeHtml(m.id)}</span>` +
+    (m.agent ? `<span class="ac-agent"><span class="ac-dot" style="background:${agentStyle(m.agent).color}"></span>${escapeHtml(m.agent)}</span>` : "") +
+    `<span class="pill ${badgeCls}">${escapeHtml(m.badge)}</span>${score}${attempts}${decision}</div>` +
+    (m.title ? `<div class="rc-title">${escapeHtml(m.title)}</div>` : "") +
+    criteria + reasons + suggestions +
+    `<span class="kicker">Changed files</span>` + changed + diff +
+    `<div class="rc-actions">` +
+    `<button type="button" class="rc-accept ghost-btn" data-sid="${escapeAttr(m.id)}"${m.canAccept ? "" : " disabled"} ` +
+    `title="${m.canAccept ? "Merge this subtask's commit into the review target" : "No merge commit, or already accepted"}">✓ Accept</button>` +
+    `<button type="button" class="rc-reject ghost-btn" data-sid="${escapeAttr(m.id)}"${m.canReject ? "" : " disabled"} ` +
+    `title="Record rejection feedback; the commit stays on the task branch">✗ Reject</button>` +
+    `<input type="text" class="rc-comment title-input" maxlength="280" ` +
+    `placeholder="Rejection comment (optional) — feeds future planning" aria-label="Rejection comment for subtask ${escapeAttr(m.id)}" />` +
+    `</div><p class="rc-error pm-error hidden" role="alert"></p></div>`;
+}
+
+function _rcShowError(card, msg) {
+  const el = card.querySelector(".rc-error");
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+
+async function acceptSubtask(card, sid) {
+  const btn = card.querySelector(".rc-accept");
+  btn.disabled = true;
+  let resp, data = {};
+  try {
+    resp = await fetch(`/api/tasks/${encodeURIComponent(reviewTaskId)}/subtasks/${encodeURIComponent(sid)}/accept`,
+                       { method: "POST" });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _rcShowError(card, "Accept failed: " + e); btn.disabled = false; return; }
+  if (resp.status === 501) {
+    showToast("Per-subtask acceptance is not available yet on this server", "warn", 6000);
+    btn.disabled = false;
+    return;
+  }
+  if (!resp.ok) {
+    const files = (data.files || []).length ? " · conflicts: " + data.files.join(", ") : "";
+    _rcShowError(card, (data.error || ("HTTP " + resp.status)) + files);
+    btn.disabled = false;
+    return;
+  }
+  showToast(`Accepted ${sid}` + (data.commit ? ` · merged as ${String(data.commit).slice(0, 7)}` : ""), "success");
+  loadReviewTab();  // re-render with the recorded decision
+}
+
+async function rejectSubtask(card, sid) {
+  const comment = (card.querySelector(".rc-comment") || { value: "" }).value.trim();
+  const btn = card.querySelector(".rc-reject");
+  btn.disabled = true;
+  let resp, data = {};
+  try {
+    resp = await fetch(`/api/tasks/${encodeURIComponent(reviewTaskId)}/subtasks/${encodeURIComponent(sid)}/reject`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ comment }),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _rcShowError(card, "Reject failed: " + e); btn.disabled = false; return; }
+  if (resp.status === 501) {
+    showToast("Per-subtask review is not available yet on this server", "warn", 6000);
+    btn.disabled = false;
+    return;
+  }
+  if (!resp.ok) { _rcShowError(card, data.error || ("HTTP " + resp.status)); btn.disabled = false; return; }
+  showToast(`Rejected ${sid} — feedback recorded`, "warn");
+  loadReviewTab();
+}
+
+async function loadPermissionsTab() {
+  const el = $("rvp-permissions");
+  let data;
+  try {
+    const resp = await fetch("/api/tasks/" + encodeURIComponent(reviewTaskId) + "/permissions");
+    data = await resp.json().catch(() => ({}));
+    if (!resp.ok || data.error) {
+      el.innerHTML = `<p class="muted">Could not load permissions: ${escapeHtml(data.error || ("HTTP " + resp.status))}</p>`;
+      return;
+    }
+  } catch (e) { el.innerHTML = '<p class="muted">Could not load permissions.</p>'; return; }
+  const m = permissionsModel(data);
+  const branches = (m.taskBranch || m.reviewTarget)
+    ? `<p class="perm-branches">⎇ task branch <code>${escapeHtml(m.taskBranch || "—")}</code>` +
+      ` · review target <code>${escapeHtml(m.reviewTarget || "—")}</code></p>` : "";
+  const policy = m.policyRows.length
+    ? `<table class="dsa-table perm-table"><thead><tr><th scope="col">Setting</th><th scope="col">Value</th></tr></thead><tbody>` +
+      m.policyRows.map(r => `<tr><td>${escapeHtml(r.key)}</td><td class="perm-val">${escapeHtml(r.value)}</td></tr>`).join("") +
+      `</tbody></table>`
+    : '<p class="muted">No resolved policy recorded for this run.</p>';
+  const agents = m.agents.length
+    ? m.agents.map(a =>
+        `<div class="perm-agent"><span class="ac-agent"><span class="ac-dot" style="background:${agentStyle(a.agent).color}"></span>${escapeHtml(a.agent)}</span>` +
+        `<span class="tool-chips">` +
+        (a.tools.length ? a.tools.map(t => `<span class="tool-chip">${escapeHtml(t)}</span>`).join("")
+                        : '<span class="muted">no tools</span>') +
+        `</span></div>`).join("")
+    : '<p class="muted">No per-agent tool allowlist recorded.</p>';
+  const denied = m.deniedEmpty
+    ? '<p class="muted">no denied actions</p>'
+    : `<table class="dsa-table perm-table"><thead><tr><th scope="col">When</th><th scope="col">Agent</th>` +
+      `<th scope="col">Tool</th><th scope="col">Outcome</th></tr></thead><tbody>` +
+      m.denied.map(d =>
+        `<tr><td>${d.ts != null ? escapeHtml(new Date(d.ts * 1000).toLocaleString()) : "—"}</td>` +
+        `<td>${escapeHtml(d.agent || "—")}</td><td>${escapeHtml(d.tool || "—")}</td>` +
+        `<td class="perm-denied">${escapeHtml(d.outcome)}</td></tr>`).join("") +
+      `</tbody></table>`;
+  el.innerHTML = `<span class="kicker">Resolved policy in force</span>${branches}${policy}` +
+    `<span class="kicker">Tool allowlist per agent</span><div class="perm-agents">${agents}</div>` +
+    `<span class="kicker">Denied actions — from the audit log</span>${denied}`;
 }
 
 // ---- Dashboard (Tier 5) ----
@@ -1779,19 +2073,27 @@ $("modal-close").onclick = () => closeModalEl("modal");
 $("modal").onclick = (e) => { if (e.target === $("modal")) closeModalEl("modal"); };
 $("agent-modal-close").onclick = closeAgentModal;
 $("agent-modal").onclick = (e) => { if (e.target === $("agent-modal")) closeAgentModal(); };
+// F4: Reviews & Permissions panel + project home
+$("review-btn").onclick = openReviewPanel;
+$("review-modal-close").onclick = closeReviewPanel;
+$("review-modal").onclick = (e) => { if (e.target === $("review-modal")) closeReviewPanel(); };
+document.querySelectorAll("#review-modal .tab").forEach(t => t.onclick = () => selectReviewTab(t.dataset.rtab));
+$("ph-refresh").onclick = loadProjectHome;
+$("ph-policy-save").onclick = saveProjectPolicy;
 $("roster-modal-close").onclick = closeRosterModal;
 $("roster-modal").onclick = (e) => { if (e.target === $("roster-modal")) closeRosterModal(); };
 // a11y: Escape closes the topmost dialog; Tab is trapped inside an open dialog
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!$("project-modal").classList.contains("hidden")) closeProjectModal();
+  else if (!$("review-modal").classList.contains("hidden")) closeReviewPanel();
   else if (!$("roster-modal").classList.contains("hidden")) closeRosterModal();
   else if (!$("agent-modal").classList.contains("hidden")) closeAgentModal();
   else closeModalEl("modal");
 });
-["modal", "agent-modal", "roster-modal", "project-modal"].forEach(id =>
+["modal", "agent-modal", "roster-modal", "project-modal", "review-modal"].forEach(id =>
   $(id).addEventListener("keydown", (e) => _trapModalTab($(id), e)));
-document.querySelectorAll(".tab").forEach(t => t.onclick = () => selectTab(t.dataset.doc));
+document.querySelectorAll("#modal .tab").forEach(t => t.onclick = () => selectTab(t.dataset.doc));
 $("project").onchange = onProjectChange;
 $("new-project").onclick = openProjectModal;
 $("project-modal-close").onclick = closeProjectModal;
@@ -1825,4 +2127,5 @@ setInterval(loadQueue, 4000);  // keep the queue panel + chip fresh
 setInterval(() => {            // keep the project activity strip (+ dashboard table) live
   refreshProjectPulse(false);
   if (currentView === "dashboard") loadProjectsActivity();
+  if (currentView === "project") renderProjectHomeStatus(selectedProject());
 }, 5000);

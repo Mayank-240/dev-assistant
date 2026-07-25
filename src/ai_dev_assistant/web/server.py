@@ -25,7 +25,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import projects
+from .. import projects, vcs
 from ..agents.registry import build_agents
 from ..config import Settings
 from ..engine import Engine
@@ -205,6 +205,10 @@ class FeedbackRequest(BaseModel):
     rating: int | None = None       # 1-5
     accepted: bool | None = None    # was the delivered work accepted?
     comment: str | None = None
+
+
+class SubtaskRejectRequest(BaseModel):
+    comment: str | None = None      # why the subtask's work was rejected (feeds learning)
 
 
 def create_app(settings: Settings | None = None, host: str | None = None,
@@ -930,6 +934,230 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse({"ok": True})
+
+    # ---- F4: project home — recent runs (feeds the quality-trend sparkline) ----
+    @app.get("/api/projects/{slug}/runs")
+    async def get_project_runs(slug: str, limit: int = 30) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        limit = max(1, min(int(limit), 100))
+        try:
+            rows = app.state.runs.list(limit=limit, project=slug)
+        except TypeError:  # run store without per-project filtering (landing separately)
+            rows = [r for r in app.state.runs.list(limit=500)
+                    if _project_of_run(r) == slug][:limit]
+        return JSONResponse([{
+            "id": r.get("id"), "title": _title_of(r), "status": r.get("status"),
+            "run_status": r.get("run_status"), "quality_score": r.get("quality_score"),
+            "cost_usd": r.get("cost_usd"), "tests": r.get("tests"),
+            "created_at": r.get("created_at"), "ended_at": r.get("ended_at"),
+        } for r in rows])
+
+    # ---- F4 decision #5: Reviews & Permissions panel + per-subtask accept/reject ----
+    # Several inputs land concurrently (run-store review columns/methods, the engine's
+    # policy event, vcs.cherry_pick_merge). Every usage is guarded — missing pieces
+    # degrade to empty fields on GETs and to 501 on the accept/reject actions.
+
+    def _json_or(raw: Any, default: Any) -> Any:
+        if not raw:
+            return default
+        if isinstance(raw, (dict, list)):
+            return raw
+        try:
+            out = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return default
+        return out if isinstance(out, type(default)) else default
+
+    def _project_root(slug: str) -> str:
+        try:
+            entry = projects.get_project(settings, slug) or {}
+        except AttributeError:
+            entry = next((p for p in projects.list_projects(settings)
+                          if p.get("slug") == slug), None) or {}
+        return str(entry.get("root") or "").strip()
+
+    def _review_target_for(slug: str) -> str:
+        try:
+            return projects.review_target(settings, slug)
+        except AttributeError:  # projects.review_target landing separately
+            return "main"
+
+    def _plan_subtasks(task_id: str, row: dict[str, Any]) -> list[dict[str, Any]]:
+        """Subtask id/title/agent from the plan event, else the run row's plan_json."""
+        for ev in _read_jsonl(settings.docs_dir / task_id / "events.jsonl"):
+            if ev.get("type") == "plan":
+                subs = (ev.get("data") or {}).get("subtasks") or []
+                if subs:
+                    return [s for s in subs if isinstance(s, dict)]
+        plan = _json_or(row.get("plan_json"), {})
+        return [s for s in (plan.get("subtasks") or []) if isinstance(s, dict)]
+
+    def _policy_event(task_id: str) -> dict[str, Any] | None:
+        """The run's resolved-policy event from events.jsonl (last one wins)."""
+        for ev in reversed(_read_jsonl(settings.docs_dir / task_id / "events.jsonl")):
+            data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+            if ev.get("type") != "policy" and "policy" not in data:
+                continue
+            src = data if ("policy" in data or "tools_by_agent" in data) else ev
+            return {
+                "policy": src.get("policy") if isinstance(src.get("policy"), dict) else {},
+                "tools_by_agent": (src.get("tools_by_agent")
+                                   if isinstance(src.get("tools_by_agent"), dict) else {}),
+                "review_target": str(src.get("review_target") or ""),
+                "task_branch": str(src.get("task_branch") or ""),
+            }
+        return None
+
+    def _git_show(root: str, sha: str) -> str:
+        """Unified diff of one commit in the project repo, bounded to 100 KB.
+        -m --first-parent makes merge commits show a real patch."""
+        try:
+            r = subprocess.run(
+                ["git", "-C", root, "show", "--no-color", "-m", "--first-parent", sha],
+                capture_output=True, text=True, timeout=30)
+            return r.stdout[:100_000] if r.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    @app.get("/api/tasks/{task_id}/review")
+    async def get_review(task_id: str) -> JSONResponse:
+        row = app.state.runs.get(task_id)
+        if row is None and not (settings.docs_dir / task_id).is_dir():
+            return JSONResponse({"error": "unknown task"}, status_code=404)
+        row = row or {}
+        slug = _project_of_run(row)
+        task_branch = str(row.get("task_branch") or "") or f"ada/{task_id}"
+        target = str(row.get("review_target") or "") or _review_target_for(slug)
+        try:
+            states = app.state.runs.get_subtask_states(task_id) or {}
+        except Exception:  # noqa: BLE001 — store variant landing separately
+            states = {}
+        reviews: dict[str, Any] = {}
+        if hasattr(app.state.runs, "get_subtask_reviews"):
+            try:
+                reviews = app.state.runs.get_subtask_reviews(task_id) or {}
+            except Exception:  # noqa: BLE001
+                reviews = {}
+        root = _project_root(slug)
+        subs = _plan_subtasks(task_id, row)
+        meta = {s.get("id"): s for s in subs}
+        ids = [s.get("id") for s in subs if s.get("id")]
+        ids += [sid for sid in states if sid not in ids]
+        out = []
+        for sid in ids:
+            st = states.get(sid) or {}
+            merge_commit = str(st.get("merge_commit") or "")
+            diff = ""
+            if merge_commit and root:
+                diff = await asyncio.to_thread(_git_show, root, merge_commit)
+            rv = reviews.get(sid) if isinstance(reviews.get(sid), dict) else {}
+            out.append({
+                "id": sid,
+                "title": str((meta.get(sid) or {}).get("title") or ""),
+                "agent": str((meta.get(sid) or {}).get("agent") or ""),
+                "status": st.get("status"),
+                "attempts": st.get("attempts"),
+                "verdict": _json_or(st.get("verdict"), {}),
+                "changed": _json_or(st.get("changed"), []),
+                "merge_commit": merge_commit,
+                "decision": (rv or {}).get("decision") or None,
+                "diff": diff,
+            })
+        return JSONResponse({"task_branch": task_branch, "review_target": target,
+                             "subtasks": out})
+
+    @app.get("/api/tasks/{task_id}/permissions")
+    async def get_permissions(task_id: str) -> JSONResponse:
+        # Tolerant by design: a missing policy event or audit log yields empty
+        # fields (the run may predate them), never an error.
+        row = app.state.runs.get(task_id) or {}
+        pe = _policy_event(task_id) or {}
+        denied = [{
+            "ts": line.get("ts"), "agent": str(line.get("agent") or ""),
+            "tool": str(line.get("tool") or ""), "outcome": str(line.get("outcome") or ""),
+        } for line in _read_jsonl(settings.docs_dir / task_id / "audit.jsonl")
+            if str(line.get("outcome") or "").startswith("DENIED:")]
+        return JSONResponse({
+            "policy": pe.get("policy") or {},
+            "tools_by_agent": pe.get("tools_by_agent") or {},
+            "review_target": pe.get("review_target") or str(row.get("review_target") or ""),
+            "task_branch": pe.get("task_branch") or str(row.get("task_branch") or ""),
+            "denied": denied,
+        })
+
+    @app.post("/api/tasks/{task_id}/subtasks/{subtask_id}/accept")
+    async def accept_subtask(task_id: str, subtask_id: str) -> JSONResponse:
+        row = app.state.runs.get(task_id)
+        if row is None:
+            return JSONResponse({"error": "unknown task"}, status_code=404)
+        status = row.get("status") or ""
+        if status not in _TERMINAL_STATUSES:
+            return JSONResponse(
+                {"error": f"run is still {status or 'active'} — review after it finishes"},
+                status_code=409)
+        try:
+            states = app.state.runs.get_subtask_states(task_id) or {}
+        except Exception:  # noqa: BLE001
+            states = {}
+        st = states.get(subtask_id)
+        if st is None:
+            return JSONResponse({"error": "unknown subtask"}, status_code=404)
+        merge_commit = str(st.get("merge_commit") or "").strip()
+        if not merge_commit:
+            return JSONResponse(
+                {"error": "subtask has no merge commit to accept"}, status_code=409)
+        # projects.accept_commit routes owned checkouts to an in-checkout cherry-pick
+        # and in-place projects to the temp-worktree path; older trees fall back to
+        # vcs.cherry_pick_merge, and with neither landed the action answers 501.
+        use_accept = hasattr(projects, "accept_commit")
+        if not ((use_accept or hasattr(vcs, "cherry_pick_merge"))
+                and hasattr(app.state.runs, "set_subtask_review")):
+            return JSONResponse(
+                {"error": "per-subtask acceptance is not available yet"}, status_code=501)
+        slug = _project_of_run(row)
+        try:
+            if use_accept:
+                res = await asyncio.to_thread(
+                    projects.accept_commit, settings, slug, merge_commit)
+            else:
+                root = _project_root(slug)
+                if not root:
+                    return JSONResponse(
+                        {"error": "project has no repository checkout"}, status_code=409)
+                target = str(row.get("review_target") or "") or _review_target_for(slug)
+                res = await asyncio.to_thread(
+                    vcs.cherry_pick_merge, Path(root), merge_commit, target)
+        except ValueError as exc:  # e.g. unknown project / no checkout
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        except Exception as exc:  # noqa: BLE001 — surface git failures, don't 500
+            return JSONResponse({"error": f"merge failed: {exc}"}, status_code=502)
+        res = res if isinstance(res, dict) else {}
+        if res.get("conflict"):
+            return JSONResponse({**res, "error": "merge conflict — resolve on the task "
+                                 "branch or reject this subtask"}, status_code=409)
+        if not res.get("merged"):
+            return JSONResponse({**res, "error": res.get("error") or "merge failed"},
+                                status_code=409)
+        app.state.runs.set_subtask_review(task_id, subtask_id, "accepted", "")
+        return JSONResponse({**res, "decision": "accepted"})
+
+    @app.post("/api/tasks/{task_id}/subtasks/{subtask_id}/reject")
+    async def reject_subtask(task_id: str, subtask_id: str,
+                             req: SubtaskRejectRequest) -> JSONResponse:
+        row = app.state.runs.get(task_id)
+        if row is None:
+            return JSONResponse({"error": "unknown task"}, status_code=404)
+        if not hasattr(app.state.runs, "set_subtask_review"):
+            return JSONResponse(
+                {"error": "per-subtask review is not available yet"}, status_code=501)
+        comment = (req.comment or "").strip()
+        app.state.runs.set_subtask_review(task_id, subtask_id, "rejected", comment)
+        # Learning input: a rejection is negative feedback on the run (M3 consumes it).
+        app.state.runs.set_feedback(
+            task_id, accepted=False,
+            comment=comment or f"subtask {subtask_id} rejected in review")
+        return JSONResponse({"ok": True, "decision": "rejected", "comment": comment})
 
     @app.get("/api/graph")
     async def get_graph(project: str | None = None) -> JSONResponse:

@@ -80,20 +80,28 @@ specified in [PLAN.md](PLAN.md) and not yet built.
 7. Evals: live suite · offline replay (CI) · `--ab` comparison.
 8. Deploy: compose up → token from logs → container is the boundary.
 
-## [planned] Project-level assistant (PLAN.md)
-- Project lifecycle: create / import local (operate in place, never touches
-  your branch or working tree) / import URL; one-time onboarding + incremental
-  re-indexing; archive/delete.
-- In-project tasks: worktrees off the durable project checkout, per-project
-  policy (budget, effort, git mode, protected paths), branch-mode outcomes.
-- Per-subtask review: accept/reject individual subtasks' commits; rejections
-  feed learning.
-- Cross-project fan-out: coordinator → parallel children → budget split →
-  rollup report.
-- UI commitments: a **live project activity view** (what is running/queued in
-  any project right now, at a glance and per project), and a **Reviews &
-  Permissions panel** on every task (per-subtask verdicts with evidence, plus
-  the task's effective permissions: policy in force, tool allowlist, and any
-  denied actions from the audit log).
-- Project-first CLI/API; evals on ephemeral projects; per-run repo binding
-  removed.
+## Project-level assistant (PLAN.md — slices 1 & 2 SHIPPED)
+- Project lifecycle: create greenfield (own git checkout) / import local
+  **in place** (read-only contract: the assistant never commits, switches
+  branches, or writes in your repo — only `ada/*` branches) / import git URL
+  (clone); one-time onboarding + git-diff incremental re-indexing; policy
+  storage; archive/delete (never removes a local-origin directory).
+- In-project tasks: git worktrees off the durable checkout (outside your dir),
+  per-subtask worktrees + commits ON by default, per-project policy (budget,
+  effort, git_mode branch|merge, protected paths — enforced at the tool
+  boundary with DENIED-audited refusals), branch-mode outcomes; worktrees
+  persist for review/continue/resume.
+- Per-subtask review: Reviews & Permissions panel on every task — verdicts with
+  per-criterion evidence + changed files + diffs, resolved policy, tools per
+  agent, denied actions from the audit log; Accept cherry-picks that subtask's
+  commit into the review target (owned checkouts advance directly; in-place
+  projects use `ada/integration`), Reject records feedback for learning.
+- Live activity: per-project status + activity strip, all-projects activity
+  table, project home with policy editor, run history, and quality sparkline.
+- Project-first CLI (`ada project …`, `ada run -p`) and API; evals run through
+  ephemeral projects; per-run repo binding removed.
+
+## [planned] Slice 3 (PLAN.md)
+- Cross-project fan-out: coordinator → one child task per project → parallel
+  execution with optional stagger → budget split → rollup report; cross-project
+  composer + parent task view; cross-project golden eval task.

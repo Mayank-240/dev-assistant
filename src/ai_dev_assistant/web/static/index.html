@@ -95,6 +95,7 @@
 
           <nav class="nav" aria-label="Workspace views">
             <span class="nav-label" aria-hidden="true">Workspace</span>
+            <button type="button" class="vtab" data-view="project"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 13.5v-8l5.5-3.5 5.5 3.5v8z"/><path d="M6.5 13.5v-4h3v4"/></svg>Project&nbsp;Home</button>
             <button type="button" class="vtab" data-view="agents"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><circle cx="4" cy="4" r="2"/><circle cx="12" cy="4" r="2"/><circle cx="4" cy="12" r="2"/><circle cx="12" cy="12" r="2"/></svg>Agents</button>
             <button type="button" class="vtab" data-view="memory"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2.5" y="3" width="11" height="3" rx="1"/><rect x="2.5" y="9.5" width="11" height="3" rx="1"/></svg>Memory</button>
             <button type="button" class="vtab" data-view="graph"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="3.5" cy="12" r="2" fill="currentColor" stroke="none"/><circle cx="12.5" cy="11" r="2" fill="currentColor" stroke="none"/><circle cx="8" cy="3.5" r="2" fill="currentColor" stroke="none"/><path d="M8 4.5l-4 6.5M8 4.5l4 5.5"/></svg>Knowledge&nbsp;Graph</button>
@@ -184,6 +185,7 @@
                   <div class="run-status">
                     <span id="timer" class="timer">0.0s</span>
                     <span id="status-pill" class="pill pill-running">running</span>
+                    <button id="review-btn" class="ghost-btn" title="Per-subtask reviews and the task's effective permissions">⚖ Review &amp; Permissions</button>
                     <button id="pause-btn" class="ghost-btn hidden" title="Pause before the next batch">⏸ Pause</button>
                     <button id="steer-btn" class="ghost-btn hidden" title="Send a steering note to the next subtask">✎ Steer</button>
                     <button id="cancel-btn" class="cancel hidden">Cancel</button>
@@ -308,6 +310,60 @@
                 <button id="cmp-btn" class="ghost-btn">Compare</button>
               </div>
               <div id="cmp-result" class="cmp-result muted">Pick two runs from history and press Compare.</div>
+            </div>
+          </div>
+
+          <!-- ============ PROJECT HOME (F4) ============ -->
+          <div id="view-project" class="view hidden">
+            <div class="view-header">
+              <div>
+                <h1 id="ph-name">Project home</h1>
+                <p>Repository status, live activity, policy, and run history for the selected project.</p>
+              </div>
+              <button id="ph-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh project home">⟳</button>
+            </div>
+            <div class="ph-grid">
+              <div class="card">
+                <span class="kicker">Repository &amp; activity</span>
+                <div id="ph-status" class="proj-status" title="Repository state of the selected project"><span class="muted">No repository info.</span></div>
+                <div id="ph-activity" class="proj-activity pa-idle" role="status" aria-live="polite"><span class="pa-dot" aria-hidden="true"></span>idle</div>
+              </div>
+              <div class="card">
+                <span class="kicker">Policy — applies to every task in this project</span>
+                <div class="ph-policy">
+                  <label class="pm-label" for="ph-budget">Budget $ per run</label>
+                  <input id="ph-budget" class="title-input" type="number" min="0" step="0.5" placeholder="none (server default)" />
+                  <label class="pm-label" for="ph-effort">Effort</label>
+                  <select id="ph-effort" class="select">
+                    <option value="">(default)</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="xhigh">xhigh</option>
+                    <option value="max">max</option>
+                  </select>
+                  <label class="pm-label" for="ph-gitmode">Git mode</label>
+                  <select id="ph-gitmode" class="select">
+                    <option value="">(default: branch)</option>
+                    <option value="branch">branch — leave ada/&lt;task&gt; for review</option>
+                    <option value="merge">merge — auto-merge on pass</option>
+                  </select>
+                  <label class="pm-label" for="ph-protected">Protected paths — one glob per line; agents refuse to write them</label>
+                  <textarea id="ph-protected" rows="3" placeholder="infra/**&#10;*.lock"></textarea>
+                  <p id="ph-policy-error" class="pm-error hidden" role="alert"></p>
+                  <div class="pe-actions">
+                    <button id="ph-policy-save">Save policy</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="ph-trend-head">
+                <span class="kicker">Recent runs — quality trend</span>
+                <span class="ph-trend" aria-hidden="true"><svg id="ph-sparkline" width="140" height="32" viewBox="0 0 140 32" preserveAspectRatio="none"></svg></span>
+                <span id="ph-trend-label" class="muted"></span>
+              </div>
+              <div id="ph-runs" class="ph-runs"><p class="muted">No runs yet for this project.</p></div>
             </div>
           </div>
 
@@ -439,6 +495,24 @@
           <span class="kicker">Tools</span>
           <div id="rm-tools" class="tool-chips"></div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Reviews & Permissions panel (F4, decision #5) -->
+  <div id="review-modal" class="modal hidden">
+    <div class="modal-box rvp-box" role="dialog" aria-modal="true" aria-label="Reviews and permissions" tabindex="-1">
+      <div class="modal-head">
+        <div class="tabs" role="tablist" aria-label="Reviews and permissions">
+          <button type="button" id="rvp-tab-reviews" class="tab active" role="tab" aria-selected="true" aria-controls="rvp-reviews" data-rtab="reviews">Reviews</button>
+          <button type="button" id="rvp-tab-permissions" class="tab" role="tab" aria-selected="false" aria-controls="rvp-permissions" data-rtab="permissions">Permissions</button>
+        </div>
+        <button id="review-modal-close" type="button" class="ghost" aria-label="Close dialog">✕</button>
+      </div>
+      <div class="rvp-body">
+        <div id="rvp-branches" class="rvp-branches hidden"></div>
+        <div id="rvp-reviews" role="tabpanel" aria-labelledby="rvp-tab-reviews"><p class="muted">Loading…</p></div>
+        <div id="rvp-permissions" role="tabpanel" aria-labelledby="rvp-tab-permissions" class="hidden"><p class="muted">Loading…</p></div>
       </div>
     </div>
   </div>
