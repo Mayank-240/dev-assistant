@@ -62,7 +62,8 @@ specified in [PLAN.md](PLAN.md) and not yet built.
 ## CLI · evals · CI
 - `ada run` (`-i`, `--continue`, `--ingest`) · `ada resume` · `ada server` ·
   `ada eval` (`--only/--json/--repeat/--timeout/--replay/--record-cassettes/--ab`).
-- 10 multi-language golden tasks with held-out grading + toolchain skips;
+- 11 golden tasks (multi-language + one cross-project fan-out task) with
+  held-out grading + toolchain skips;
   offline replay cassettes in CI; secret-gated live-eval workflow; A/B knob
   harness; retrieval benchmark. CI: pytest + node tests + replay eval.
 - Per-task artifacts: plan/report/brief/activity docs, streamed events.jsonl,
@@ -80,7 +81,7 @@ specified in [PLAN.md](PLAN.md) and not yet built.
 7. Evals: live suite · offline replay (CI) · `--ab` comparison.
 8. Deploy: compose up → token from logs → container is the boundary.
 
-## Project-level assistant (PLAN.md — slices 1 & 2 SHIPPED)
+## Project-level assistant (PLAN.md — all three slices SHIPPED)
 - Project lifecycle: create greenfield (own git checkout) / import local
   **in place** (read-only contract: the assistant never commits, switches
   branches, or writes in your repo — only `ada/*` branches) / import git URL
@@ -98,10 +99,15 @@ specified in [PLAN.md](PLAN.md) and not yet built.
   projects use `ada/integration`), Reject records feedback for learning.
 - Live activity: per-project status + activity strip, all-projects activity
   table, project home with policy editor, run history, and quality sparkline.
-- Project-first CLI (`ada project …`, `ada run -p`) and API; evals run through
-  ephemeral projects; per-run repo binding removed.
-
-## [planned] Slice 3 (PLAN.md)
-- Cross-project fan-out: coordinator → one child task per project → parallel
-  execution with optional stagger → budget split → rollup report; cross-project
-  composer + parent task view; cross-project golden eval task.
+- Cross-project fan-out (slice 3): one prompt over N projects → one child task
+  per project (own worktree, baseline, `ada/<child-id>` branch), run in
+  parallel with optional `--stagger` (first child's lessons inform the rest),
+  parent budget split into per-child caps, and a rollup report — per-project
+  verdict table with cost/quality/branch/review-target, parent ↔ child
+  `parent_id` lineage (parent row `project="multi"`), failure isolation (one
+  child failing never blocks the others); cross-project composer + parent view.
+- Cross-project golden eval task (`cross_logging_fix`): two sub-repo fixtures
+  imported as two ephemeral projects, driven through the real fan-out path and
+  graded per child on held-out tests plus a rollup grader.
+- Project-first CLI (`ada project …`, `ada run -p a -p b`) and API; evals run
+  through ephemeral projects; per-run repo binding removed.

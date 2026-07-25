@@ -1,7 +1,10 @@
 # AI Dev Assistant — Feature Plan: the Project-Level Assistant
 
-Status: **draft for decision** — nothing below is built yet. The assistant is not
-deployed anywhere, so this plan assumes a clean break: no migrations, no
+Status: **all three slices implemented** (see §4 Build order); this document is
+kept as the design record, decision history in §5 intact.
+
+Originally drafted for decision when nothing below was built. The assistant was
+not deployed anywhere, so this plan assumed a clean break: no migrations, no
 backward-compatibility shims. Legacy per-run behavior is replaced, not preserved.
 
 ---
@@ -178,9 +181,9 @@ Three slices, each landing green (tests + replay eval + CI) before the next:
 
 | Slice | Contents | Rough size |
 |---|---|---|
-| **1. Projects own repos** | F1 (lifecycle, import, one-time + incremental indexing), F5 project commands, F6 project endpoints, run records gain `project_id` | the foundation; touches config/engine/vcs/projects/server/cli |
-| **2. Tasks live in projects** | F2 (worktree-off-checkout, policy incl. protected paths + git modes), F4 project home + review v1, F8 eval harness moves to ephemeral projects | engine + web, biggest slice |
-| **3. Fan-out** | F3 (coordinator, parallel children, stagger option, budget split, rollup), cross-project composer + parent view, cross-project golden task | mostly new orchestration code |
+| **1. Projects own repos** — shipped | F1 (lifecycle, import, one-time + incremental indexing), F5 project commands, F6 project endpoints, run records gain `project_id` | the foundation; touches config/engine/vcs/projects/server/cli |
+| **2. Tasks live in projects** — shipped | F2 (worktree-off-checkout, policy incl. protected paths + git modes), F4 project home + review v1, F8 eval harness moves to ephemeral projects | engine + web, biggest slice |
+| **3. Fan-out** — shipped | F3 (coordinator, parallel children, stagger option, budget split, rollup), cross-project composer + parent view, cross-project golden task (`cross_logging_fix`) | mostly new orchestration code |
 
 Clean-break removals alongside slice 1: per-run repo binding (env + RunRequest
 fields), per-run workspace copies, `--continue`'s workspace-copy path.
