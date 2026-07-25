@@ -96,6 +96,8 @@ class Settings:
     git_finalize: bool = False      # at the end, commit the workspace on a new branch
     git_branch_prefix: str = "ada/"
     worktree_per_subtask: bool = False  # isolate parallel subtasks in git worktrees, merge on pass
+    git_mode: str = "branch"        # project outcome: "branch" (review) | "merge" (auto on pass)
+    protected_paths: tuple[str, ...] = ()  # globs agents' write tools must refuse (policy-driven)
 
     # --- Sandbox / execution safety (Tier 2/5) ---
     sandbox: str = "subprocess"     # "subprocess" (scrubbed env + rlimits) | "none"
@@ -157,6 +159,9 @@ class Settings:
             git_finalize=_bool("ADA_GIT_FINALIZE", False),
             git_branch_prefix=_get("ADA_GIT_BRANCH_PREFIX", "ada/"),
             worktree_per_subtask=_bool("ADA_WORKTREE_PER_SUBTASK", False),
+            git_mode=_get("ADA_GIT_MODE", "branch"),
+            protected_paths=tuple(p.strip() for p in _get("ADA_PROTECTED_PATHS", "").split(",")
+                                  if p.strip()),
             sandbox=_get("ADA_SANDBOX", "subprocess"),
             sandbox_cpu_seconds=_int("ADA_SANDBOX_CPU_SECONDS", 60),
             sandbox_mem_mb=_int("ADA_SANDBOX_MEM_MB", 1024),

@@ -407,6 +407,78 @@ def delete_project(settings: Settings, slug: str) -> None:
     _write_registry(settings, items)
 
 
+def review_target(settings: Settings, slug: str) -> str:
+    """The branch acceptance merges into (F2/decision #2).
+
+    In-place (local-origin) projects get an ``ada/integration`` branch — git refuses
+    commits to the user's checked-out branch from another worktree, and the safety
+    contract forbids touching their working tree; the user merges when ready.
+    """
+    p = get_project(settings, slug) or {}
+    if p.get("origin") == "local":
+        return "ada/integration"
+    return p.get("default_branch") or "main"
+
+
+# Policy keys applied onto Settings for a run (project policy → Settings field).
+_POLICY_MAP = {
+    "budget_usd": "budget_usd",
+    "effort": "agent_effort",
+    "git_mode": "git_mode",
+    "sandbox": "sandbox",
+    "allow_web": "allow_web",
+    "max_plan_subtasks": "max_plan_subtasks",
+    "worktree_per_subtask": "worktree_per_subtask",
+}
+
+
+def accept_commit(settings: Settings, slug: str, sha: str) -> dict:
+    """Accept one subtask commit into the project's review target (decision #5).
+
+    Owned checkouts (greenfield/clone) with the target checked out and clean:
+    cherry-pick directly in the checkout so the working tree advances with the
+    branch. In-place projects (and any other case): temp-worktree cherry-pick
+    into the target branch — the user's checkout is never touched.
+    """
+    from . import vcs
+
+    p = get_project(settings, slug)
+    if not p or not p.get("root"):
+        return {"merged": False, "conflict": False, "error": "project has no repository"}
+    root = Path(p["root"])
+    target = review_target(settings, slug)
+    if p.get("origin") != "local":
+        st = project_status(settings, slug)
+        if st.get("branch") == target and not st.get("dirty"):
+            return vcs.cherry_pick_in_checkout(root, sha)
+    return vcs.cherry_pick_merge(root, sha, target)
+
+
+def effective_settings(settings: Settings, slug: str | None = None) -> Settings:
+    """Resolve per-run Settings: task override → project policy → global defaults (F7).
+
+    Also flips worktree_per_subtask ON by default for project tasks with a checkout —
+    per-subtask commits are what make per-subtask review acceptance possible
+    (decision #5).
+    """
+    import dataclasses
+
+    slug = slug or settings.project
+    p = get_project(settings, slug)
+    if p is None:
+        return settings
+    policy = p.get("policy") or {}
+    overrides: dict = {}
+    for key, field in _POLICY_MAP.items():
+        if key in policy and policy[key] is not None:
+            overrides[field] = policy[key]
+    if "protected_paths" in policy:
+        overrides["protected_paths"] = tuple(policy["protected_paths"] or ())
+    if project_checkout(settings, slug) is not None and "worktree_per_subtask" not in policy:
+        overrides["worktree_per_subtask"] = True
+    return dataclasses.replace(settings, **overrides) if overrides else settings
+
+
 def resolve(settings: Settings, slug: str | None) -> str:
     """Return a valid project slug, falling back to default for unknown/blank input."""
     if not slug:

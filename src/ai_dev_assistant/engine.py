@@ -102,6 +102,7 @@ class Engine:
         self._activity: dict[str, list[dict[str, Any]]] = {}  # subtask id -> agent steps
         self._cost_by_subtask: dict[str, dict[str, Any]] = {}
         self._changed_by_subtask: dict[str, list[str]] = {}  # subtask id -> files it touched
+        self._merge_by_subtask: dict[str, str] = {}  # subtask id -> its merge commit sha
         self._baseline: dict[str, Any] = {}  # pre-run test/lint snapshot (V3 delta gating)
         self._repairs = 0
         self._tracer: Tracer | None = None
@@ -144,7 +145,33 @@ class Engine:
                                resume: bool) -> str:
         run_ws, rid, emit = ctx.run_ws, ctx.rid, ctx.emit
         repo_context = ""
-        if resume:
+        checkout = self._project_checkout() if not self.settings.repo_backed else None
+        if checkout is not None:
+            # Project task (F2): worktree off the durable checkout. Idempotent add covers
+            # resume; a continuation bases its branch on the parent task's branch.
+            emit(status(f"Preparing worktree from project '{self.settings.project}'…"))
+            try:
+                try:
+                    from . import projects as _projects
+                    ref = await asyncio.to_thread(
+                        _projects.refresh_index, self.settings, self.settings.project,
+                        self.kb, self.kg)
+                    if ref.get("files"):
+                        emit(status(f"Project index refreshed: {ref['files']} file(s) "
+                                    f"({ref.get('mode', '?')})."))
+                except Exception as exc:  # indexing is best-effort
+                    logger.info("project index refresh skipped: %s", exc)
+                base = f"ada/{continue_from}" if continue_from else ""
+                info = await asyncio.to_thread(
+                    vcs.task_worktree_add, checkout, run_ws, rid, base=base)
+                emit(status(f"Worktree ready on {info['branch']}."))
+                repo_context = await asyncio.to_thread(build_repo_map, run_ws)
+                if continue_from:
+                    repo_context = self._continuation_summary(continue_from) + repo_context
+            except Exception as exc:
+                run_ws.mkdir(parents=True, exist_ok=True)
+                emit(status(f"Project worktree unavailable ({exc}); continuing greenfield."))
+        elif resume:
             pass  # the workspace already holds the interrupted run's state — don't re-materialize
         elif self.settings.repo_backed:
             emit(status("Materializing repository into the workspace…"))
@@ -160,28 +187,6 @@ class Engine:
                     emit(status(f"Onboarded {onb['files']} repo file(s) into the KB + graph."))
             except Exception as exc:  # never let repo setup abort the whole run
                 emit(status(f"Repository setup failed ({exc}); continuing greenfield."))
-        elif (checkout := self._project_checkout()) is not None:
-            # Project-level flow (PLAN F1/F2): the project owns a durable checkout;
-            # refresh its index incrementally, then materialize the run workspace from it.
-            emit(status(f"Preparing workspace from project '{self.settings.project}'…"))
-            try:
-                try:
-                    from . import projects as _projects
-                    ref = await asyncio.to_thread(
-                        _projects.refresh_index, self.settings, self.settings.project,
-                        self.kb, self.kg)
-                    if ref.get("files"):
-                        emit(status(f"Project index refreshed: {ref['files']} file(s) "
-                                    f"({ref.get('mode', '?')})."))
-                except Exception as exc:  # indexing is best-effort
-                    logger.info("project index refresh skipped: %s", exc)
-                info = await asyncio.to_thread(
-                    vcs.materialize, dest=run_ws, repo_url="",
-                    repo_path=str(checkout), repo_ref="")
-                emit(status(f"Project workspace ready @ {info.get('head', '')[:8]}."))
-                repo_context = await asyncio.to_thread(build_repo_map, run_ws)
-            except Exception as exc:
-                emit(status(f"Project workspace setup failed ({exc}); continuing greenfield."))
         elif continue_from:
             # Re-engagement: carry the prior task's workspace + outcome forward.
             repo_context = await self._prepare_continuation(continue_from, run_ws, rid, emit)
@@ -241,6 +246,7 @@ class Engine:
         self._activity = {}
         self._cost_by_subtask = {}
         self._changed_by_subtask = {}
+        self._merge_by_subtask = {}
         self._baseline = {}
         self._repairs = 0
 
@@ -262,8 +268,16 @@ class Engine:
             seq += 1
             base_emit(e)
 
-        run_ws = self.settings.run_workspace(rid)
-        run_ws.mkdir(parents=True, exist_ok=True)  # agents (and repo materialize) write here
+        checkout = self._project_checkout() if not self.settings.repo_backed else None
+        if checkout is not None:
+            # Project task (F2): the workspace is a git worktree OUTSIDE the checkout,
+            # on branch ada/<rid>. It persists after the run — review, files, continue,
+            # and resume all read it; it's removed when the task is deleted.
+            run_ws = self.settings.workspace_dir / self.settings.project / "worktrees" / rid
+        else:
+            run_ws = self.settings.run_workspace(rid)
+            run_ws.mkdir(parents=True, exist_ok=True)  # agents (and repo materialize) write here
+        self.last_run_workspace = run_ws
         self._tracer = Tracer(self.settings.docs_dir / rid / "trace.jsonl", enabled=self.settings.trace)
         self._audit = AuditLog(self.settings.docs_dir / rid / "audit.jsonl", enabled=self.settings.audit_log)
 
@@ -313,7 +327,35 @@ class Engine:
                             "the rest will run."))
         if continue_from:
             self.runs.set_parent(run.id, continue_from)
+        review_tgt = ""
+        if checkout is not None:
+            try:
+                from . import projects as _projects
+                review_tgt = _projects.review_target(self.settings, self.settings.project)
+            except Exception:
+                pass
+            try:
+                self.runs.set_run_branch(run.id, f"ada/{rid}", review_tgt)
+            except Exception:
+                pass
         self._seed_kg(run)
+        # Effective permissions snapshot (F4): what this task may spend, touch, and use.
+        emit(Event("policy", "Effective policy resolved.", {
+            "policy": {
+                "budget_usd": self.settings.budget_usd,
+                "effort": self.settings.agent_effort,
+                "git_mode": self.settings.git_mode,
+                "protected_paths": list(self.settings.protected_paths),
+                "sandbox": self.settings.sandbox,
+                "allow_web": self.settings.allow_web,
+                "allow_run_command": self.settings.allow_run_command,
+                "max_plan_subtasks": self.settings.max_plan_subtasks,
+                "worktree_per_subtask": self.settings.worktree_per_subtask,
+            },
+            "tools_by_agent": {n: list(a.profile.tools) for n, a in self.agents.items()},
+            "review_target": review_tgt,
+            "task_branch": f"ada/{rid}" if checkout is not None else "",
+        }))
         emit(Event("plan", f"Plan ready: {len(run.subtasks)} subtask(s).", {
             "summary": plan.summary,
             "subtasks": [
@@ -421,8 +463,36 @@ class Engine:
         if n_files:
             emit(status(f"Indexed {n_files} generated file(s) into the knowledge graph."))
 
-        # ---- Tier 2: deliver the work as a git branch/commit (optional) ----
-        if self.settings.git_finalize:
+        # ---- Delivery: project tasks live on their ada/<id> branch; policy decides ----
+        checkout = self._project_checkout()
+        if checkout is not None:
+            branch = f"ada/{run.id}"
+            try:
+                from . import projects as _projects
+                target = _projects.review_target(self.settings, self.settings.project)
+            except Exception:
+                target = ""
+            if (self.settings.git_mode == "merge" and target
+                    and run.rollup_status() == "completed"):
+                try:
+                    mres = await asyncio.to_thread(
+                        vcs.merge_branch, checkout, branch, target,
+                        message=f"ada: accept task {run.id}")
+                except Exception as exc:
+                    mres = {"merged": False, "error": str(exc)}
+                if mres.get("merged"):
+                    emit(Event("git", f"Auto-merged {branch} into {target} "
+                               f"({mres.get('commit', '')[:8]}).",
+                               {"branch": branch, "merged_into": target,
+                                "commit": mres.get("commit", "")}))
+                else:
+                    emit(status(f"Auto-merge into {target} skipped "
+                                f"({mres.get('error') or 'conflict'}) — branch kept for review."))
+            else:
+                emit(Event("git", f"Task branch {branch} ready for review"
+                           + (f" (accepts merge into {target})" if target else "") + ".",
+                           {"branch": branch, "review_target": target}))
+        elif self.settings.git_finalize:
             try:
                 branch = f"{self.settings.git_branch_prefix}{run.id}"
                 info = await asyncio.to_thread(
@@ -579,7 +649,9 @@ class Engine:
                 run.id, state.id, status=state.status.value, attempts=state.attempts,
                 result=self._scrub(state.result or ""),
                 verdict_json=state.verdict.model_dump_json() if state.verdict else None,
-                error=state.error or "")
+                error=state.error or "",
+                merge_commit=self._merge_by_subtask.get(state.id, ""),
+                changed_json=json.dumps(self._changed_by_subtask.get(state.id, [])))
         except Exception:
             logger.debug("checkpoint failed for %s/%s", run.id, state.id, exc_info=True)
 
@@ -728,6 +800,7 @@ class Engine:
             allow_run_command=self.settings.allow_run_command, sandbox=self.settings.sandbox,
             sandbox_cpu=self.settings.sandbox_cpu_seconds, sandbox_mem=self.settings.sandbox_mem_mb,
             spawn=spawn, allow_web=self.settings.allow_web,
+            protected_paths=self.settings.protected_paths,
         )
         fields = {f.name for f in dataclasses.fields(ToolContext)}
         return ToolBox(ToolContext(**{k: v for k, v in kwargs.items() if k in fields}))
@@ -754,10 +827,11 @@ class Engine:
             before_cost = usage_snapshot()
             agent = session.agent  # the BaseAgent for this session
 
-            # Per-subtask worktree isolation (opt-in): parallel subtasks each work on
-            # their own checkout and merge back on completion, so siblings can't
-            # clobber each other's files mid-write.
-            use_wt = (self.settings.worktree_per_subtask and len(run.subtasks) > 1
+            # Per-subtask worktree isolation: parallel subtasks each work on their own
+            # checkout and merge back on completion — siblings can't clobber each other,
+            # and each subtask lands as its own commit (what per-subtask review
+            # acceptance is built on, so it's on even for single-subtask project plans).
+            use_wt = (self.settings.worktree_per_subtask
                       and (run_workspace / ".git").exists())
             exec_ws = run_workspace
             if use_wt:
@@ -863,6 +937,7 @@ class Engine:
                         mres = await asyncio.to_thread(
                             vcs.worktree_merge, run_workspace, state.id,
                             message=f"ada: subtask {state.id} ({state.spec.title[:50]})")
+                    self._merge_by_subtask[state.id] = mres.get("commit", "") or ""
                     if mres.get("conflict"):
                         conflicts = ", ".join(mres.get("files", [])) or "unknown files"
                         result += (f"\n\n[worktree merge conflict on: {conflicts} — these changes "

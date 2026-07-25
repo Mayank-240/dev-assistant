@@ -320,6 +320,11 @@ def _run(args: argparse.Namespace) -> int:
         from . import projects
         settings = dataclasses.replace(settings, project=projects.resolve(settings, args.project))
         print(f"Project: {settings.project}")
+    try:  # apply the active project's policy (F7): task override → policy → defaults
+        from . import projects
+        settings = projects.effective_settings(settings)
+    except Exception:
+        pass
     if settings.requires_api_key and not settings.has_api_key:
         print("ERROR: ANTHROPIC_API_KEY is not set (required for the 'anthropic' backend). "
               "Use ADA_LLM_BACKEND=claude_sdk to run via your Claude Code login instead.", file=sys.stderr)

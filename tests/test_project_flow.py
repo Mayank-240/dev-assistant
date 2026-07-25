@@ -99,11 +99,11 @@ async def test_task_runs_from_greenfield_project_checkout(tmp_path):
     assert run.all_passed
     # the run row is tagged with the project
     assert row.get("project") == proj["slug"]
-    # workspace was materialized FROM the project checkout (seed file visible to the agent)
+    # workspace is a worktree off the project checkout (seed file visible to the agent)
     assert any("seed.py" in s for s in provider.saw_files)
-    ws = settings.run_workspace(run.id)
+    ws = settings.workspace_dir / proj["slug"] / "worktrees" / run.id
     assert (ws / "seed.py").is_file() and (ws / "hello.txt").is_file()
-    # the project checkout itself was not mutated by the run
+    # the project checkout's own working tree was not mutated by the run
     assert not (checkout / "hello.txt").exists()
     assert any("project" in (e.message or "").lower() for e in events if e.type == "status")
     # indexing advanced
@@ -133,9 +133,9 @@ async def test_task_from_inplace_import_never_touches_user_repo(tmp_path):
         await engine.aclose()
 
     assert run.all_passed
-    # agent saw the user's code (materialized copy) and wrote only in the run workspace
+    # agent saw the user's code (worktree off their repo) and wrote only there
     assert any("app.py" in s for s in provider.saw_files)
-    ws = settings.run_workspace(run.id)
+    ws = settings.workspace_dir / proj["slug"] / "worktrees" / run.id
     assert (ws / "hello.txt").is_file()
     # the user's repo: same HEAD, clean, no new files
     head_after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=user_repo,

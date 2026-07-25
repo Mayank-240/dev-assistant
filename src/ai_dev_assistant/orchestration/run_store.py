@@ -62,6 +62,15 @@ CREATE TABLE IF NOT EXISTS subtask_states (
     PRIMARY KEY (run_id, subtask_id)
 );
 
+CREATE TABLE IF NOT EXISTS subtask_reviews (
+    run_id TEXT NOT NULL,
+    subtask_id TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    comment TEXT,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (run_id, subtask_id)
+);
+
 CREATE TABLE IF NOT EXISTS agent_outcomes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT,
@@ -105,9 +114,15 @@ class RunStore:
                           ("memories", "INTEGER"), ("messages", "INTEGER"),
                           ("quality_score", "REAL"), ("run_status", "TEXT"),
                           ("parent_id", "TEXT"), ("plan_json", "TEXT"),
-                          ("project", "TEXT")):
+                          ("project", "TEXT"), ("task_branch", "TEXT"),
+                          ("review_target", "TEXT")):
             try:
                 self._conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError:
+                pass
+        for col, decl in (("merge_commit", "TEXT"), ("changed", "TEXT")):
+            try:
+                self._conn.execute(f"ALTER TABLE subtask_states ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError:
                 pass
         self._conn.commit()
@@ -169,6 +184,7 @@ class RunStore:
         self._conn.execute("DELETE FROM feedback WHERE run_id = ?", (run_id,))
         self._conn.execute("DELETE FROM agent_outcomes WHERE run_id = ?", (run_id,))
         self._conn.execute("DELETE FROM subtask_states WHERE run_id = ?", (run_id,))
+        self._conn.execute("DELETE FROM subtask_reviews WHERE run_id = ?", (run_id,))
         self._conn.commit()
 
     # ---- checkpointing (R1): per-subtask state survives interruption ----
@@ -182,14 +198,37 @@ class RunStore:
 
     def checkpoint_subtask(self, run_id: str, subtask_id: str, *, status: str,
                            attempts: int, result: str, verdict_json: str | None,
-                           error: str = "") -> None:
+                           error: str = "", merge_commit: str = "",
+                           changed_json: str | None = None) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO subtask_states"
-            "(run_id, subtask_id, status, attempts, result, verdict, error, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (run_id, subtask_id, status, attempts, result, verdict_json, error, time.time()),
+            "(run_id, subtask_id, status, attempts, result, verdict, error, updated_at, "
+            "merge_commit, changed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, subtask_id, status, attempts, result, verdict_json, error, time.time(),
+             merge_commit, changed_json),
         )
         self._conn.commit()
+
+    def set_run_branch(self, run_id: str, branch: str, target: str) -> None:
+        """Record the task's delivery branch and the branch acceptance merges into."""
+        self._conn.execute("UPDATE runs SET task_branch = ?, review_target = ? WHERE id = ?",
+                           (branch, target, run_id))
+        self._conn.commit()
+
+    # ---- per-subtask review decisions (F4/decision #5) ----
+    def set_subtask_review(self, run_id: str, subtask_id: str, decision: str,
+                           comment: str = "") -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO subtask_reviews(run_id, subtask_id, decision, comment, "
+            "created_at) VALUES (?, ?, ?, ?, ?)",
+            (run_id, subtask_id, decision, comment, time.time()),
+        )
+        self._conn.commit()
+
+    def get_subtask_reviews(self, run_id: str) -> dict[str, dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM subtask_reviews WHERE run_id = ?", (run_id,)).fetchall()
+        return {r["subtask_id"]: dict(r) for r in rows}
 
     def get_subtask_states(self, run_id: str) -> dict[str, dict[str, Any]]:
         rows = self._conn.execute(
