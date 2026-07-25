@@ -9,6 +9,7 @@ from __future__ import annotations
 from ..config import Settings
 from ..llm.provider import LLMProvider
 from ..llm.schemas import Verdict
+from ..security.redaction import untrusted
 from .registry import REVIEWER_SYSTEM
 
 
@@ -25,14 +26,21 @@ class Reviewer:
         acceptance_criteria: list[str],
         result: str,
         workspace_files: list[str] | None = None,
+        changed_files: list[str] | None = None,
         file_contents: str = "",
     ) -> Verdict:
         criteria = "\n".join(f"- {c}" for c in acceptance_criteria) or "- (none specified)"
         files = ("\n".join(f"- {f}" for f in workspace_files) if workspace_files
                  else "(workspace is empty)")
+        changed_block = (
+            "\nFILES THIS SUBTASK ADDED OR MODIFIED (focus your review here):\n"
+            + "\n".join(f"- {f}" for f in changed_files) + "\n"
+        ) if changed_files else ""
+        # Workspace file contents are attacker-influenceable in a repo-backed run — wrap
+        # them so an injected instruction inside a source file is treated as data (S6).
         contents_block = (
             f"\nACTUAL FILE CONTENTS (read these — do not trust the result's claims about them):\n"
-            f"{file_contents}\n" if file_contents else ""
+            f"{untrusted(file_contents, source='workspace-files')}\n" if file_contents else ""
         )
         user = (
             f"SUBTASK: {title}\n"
@@ -40,6 +48,7 @@ class Reviewer:
             f"ACCEPTANCE CRITERIA:\n{criteria}\n\n"
             f"FILES ACTUALLY PRESENT IN THE WORKSPACE (ground truth — judge file-existence "
             f"criteria against THIS list, not the result's claims):\n{files}\n"
+            f"{changed_block}"
             f"{contents_block}\n"
             f"RESULT TO VERIFY:\n{result}\n\n"
             "Decide whether the result meets every acceptance criterion. When file contents are "

@@ -100,9 +100,38 @@ class NetworkXKnowledgeGraph:
         if not self._path:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock:
-            data = self._serialize()
-        self._path.write_text(json.dumps(data, indent=2))
+        # Concurrent runs each hold their own in-memory graph of the same project file;
+        # merge with what's on disk under an exclusive lock so the last writer no longer
+        # silently discards the other run's facts (R4).
+        lock_path = self._path.with_suffix(".lock")
+        with self._lock, open(lock_path, "w") as lock_fh:
+            try:
+                import fcntl
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass  # non-POSIX: best effort, single-writer assumption
+            self._merge_from_disk()
+            self._path.write_text(json.dumps(self._serialize(), indent=2))
+
+    def _merge_from_disk(self) -> None:
+        """Union the on-disk graph into memory (in-memory attrs win on conflict)."""
+        if not (self._path and self._path.exists()):
+            return
+        try:
+            data = json.loads(self._path.read_text())
+        except Exception:
+            return
+        for node in data.get("nodes", []):
+            if node["id"] not in self._g:
+                self._g.add_node(node["id"], **node.get("attrs", {}))
+        for edge in data.get("edges", []):
+            rel = edge.get("relation", "related_to")
+            if not self._g.has_edge(edge["src"], edge["dst"], key=rel):
+                for nid in (edge["src"], edge["dst"]):
+                    if nid not in self._g:
+                        self._g.add_node(nid, node_type="concept")
+                self._g.add_edge(edge["src"], edge["dst"], key=rel, relation=rel,
+                                 **edge.get("attrs", {}))
 
     def _serialize(self) -> dict:
         return {

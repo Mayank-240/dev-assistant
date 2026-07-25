@@ -8,8 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..llm.provider import LLMProvider, StepFn
-from ..tools.registry import ToolBox
+from ..llm.provider import LLMProvider, StepFn, ToolDispatcher
 
 
 @dataclass
@@ -36,12 +35,16 @@ class BaseAgent:
         *,
         task_text: str,
         context: str,
-        toolbox: ToolBox,
+        toolbox: ToolDispatcher,
         provider: LLMProvider,
         workdir: str | None = None,
         on_step: StepFn | None = None,
+        max_cost_usd: float | None = None,
     ) -> str:
         prompt = task_text if not context else f"{task_text}\n\n--- Context ---\n{context}"
+        # Forward the budget only when set: wrapper providers (record/replay) predate the
+        # kwarg, and None means "no cap" anyway.
+        extra: dict[str, float] = {} if max_cost_usd is None else {"max_cost_usd": max_cost_usd}
         return await provider.run_agent(
             system_prompt=self.system_prompt,
             prompt=prompt,
@@ -51,4 +54,5 @@ class BaseAgent:
             effort=self.profile.effort,
             workdir=workdir,
             on_step=on_step,
+            **extra,
         )

@@ -50,6 +50,18 @@ CREATE TABLE IF NOT EXISTS feedback (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS subtask_states (
+    run_id TEXT NOT NULL,
+    subtask_id TEXT NOT NULL,
+    status TEXT,
+    attempts INTEGER,
+    result TEXT,
+    verdict TEXT,
+    error TEXT,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (run_id, subtask_id)
+);
+
 CREATE TABLE IF NOT EXISTS agent_outcomes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT,
@@ -80,12 +92,19 @@ class RunStore:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # Concurrent runs / web workers share this file — WAL + a busy timeout stop
+        # "database is locked" races (R4).
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+        except sqlite3.OperationalError:
+            pass
         self._conn.executescript(_SCHEMA)
         # migrate older DBs that predate newer columns
         for col, decl in (("title", "TEXT"), ("kg_nodes", "INTEGER"), ("kg_edges", "INTEGER"),
                           ("memories", "INTEGER"), ("messages", "INTEGER"),
                           ("quality_score", "REAL"), ("run_status", "TEXT"),
-                          ("parent_id", "TEXT")):
+                          ("parent_id", "TEXT"), ("plan_json", "TEXT")):
             try:
                 self._conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError:
@@ -143,7 +162,33 @@ class RunStore:
         self._conn.execute("DELETE FROM queue WHERE task_id = ?", (run_id,))
         self._conn.execute("DELETE FROM feedback WHERE run_id = ?", (run_id,))
         self._conn.execute("DELETE FROM agent_outcomes WHERE run_id = ?", (run_id,))
+        self._conn.execute("DELETE FROM subtask_states WHERE run_id = ?", (run_id,))
         self._conn.commit()
+
+    # ---- checkpointing (R1): per-subtask state survives interruption ----
+    def save_plan(self, run_id: str, plan_json: str) -> None:
+        self._conn.execute("UPDATE runs SET plan_json = ? WHERE id = ?", (plan_json, run_id))
+        self._conn.commit()
+
+    def get_plan(self, run_id: str) -> str | None:
+        row = self._conn.execute("SELECT plan_json FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return row["plan_json"] if row and row["plan_json"] else None
+
+    def checkpoint_subtask(self, run_id: str, subtask_id: str, *, status: str,
+                           attempts: int, result: str, verdict_json: str | None,
+                           error: str = "") -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO subtask_states"
+            "(run_id, subtask_id, status, attempts, result, verdict, error, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, subtask_id, status, attempts, result, verdict_json, error, time.time()),
+        )
+        self._conn.commit()
+
+    def get_subtask_states(self, run_id: str) -> dict[str, dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM subtask_states WHERE run_id = ?", (run_id,)).fetchall()
+        return {r["subtask_id"]: dict(r) for r in rows}
 
     # ---- human feedback (Tier 4) ----
     def set_feedback(self, run_id: str, *, rating: int | None = None,
@@ -158,6 +203,15 @@ class RunStore:
     def get_feedback(self, run_id: str) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM feedback WHERE run_id = ?", (run_id,)).fetchone()
         return dict(row) if row else None
+
+    def recent_feedback(self, limit: int = 5) -> list[dict[str, Any]]:
+        """Latest human feedback joined with its run — consumed at plan time (M3)."""
+        rows = self._conn.execute(
+            "SELECT f.run_id, f.rating, f.accepted, f.comment, r.prompt "
+            "FROM feedback f LEFT JOIN runs r ON r.id = f.run_id "
+            "ORDER BY f.created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ---- learned routing signal (Tier 4) ----
     def record_agent_outcome(self, run_id: str, agent: str, passed: bool, score: int | None) -> None:

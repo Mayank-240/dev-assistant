@@ -13,6 +13,7 @@ consume the same stream.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import shutil
@@ -26,13 +27,14 @@ from .agents.registry import build_agents
 from .agents.reviewer import Reviewer
 from .config import Settings
 from .context import assemble as assemble_context
+from .context import budget_for
 from .docs.writer import write_task_docs
 from .knowledge.base import KnowledgeBase
 from .knowledge.extract import enrich_kg_from_workspace
 from .knowledge.graph import NetworkXKnowledgeGraph
 from .knowledge.repo_map import build_repo_map, onboard
 from .llm.factory import get_provider
-from .llm.schemas import BriefDoc, Plan, SubTask
+from .llm.schemas import BriefDoc, Plan, SubTask, Verdict
 from .memory.store import MemoryStore, ScopedMemory
 from .orchestration.events import Event, status
 from .orchestration.message_bus import MessageBus
@@ -40,11 +42,11 @@ from .orchestration.run_control import RunControl
 from .orchestration.run_store import RunStore
 from .orchestration.scheduler import BudgetExceeded, Scheduler
 from .orchestration.session_pool import Session, SessionPool
-from .orchestration.task import RunStatus, SubTaskState, TaskRun, new_task_id
+from .orchestration.task import DAGError, RunStatus, SubTaskState, TaskRun, new_task_id
 from .orchestration.trace import Tracer
-from .security.redaction import AuditLog
+from .security.redaction import AuditLog, redact, untrusted
 from .tools.registry import ToolBox, ToolContext
-from .verification import apply_objective_gate, gather_signals
+from .verification import apply_objective_gate, capture_baseline, gather_signals
 
 logger = logging.getLogger("ada.engine")
 
@@ -88,9 +90,14 @@ class Engine:
         self._msg_lock = asyncio.Lock()
         self._activity: dict[str, list[dict[str, Any]]] = {}  # subtask id -> agent steps
         self._cost_by_subtask: dict[str, dict[str, Any]] = {}
+        self._changed_by_subtask: dict[str, list[str]] = {}  # subtask id -> files it touched
+        self._baseline: dict[str, Any] = {}  # pre-run test/lint snapshot (V3 delta gating)
         self._repairs = 0
         self._tracer: Tracer | None = None
         self._audit: AuditLog | None = None
+        # Secrets are scrubbed at every durable boundary (memory/KB/docs/events), not just
+        # tool output (S7).
+        self._scrub = redact if settings.redact_secrets else (lambda t: t)
 
     def ingest_doc(self, doc_id: str, text: str) -> int:
         return self.kb.ingest(doc_id, text)
@@ -100,7 +107,8 @@ class Engine:
         repo_context = ""
         if continue_from:
             parent_ws = self.settings.run_workspace(continue_from)
-            repo_context = self._continuation_summary(continue_from) + (build_repo_map(parent_ws) or "")
+            rmap = await asyncio.to_thread(build_repo_map, parent_ws)
+            repo_context = self._continuation_summary(continue_from) + (rmap or "")
         return await self.orchestrator.make_plan(
             prompt, self.agents, prior_knowledge=self._recall_prior(prompt),
             repo_context=repo_context, track_record=self._track_record_text(),
@@ -120,21 +128,61 @@ class Engine:
             f"Previous outcome: {parent.get('summary', '')}\n\n"
         )
 
-    def _prepare_continuation(self, parent_id: str, run_ws: Path, rid: str, emit: EventFn) -> str:
+    # ---- phase: workspace setup (A1) — repo materialization / continuation / baseline ----
+    async def _setup_workspace(self, run_ws: Path, rid: str, *, continue_from: str | None,
+                               resume: bool, emit: EventFn) -> str:
+        repo_context = ""
+        if resume:
+            pass  # the workspace already holds the interrupted run's state — don't re-materialize
+        elif self.settings.repo_backed:
+            emit(status("Materializing repository into the workspace…"))
+            try:
+                info = await asyncio.to_thread(
+                    vcs.materialize, dest=run_ws, repo_url=self.settings.repo_url,
+                    repo_path=self.settings.repo_path, repo_ref=self.settings.repo_ref)
+                emit(status(f"Repository ready ({info['mode']} @ {info.get('head', '')[:8]})."))
+                # Heavy indexing runs off the event loop (W3) so the server stays live.
+                repo_context = await asyncio.to_thread(build_repo_map, run_ws)
+                onb = await asyncio.to_thread(onboard, self.kb, self.kg, run_ws, rid or "run")
+                if onb["files"]:
+                    emit(status(f"Onboarded {onb['files']} repo file(s) into the KB + graph."))
+            except Exception as exc:  # never let repo setup abort the whole run
+                emit(status(f"Repository setup failed ({exc}); continuing greenfield."))
+        elif continue_from:
+            # Re-engagement: carry the prior task's workspace + outcome forward.
+            repo_context = await self._prepare_continuation(continue_from, run_ws, rid, emit)
+
+        # ---- V3: pre-run baseline so verification gates on the DELTA, not absolute state ----
+        if self.settings.objective_review or self.settings.verify_run_tests:
+            try:
+                self._baseline = await asyncio.to_thread(
+                    capture_baseline, run_ws, run_tests=self.settings.verify_run_tests,
+                    lint=self.settings.lint_check, timeout=self.settings.verify_timeout)
+                base_t = self._baseline.get("tests")
+                if base_t is not None:
+                    emit(status(f"Baseline: workspace tests {'pass' if base_t.passed else 'FAIL'} "
+                                "before any changes — verification gates on the delta."))
+            except Exception as exc:
+                emit(status(f"Baseline capture skipped: {exc}"))
+        return repo_context
+
+    async def _prepare_continuation(self, parent_id: str, run_ws: Path, rid: str, emit: EventFn) -> str:
         """Carry the parent task's workspace + context forward into this run."""
         parent_ws = self.settings.run_workspace(parent_id)
         if parent_ws.is_dir():
             emit(status(f"Re-engaging task {parent_id}: carrying its workspace forward…"))
             try:
-                shutil.copytree(parent_ws, run_ws, dirs_exist_ok=True,
-                                ignore=shutil.ignore_patterns("__pycache__", ".git", ".pytest_cache"))
+                await asyncio.to_thread(
+                    shutil.copytree, parent_ws, run_ws, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("__pycache__", ".git", ".pytest_cache"))
             except Exception as exc:  # never let a copy hiccup abort the run
                 emit(status(f"Could not copy prior workspace ({exc}); continuing fresh."))
             try:
-                onboard(self.kb, self.kg, run_ws, rid)
+                await asyncio.to_thread(onboard, self.kb, self.kg, run_ws, rid)
             except Exception:
                 pass
-        return self._continuation_summary(parent_id) + (build_repo_map(run_ws) or "")
+        rmap = await asyncio.to_thread(build_repo_map, run_ws)
+        return self._continuation_summary(parent_id) + (rmap or "")
 
     async def run(
         self,
@@ -144,42 +192,48 @@ class Engine:
         task_id: str | None = None,
         title: str | None = None,
         continue_from: str | None = None,
+        resume: bool = False,
         on_event: EventFn | None = None,
     ) -> tuple[TaskRun, BriefDoc, Path]:
         base_emit: EventFn = on_event or (lambda _e: None)
         self._activity = {}
         self._cost_by_subtask = {}
+        self._changed_by_subtask = {}
+        self._baseline = {}
         self._repairs = 0
-        events_log: list[dict[str, Any]] = []
-
-        def emit(e: Event) -> None:
-            events_log.append(e.to_dict())
-            base_emit(e)
 
         rid = task_id or new_task_id()  # fix the id now so workspace/trace paths are per-run
+        # Events stream to the durable log as they happen (R2) — a crashed or cancelled run
+        # keeps everything up to the failure, which is exactly the run you need to debug.
+        events_path = self.settings.docs_dir / rid / "events.jsonl"
+        events_path.parent.mkdir(parents=True, exist_ok=True)
+        seq = 0
+
+        def emit(e: Event) -> None:
+            nonlocal seq
+            try:
+                with events_path.open("a") as fh:
+                    fh.write(json.dumps({"seq": seq, **e.to_dict()}, ensure_ascii=False,
+                                        default=str) + "\n")
+            except Exception:
+                pass
+            seq += 1
+            base_emit(e)
+
         run_ws = self.settings.run_workspace(rid)
         run_ws.mkdir(parents=True, exist_ok=True)  # agents (and repo materialize) write here
         self._tracer = Tracer(self.settings.docs_dir / rid / "trace.jsonl", enabled=self.settings.trace)
         self._audit = AuditLog(self.settings.docs_dir / rid / "audit.jsonl", enabled=self.settings.audit_log)
 
-        # ---- Tier 2: bind to a real repository (or git-init a greenfield workspace) ----
-        repo_context = ""
-        if self.settings.repo_backed:
-            emit(status("Materializing repository into the workspace…"))
-            try:
-                info = await asyncio.to_thread(
-                    vcs.materialize, dest=run_ws, repo_url=self.settings.repo_url,
-                    repo_path=self.settings.repo_path, repo_ref=self.settings.repo_ref)
-                emit(status(f"Repository ready ({info['mode']} @ {info.get('head', '')[:8]})."))
-                repo_context = build_repo_map(run_ws)
-                onb = onboard(self.kb, self.kg, run_ws, rid or "run")
-                if onb["files"]:
-                    emit(status(f"Onboarded {onb['files']} repo file(s) into the KB + graph."))
-            except Exception as exc:  # never let repo setup abort the whole run
-                emit(status(f"Repository setup failed ({exc}); continuing greenfield."))
-        elif continue_from:
-            # Re-engagement: carry the prior task's workspace + outcome forward.
-            repo_context = self._prepare_continuation(continue_from, run_ws, rid, emit)
+        # ---- R1: resuming an interrupted run reuses its workspace + persisted plan ----
+        if resume and task_id and plan is None:
+            stored = self.runs.get_plan(task_id)
+            if stored:
+                plan = Plan.model_validate_json(stored)
+                emit(status(f"Resuming task {task_id} from its checkpointed plan."))
+
+        repo_context = await self._setup_workspace(run_ws, rid, continue_from=continue_from,
+                                                   resume=resume, emit=emit)
 
         if plan is None:
             prior = self._recall_prior(prompt)
@@ -195,6 +249,9 @@ class Engine:
 
         run = TaskRun.from_plan(prompt, plan, rid)
         try:
+            if len(run.subtasks) > self.settings.max_plan_subtasks:
+                raise DAGError(f"plan too large: {len(run.subtasks)} subtasks "
+                               f"(cap {self.settings.max_plan_subtasks})")
             run.validate()  # structural DAG check (cycles / dup ids / dangling deps)
         except Exception as exc:
             emit(Event("error", f"Invalid plan: {exc}", {"message": str(exc)}))
@@ -203,6 +260,15 @@ class Engine:
 
         final_title = (title or "").strip() or (getattr(plan, "title", "") or "").strip() or None
         self.runs.start(run.id, prompt, title=final_title)
+        try:
+            self.runs.save_plan(run.id, plan.model_dump_json())  # resumable (R1)
+        except Exception:
+            pass
+        if resume:
+            restored = self._restore_checkpoints(run)
+            if restored:
+                emit(status(f"Resuming: {restored} completed subtask(s) restored from checkpoint; "
+                            "the rest will run."))
         if continue_from:
             self.runs.set_parent(run.id, continue_from)
         self._seed_kg(run)
@@ -248,104 +314,130 @@ class Engine:
             emit(Event("sessions", f"Sessions: {pool.created_total} spawned, {pool.reaped_total} reaped.",
                        {"created": pool.created_total, "reaped": pool.reaped_total}))
 
-            # Objective verification: run the generated tests in the run's workspace.
-            if self.settings.verify_run_tests:
-                from .execution import run_workspace_tests
-                emit(status("Running generated tests in the workspace…"))
-                try:
-                    run.execution = await run_workspace_tests(run_ws, self.settings.verify_timeout)
-                except Exception as exc:  # never let test execution abort the run
-                    run.execution = None
-                    emit(status(f"Test execution skipped: {exc}"))
-                if run.execution is not None:
-                    self.kg.add_fact(run.id, "tests", "passed" if run.execution.passed else "failed")
-                    emit(Event(
-                        "execution",
-                        f"Tests {'passed' if run.execution.passed else 'failed'}: {run.execution.command}",
-                        {"ran": True, "passed": run.execution.passed, "command": run.execution.command,
-                         "return_code": run.execution.return_code,
-                         "duration": round(run.execution.duration, 1), "timed_out": run.execution.timed_out},
-                    ))
-                else:
-                    emit(Event("execution", "No runnable tests detected in the workspace.", {"ran": False}))
-
-            # Enrich the knowledge graph with real code entities from the generated files.
-            n_files = enrich_kg_from_workspace(self.kg, run_ws, run.id)
-            if n_files:
-                emit(status(f"Indexed {n_files} generated file(s) into the knowledge graph."))
-
-            # ---- Tier 2: deliver the work as a git branch/commit (optional) ----
-            if self.settings.git_finalize:
-                try:
-                    branch = f"{self.settings.git_branch_prefix}{run.id}"
-                    info = await asyncio.to_thread(
-                        vcs.finalize, run_ws, branch=branch, message=f"ADA: {final_title or prompt[:60]}")
-                    emit(Event("git", f"Committed on branch {info['branch']} ({info['commit']}).",
-                               {"branch": info["branch"], "commit": info["commit"]}))
-                except Exception as exc:
-                    emit(status(f"Git finalize skipped: {exc}"))
-
-            emit(status("Documenting the run (report + brief)…"))
-            with self._tracer.span("phase", "summarize"):
-                try:
-                    brief = await self._summarize(run)
-                except Exception as exc:  # always produce docs, even if the summary call fails
-                    passed_n = sum(1 for s in run.subtasks.values() if s.status is RunStatus.PASSED)
-                    brief = BriefDoc(
-                        tldr=f"Completed {passed_n}/{len(run.subtasks)} subtasks. (Auto-summary unavailable: {exc})",
-                        key_points=[f"{s.id} [{s.agent}] {s.spec.title}: {s.status.value}" for s in run.subtasks.values()],
-                        status="completed with errors",
-                    )
-
-            # ---- Tier 4: learn from this run (outcome-aware) ----
-            await self._reflect_and_learn(run, brief, emit)
-            self._index_artifacts(run, brief, run_ws)
-            self._record_agent_outcomes(run)
-            self.kg.save()
-
-            out_dir = write_task_docs(self.settings, run, brief, self.bus.history,
-                                      run.execution, activity=self._activity)
-            self._write_events_log(out_dir, events_log)
-
-            passed = sum(1 for s in run.subtasks.values() if s.status is RunStatus.PASSED)
-            tests = "n/a" if run.execution is None else ("passed" if run.execution.passed else "failed")
-            usage = getattr(self.provider, "usage", None)
-            usage_dict = usage.to_dict() if usage else {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
-            quality = self._quality_score(run)
-            rollup = "over_budget" if over_budget else run.rollup_status()
-
-            self.runs.finish(
-                run.id, status=rollup, run_status=run.rollup_status(),
-                quality_score=quality,
-                subtasks_total=len(run.subtasks), subtasks_passed=passed,
-                tests=tests, summary=brief.tldr, sessions_spawned=pool.created_total,
-                sessions_reaped=pool.reaped_total,
-                kg_nodes=self.kg.num_nodes, kg_edges=self.kg.num_edges,
-                memories=self._mem_writes, messages=len(self.bus.history),
-                **{k: v for k, v in usage_dict.items() if k != "calls"},
-            )
+            brief, out_dir = await self._finalize_run(
+                run, run_ws, emit, over_budget=over_budget, final_title=final_title,
+                prompt=prompt, pool=pool)
             finalized = True
-
-            emit(Event("brief", brief.tldr, {
-                "tldr": brief.tldr, "key_points": brief.key_points, "status": brief.status,
-            }))
-            emit(Event("done", "Run complete.", {
-                "task_id": run.id, "passed": passed, "total": len(run.subtasks),
-                "docs_dir": str(out_dir), "tests": tests, "over_budget": over_budget,
-                "run_status": rollup, "quality_score": quality,
-                **usage_dict, **self._metrics(),
-            }))
             return run, brief, out_dir
         except asyncio.CancelledError:
+            # Deep cancellation (R5): kill any child process groups this run spawned.
+            try:
+                from .execution import terminate_tag
+                killed = terminate_tag(run.id)
+                if killed:
+                    logger.info("cancelled run %s: killed %d child process group(s)", run.id, killed)
+            except Exception:
+                pass
             self.runs.set_status(run.id, "cancelled")
             raise
         finally:
+            self._checkpoint_all(run)  # persist final subtask states for --resume (R1)
             if not finalized:
                 # Any non-terminal run after an unexpected failure is marked failed, not left
                 # stranded 'running'.
                 cur = self.runs.get(run.id) or {}
                 if cur.get("status") in (None, "running"):
                     self.runs.set_status(run.id, "failed")
+
+    # ---- phase: finalize (A1) — objective tests, delivery, summary, learning, docs ----
+    async def _finalize_run(self, run: TaskRun, run_ws: Path, emit: EventFn, *,
+                            over_budget: bool, final_title: str | None, prompt: str,
+                            pool: SessionPool) -> tuple[BriefDoc, Path]:
+        # Objective verification: run the generated tests in the run's workspace.
+        if self.settings.verify_run_tests:
+            from .execution import run_workspace_tests
+            emit(status("Running generated tests in the workspace…"))
+            try:
+                try:
+                    run.execution = await run_workspace_tests(
+                        run_ws, self.settings.verify_timeout, tag=run.id)
+                except TypeError:  # execution.py without tag support
+                    run.execution = await run_workspace_tests(run_ws, self.settings.verify_timeout)
+            except Exception as exc:  # never let test execution abort the run
+                run.execution = None
+                emit(status(f"Test execution skipped: {exc}"))
+            if run.execution is not None:
+                base_t = self._baseline.get("tests")
+                pre_existing = (not run.execution.passed and base_t is not None
+                                and not base_t.passed)
+                self.kg.add_fact(run.id, "tests", "passed" if run.execution.passed else "failed")
+                emit(Event(
+                    "execution",
+                    f"Tests {'passed' if run.execution.passed else 'failed'}: {run.execution.command}"
+                    + (" (failures pre-date this run)" if pre_existing else ""),
+                    {"ran": True, "passed": run.execution.passed, "command": run.execution.command,
+                     "return_code": run.execution.return_code,
+                     "duration": round(run.execution.duration, 1), "timed_out": run.execution.timed_out,
+                     "pre_existing_failures": pre_existing},
+                ))
+            else:
+                emit(Event("execution", "No runnable tests detected in the workspace.", {"ran": False}))
+
+        # Enrich the knowledge graph with real code entities from the generated files.
+        n_files = await asyncio.to_thread(enrich_kg_from_workspace, self.kg, run_ws, run.id)
+        if n_files:
+            emit(status(f"Indexed {n_files} generated file(s) into the knowledge graph."))
+
+        # ---- Tier 2: deliver the work as a git branch/commit (optional) ----
+        if self.settings.git_finalize:
+            try:
+                branch = f"{self.settings.git_branch_prefix}{run.id}"
+                info = await asyncio.to_thread(
+                    vcs.finalize, run_ws, branch=branch, message=f"ADA: {final_title or prompt[:60]}")
+                emit(Event("git", f"Committed on branch {info['branch']} ({info['commit']}).",
+                           {"branch": info["branch"], "commit": info["commit"]}))
+            except Exception as exc:
+                emit(status(f"Git finalize skipped: {exc}"))
+
+        emit(status("Documenting the run (report + brief)…"))
+        with self._tracer.span("phase", "summarize"):
+            try:
+                brief = await self._summarize(run)
+            except Exception as exc:  # always produce docs, even if the summary call fails
+                passed_n = sum(1 for s in run.subtasks.values() if s.status is RunStatus.PASSED)
+                brief = BriefDoc(
+                    tldr=f"Completed {passed_n}/{len(run.subtasks)} subtasks. (Auto-summary unavailable: {exc})",
+                    key_points=[f"{s.id} [{s.agent}] {s.spec.title}: {s.status.value}" for s in run.subtasks.values()],
+                    status="completed with errors",
+                )
+
+        # ---- Tier 4: learn from this run (outcome-aware) ----
+        await self._reflect_and_learn(run, brief, emit)
+        await asyncio.to_thread(self._index_artifacts, run, brief, run_ws)
+        self._record_agent_outcomes(run)
+        self.kg.save()
+
+        out_dir = write_task_docs(self.settings, run, brief, self.bus.history,
+                                  run.execution, activity=self._activity)
+
+        passed = sum(1 for s in run.subtasks.values() if s.status is RunStatus.PASSED)
+        tests = "n/a" if run.execution is None else ("passed" if run.execution.passed else "failed")
+        usage = getattr(self.provider, "usage", None)
+        usage_dict = usage.to_dict() if usage else {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+        quality = self._quality_score(run)
+        rollup = "over_budget" if over_budget else run.rollup_status()
+
+        self.runs.finish(
+            run.id, status=rollup, run_status=run.rollup_status(),
+            quality_score=quality,
+            subtasks_total=len(run.subtasks), subtasks_passed=passed,
+            tests=tests, summary=brief.tldr, sessions_spawned=pool.created_total,
+            sessions_reaped=pool.reaped_total,
+            kg_nodes=self.kg.num_nodes, kg_edges=self.kg.num_edges,
+            memories=self._mem_writes, messages=len(self.bus.history),
+            **{k: v for k, v in usage_dict.items() if k != "calls"},
+        )
+
+        emit(Event("brief", brief.tldr, {
+            "tldr": brief.tldr, "key_points": brief.key_points, "status": brief.status,
+        }))
+        emit(Event("done", "Run complete.", {
+            "task_id": run.id, "passed": passed, "total": len(run.subtasks),
+            "docs_dir": str(out_dir), "tests": tests, "over_budget": over_budget,
+            "run_status": rollup, "quality_score": quality,
+            **usage_dict, **self._metrics(),
+        }))
+        return brief, out_dir
 
     async def aclose(self) -> None:
         await self.provider.aclose()
@@ -354,13 +446,34 @@ class Engine:
 
     # ---- internals ----
     def _recall_prior(self, prompt: str) -> str:
-        """Pull relevant lessons from cross-run long-term memory for planning."""
+        """Pull relevant lessons + recent human feedback from past runs for planning."""
+        parts: list[str] = []
         try:
             hits = self.memory.recall("longterm", prompt, top_k=5, min_score=0.15, decay=True)
+            parts.extend(f"- {h.content}" for h in hits)
         except Exception as exc:  # a store/embedding error must not abort planning
             logger.warning("prior recall failed: %s", exc)
+        fb = self._feedback_text()
+        if fb:
+            parts.append("Recent human feedback on past runs (weigh this heavily):")
+            parts.append(fb)
+        return "\n".join(parts)
+
+    def _feedback_text(self, limit: int = 5) -> str:
+        """Human feedback is the highest-signal learning input — feed it to the planner (M3)."""
+        try:
+            rows = self.runs.recent_feedback(limit=limit)
+        except Exception:
             return ""
-        return "\n".join(f"- {h.content}" for h in hits)
+        lines = []
+        for r in rows:
+            verdictish = ("accepted" if r.get("accepted") else "rejected") if r.get("accepted") is not None else ""
+            rating = f"rated {r['rating']}/5" if r.get("rating") is not None else ""
+            note = (r.get("comment") or "").strip()
+            desc = ", ".join(x for x in (verdictish, rating) if x)
+            if desc or note:
+                lines.append(f"- [{desc}] task '{(r.get('prompt') or '')[:60]}': {note}".rstrip(": "))
+        return "\n".join(lines)
 
     def _track_record_text(self) -> str:
         try:
@@ -379,16 +492,16 @@ class Engine:
             with self._tracer.span("phase", "reflect"):
                 lessons = await self.reflector.reflect(run)
             tag = run.prompt[:80]
-            self.memory.remember_unique("longterm", f"[{tag}] {lessons.summary}",
+            self.memory.remember_unique("longterm", self._scrub(f"[{tag}] {lessons.summary}"),
                                         metadata={"task": run.id, "kind": "summary", "outcome": rollup})
             for item in lessons.what_worked[:4]:
-                self.memory.remember_unique("longterm", f"[DO] {item}",
+                self.memory.remember_unique("longterm", self._scrub(f"[DO] {item}"),
                                             metadata={"task": run.id, "kind": "do"})
             for item in lessons.what_to_avoid[:4]:
-                self.memory.remember_unique("longterm", f"[AVOID] {item}",
+                self.memory.remember_unique("longterm", self._scrub(f"[AVOID] {item}"),
                                             metadata={"task": run.id, "kind": "avoid"})
             for item in lessons.routing_notes[:3]:
-                self.memory.remember_unique("longterm", f"[ROUTING] {item}",
+                self.memory.remember_unique("longterm", self._scrub(f"[ROUTING] {item}"),
                                             metadata={"task": run.id, "kind": "routing"})
             self._mem_writes += 1
             emit(Event("reflection", lessons.summary, {
@@ -407,13 +520,54 @@ class Engine:
     def _index_artifacts(self, run: TaskRun, brief: BriefDoc, run_ws: Path) -> None:
         """Index this run's brief/report + produced source into the KB so kb_search goes live."""
         try:
-            self.kb.reingest(f"brief:{run.id}", brief.tldr + "\n" + "\n".join(brief.key_points))
+            self.kb.reingest(f"brief:{run.id}",
+                             self._scrub(brief.tldr + "\n" + "\n".join(brief.key_points)))
             for rel in self._workspace_files(run, run_ws)[:40]:
                 p = run_ws / rel
                 if p.suffix in (".py", ".js", ".ts", ".md", ".txt", ".rs", ".go") and p.is_file():
-                    self.kb.reingest(f"code:{run.id}:{rel}", p.read_text(errors="replace"))
+                    self.kb.reingest(f"code:{run.id}:{rel}", self._scrub(p.read_text(errors="replace")))
         except Exception as exc:
             logger.info("artifact indexing skipped: %s", exc)
+
+    # ---- checkpoint / resume (R1) ----
+    def _checkpoint(self, run: TaskRun, state: SubTaskState) -> None:
+        try:
+            self.runs.checkpoint_subtask(
+                run.id, state.id, status=state.status.value, attempts=state.attempts,
+                result=self._scrub(state.result or ""),
+                verdict_json=state.verdict.model_dump_json() if state.verdict else None,
+                error=state.error or "")
+        except Exception:
+            logger.debug("checkpoint failed for %s/%s", run.id, state.id, exc_info=True)
+
+    def _checkpoint_all(self, run: TaskRun) -> None:
+        for st in run.subtasks.values():
+            if st.status is not RunStatus.PENDING or st.attempts:
+                self._checkpoint(run, st)
+
+    def _restore_checkpoints(self, run: TaskRun) -> int:
+        """Load persisted subtask states; completed ones are skipped by the scheduler."""
+        try:
+            stored = self.runs.get_subtask_states(run.id)
+        except Exception:
+            return 0
+        restored = 0
+        for sid, row in stored.items():
+            st = run.subtasks.get(sid)
+            if st is None:
+                continue
+            st.attempts = int(row.get("attempts") or 0)
+            if row.get("status") in ("passed", "passed_with_caveats"):
+                st.status = RunStatus(row["status"])
+                st.result = row.get("result") or ""
+                if row.get("verdict"):
+                    try:
+                        st.verdict = Verdict.model_validate_json(row["verdict"])
+                    except Exception:
+                        pass
+                restored += 1
+            # anything not completed re-runs from PENDING (attempts preserved)
+        return restored
 
     def _record_agent_outcomes(self, run: TaskRun) -> None:
         for st in run.subtasks.values():
@@ -434,14 +588,6 @@ class Engine:
         retries = sum(max(0, s.attempts - 1) for s in run.subtasks.values())
         base -= min(15.0, retries * 3.0)
         return round(max(0.0, min(100.0, base)), 1)
-
-    def _write_events_log(self, out_dir: Path, events: list[dict[str, Any]]) -> None:
-        try:
-            with (out_dir / "events.jsonl").open("w") as fh:
-                for i, e in enumerate(events):
-                    fh.write(json.dumps({"seq": i, **e}, ensure_ascii=False, default=str) + "\n")
-        except Exception:
-            pass
 
     def _make_replan(self, run: TaskRun, emit: EventFn):
         """Adaptive replanning hook: inject a bounded repair subtask for a failed one."""
@@ -528,6 +674,21 @@ class Engine:
                 "sender": m.sender, "recipient": m.recipient, "content": m.content,
             }))
 
+    def _build_toolbox(self, agent_name: str, task_scope: str, run_ws: Path, *,
+                       spawn: Any = None) -> ToolBox:
+        """ToolContext construction resilient to optional fields (spawn/allow_web) landing."""
+        kwargs: dict[str, Any] = dict(
+            memory=self.memory, kb=self.kb, kg=self.kg, bus=self.bus,
+            agent_name=agent_name, task_scope=task_scope, base_dir=run_ws,
+            workspace=run_ws, verify_timeout=self.settings.verify_timeout,
+            redact=self.settings.redact_secrets, audit=self._audit,
+            allow_run_command=self.settings.allow_run_command, sandbox=self.settings.sandbox,
+            sandbox_cpu=self.settings.sandbox_cpu_seconds, sandbox_mem=self.settings.sandbox_mem_mb,
+            spawn=spawn, allow_web=self.settings.allow_web,
+        )
+        fields = {f.name for f in dataclasses.fields(ToolContext)}
+        return ToolBox(ToolContext(**{k: v for k, v in kwargs.items() if k in fields}))
+
     def _make_execute(self, run: TaskRun, emit: EventFn, run_workspace: Path):
         def usage_snapshot() -> dict[str, Any]:
             u = getattr(self.provider, "usage", None)
@@ -547,16 +708,22 @@ class Engine:
             before_files = self._file_index(run_workspace)
             before_cost = usage_snapshot()
             agent = session.agent  # the BaseAgent for this session
-            toolbox = ToolBox(
-                ToolContext(
-                    memory=self.memory, kb=self.kb, kg=self.kg, bus=self.bus,
-                    agent_name=state.agent, task_scope=run.id, base_dir=run_workspace,
-                    workspace=run_workspace, verify_timeout=self.settings.verify_timeout,
-                    redact=self.settings.redact_secrets, audit=self._audit,
-                    allow_run_command=self.settings.allow_run_command, sandbox=self.settings.sandbox,
-                    sandbox_cpu=self.settings.sandbox_cpu_seconds, sandbox_mem=self.settings.sandbox_mem_mb,
-                )
-            )
+
+            async def spawn(agent_name: str, task: str) -> str:
+                """Depth-1 delegation (T4): run a specialist inline on a bounded subtask."""
+                sub = self.agents.get(agent_name)
+                if sub is None:
+                    return f"unknown agent '{agent_name}'"
+                sub_box = self._build_toolbox(agent_name, run.id, run_workspace, spawn=None)
+                try:
+                    return await asyncio.wait_for(sub.run(
+                        task_text=task[:4000], context="", toolbox=sub_box,
+                        provider=self.provider, workdir=str(run_workspace), on_step=on_step),
+                        timeout=self.settings.subtask_max_seconds or None)
+                except asyncio.TimeoutError:
+                    return "[delegation stopped: wall-clock cap]"
+
+            toolbox = self._build_toolbox(state.agent, run.id, run_workspace, spawn=spawn)
             criteria = "\n".join(f"- {c}" for c in state.spec.acceptance_criteria) or "- (none)"
             task_text = (
                 f"{state.spec.title}\n\n{state.spec.description}\n\nAcceptance criteria:\n{criteria}"
@@ -571,27 +738,61 @@ class Engine:
             if self.control is not None:
                 for note in self.control.drain_steer():
                     parts.append(("Steering note from the operator", note))
-            context = assemble_context(parts, budget_tokens=6000)
+            # Subtask-scoped context pack (C2): a ranked workspace map + top knowledge hits,
+            # so the agent doesn't start blind and burn turns rediscovering the codebase.
+            try:
+                repo_slice = await asyncio.to_thread(
+                    build_repo_map, run_workspace, 2500,
+                    f"{state.spec.title} {state.spec.description}")
+                if repo_slice:
+                    parts.append(("Workspace map (most relevant files first)", repo_slice))
+            except Exception:
+                pass
+            try:
+                hits = self.kb.search(f"{state.spec.title} {state.spec.description}",
+                                      top_k=3, min_score=0.2)
+                if hits:
+                    parts.append(("Related knowledge", untrusted(
+                        "\n".join(f"- {h.text[:300]}" for h in hits), source="knowledge-base")))
+            except Exception:
+                pass
+            context = assemble_context(
+                parts, budget_tokens=budget_for(self.settings.agent_model).context_budget_tokens)
 
             def on_step(step: dict[str, Any], _id=state.id, _agent=state.agent) -> None:
                 self._activity.setdefault(_id, []).append(step)
                 emit(Event("agent_step", "", {"id": _id, "agent": _agent, **step}))
 
+            cap = self.settings.subtask_max_seconds or None
+            run_kwargs: dict[str, Any] = dict(
+                task_text=task_text, context=context, toolbox=toolbox,
+                provider=self.provider, workdir=str(run_workspace), on_step=on_step)
+            if budget:
+                # R3: hand the tool loop the remaining budget so it can stop mid-subtask.
+                run_kwargs["max_cost_usd"] = max(0.0, budget - float(usage_snapshot()["cost_usd"]))
             with self._tracer.span("subtask", state.id, agent=state.agent):
-                result = await agent.run(
-                    task_text=task_text, context=context, toolbox=toolbox,
-                    provider=self.provider, workdir=str(run_workspace), on_step=on_step,
-                )
+                try:
+                    try:
+                        coro = agent.run(**run_kwargs)
+                    except TypeError:  # BaseAgent without max_cost_usd support
+                        run_kwargs.pop("max_cost_usd", None)
+                        coro = agent.run(**run_kwargs)
+                    result = await asyncio.wait_for(coro, timeout=cap)
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"subtask exceeded the wall-clock cap ({cap:.0f}s); "
+                        "raise ADA_SUBTASK_MAX_SECONDS if this task legitimately needs longer")
             self.memory.remember(
-                run.id, f"[{state.agent}] {state.spec.title} -> {result[:400]}",
+                run.id, self._scrub(f"[{state.agent}] {state.spec.title} -> {result[:400]}"),
                 metadata={"subtask": state.id},
             )
             self._mem_writes += 1
             self.kg.add_fact(state.id, "produced_result_by", state.agent)
-            # per-subtask cost attribution + a cheap file diff
+            # per-subtask cost attribution + the file diff (also feeds scoped verification, V2)
             after_cost = usage_snapshot()
             self._cost_by_subtask[state.id] = self._cost_delta(before_cost, after_cost)
-            self._emit_diff(state.id, emit, before_files, run_workspace)
+            self._changed_by_subtask[state.id] = self._emit_diff(state.id, emit, before_files,
+                                                                run_workspace)
             await self._emit_new_messages(emit)
             return result
 
@@ -605,19 +806,20 @@ class Engine:
             "output_tokens": int(after.get("output_tokens", 0)) - int(before.get("output_tokens", 0)),
         }
 
-    def _emit_diff(self, sid: str, emit: EventFn, before: dict[str, int], run_ws: Path) -> None:
+    def _emit_diff(self, sid: str, emit: EventFn, before: dict[str, int], run_ws: Path) -> list[str]:
         after = self._file_index(run_ws)
         added = sorted(set(after) - set(before))
         modified = sorted(p for p in (set(after) & set(before)) if after[p] != before[p])
-        if not (added or modified):
-            return
-        emit(Event("diff", f"{sid}: +{len(added)} files, ~{len(modified)} changed", {
-            "id": sid, "added": added[:50], "modified": modified[:50],
-        }))
+        if added or modified:
+            emit(Event("diff", f"{sid}: +{len(added)} files, ~{len(modified)} changed", {
+                "id": sid, "added": added[:50], "modified": modified[:50],
+            }))
+        return added + modified
 
     def _make_verify(self, run: TaskRun, emit: EventFn, run_ws: Path):
         async def verify(state: SubTaskState, result: str):
             files = self._workspace_files(run, run_ws)
+            changed = self._changed_by_subtask.get(state.id, [])
             with self._tracer.span("verify", state.id):
                 verdict = await self.reviewer.verify(
                     title=state.spec.title,
@@ -625,18 +827,24 @@ class Engine:
                     acceptance_criteria=state.spec.acceptance_criteria,
                     result=result,
                     workspace_files=files,
-                    file_contents=(self._collect_contents(run_ws, files)
+                    changed_files=changed,
+                    # T6: the reviewer reads what THIS subtask touched, not a whole-repo dump
+                    file_contents=(self._collect_contents(run_ws, changed or files)
                                    if self.settings.objective_review else ""),
                 )
             # ---- Tier 3: fold objective signals (tests/lint) into the verdict ----
             if self.settings.objective_review:
+                # V2: run only the tests relevant to what THIS subtask changed — never the
+                # whole workspace suite (siblings can't fail each other; N× cheaper).
+                test_paths = self._select_test_paths(run_ws, changed)
                 signals = await asyncio.to_thread(
                     gather_signals, run_ws, files,
-                    run_tests=self._has_tests(run_ws, files), lint=self.settings.lint_check,
-                    timeout=self.settings.verify_timeout)
-                verdict = apply_objective_gate(verdict, signals)
+                    run_tests=self.settings.verify_run_tests and bool(test_paths),
+                    lint=self.settings.lint_check,
+                    timeout=self.settings.verify_timeout, test_paths=test_paths)
+                verdict = apply_objective_gate(verdict, signals, baseline=self._baseline)
             self.kg.add_fact(state.id, "review_status", "passed" if verdict.passed else "failed")
-            result_text = result or ""
+            result_text = self._scrub(result or "")
             if len(result_text) > 12000:
                 result_text = result_text[:12000] + "\n… (truncated)"
             emit(Event("subtask_review",
@@ -648,14 +856,31 @@ class Engine:
                            "result": result_text, "cost": self._cost_by_subtask.get(state.id),
                            **self._metrics(),
                        }))
+            state.verdict = verdict
+            self._checkpoint(run, state)  # R1: survive interruption mid-run
             return verdict
 
         return verify
 
     @staticmethod
-    def _has_tests(run_ws: Path, files: list[str]) -> bool:
-        return run_ws.is_dir() and (any(f.startswith("test_") or f.endswith("_test.py") for f in files)
-                                    or any(run_ws.rglob("test_*.py")))
+    def _select_test_paths(run_ws: Path, changed: list[str]) -> list[str]:
+        """Test files relevant to a subtask's changes (V2): the test files it touched, plus
+        tests named after the modules it touched."""
+        if not run_ws.is_dir() or not changed:
+            return []
+
+        def is_test(rel: str) -> bool:
+            name = Path(rel).name
+            return (name.startswith("test_") and name.endswith(".py")) or name.endswith("_test.py")
+
+        paths = {rel for rel in changed if is_test(rel) and (run_ws / rel).is_file()}
+        stems = {Path(rel).stem for rel in changed if rel.endswith(".py") and not is_test(rel)}
+        for stem in stems:
+            for pat in (f"test_{stem}.py", f"{stem}_test.py"):
+                for p in run_ws.rglob(pat):
+                    if p.is_file() and ".git" not in p.parts:
+                        paths.add(str(p.relative_to(run_ws)))
+        return sorted(paths)
 
     @staticmethod
     def _collect_contents(run_ws: Path, files: list[str]) -> str:

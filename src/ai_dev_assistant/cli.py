@@ -31,6 +31,10 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Re-engage a completed task: continue its workspace + context with this prompt")
     runp.add_argument("-q", "--quiet", action="store_true", help="Hide internal INFO logs")
 
+    resumep = sub.add_parser("resume", help="Resume an interrupted run from its checkpoints")
+    resumep.add_argument("task_id", help="The interrupted run's task id")
+    resumep.add_argument("-q", "--quiet", action="store_true", help="Hide internal INFO logs")
+
     servep = sub.add_parser("server", help="Launch the web UI")
     servep.add_argument("--host", default="127.0.0.1")
     servep.add_argument("--port", type=int, default=8000)
@@ -41,6 +45,14 @@ def _build_parser() -> argparse.ArgumentParser:
     evalp.add_argument("--only", action="append", default=[], metavar="TASK_ID",
                        help="Run only these golden task ids (repeatable)")
     evalp.add_argument("--json", action="store_true", help="Emit the scorecard as JSON")
+    evalp.add_argument("--repeat", type=int, default=None, metavar="N",
+                       help="Samples per task (variance handling; default 1 / ADA_EVAL_REPEAT)")
+    evalp.add_argument("--timeout", type=float, default=None, metavar="SECONDS",
+                       help="Wall-clock cap per attempt (default 600 / ADA_EVAL_TASK_TIMEOUT)")
+    evalp.add_argument("--replay", nargs="?", const="", default=None, metavar="DIR",
+                       help="Run the offline replay eval over committed cassettes (no LLM needed)")
+    evalp.add_argument("--record-cassettes", nargs="?", const="", default=None, metavar="DIR",
+                       help="Regenerate the offline replay cassettes (deterministic, no LLM needed)")
     return parser
 
 
@@ -48,11 +60,46 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.cmd == "run":
         return _run(args)
+    if args.cmd == "resume":
+        return _resume(args)
     if args.cmd == "server":
         return _serve(args)
     if args.cmd == "eval":
         return _eval(args)
     return 1
+
+
+def _resume(args: argparse.Namespace) -> int:
+    logging.basicConfig(level=logging.WARNING if args.quiet else logging.INFO,
+                        format="%(message)s", stream=sys.stderr)
+    settings = Settings.load()
+    engine = Engine(settings)
+    row = engine.runs.get(args.task_id)
+    if row is None:
+        print(f"ERROR: unknown task id {args.task_id}", file=sys.stderr)
+        return 2
+    if row.get("status") == "completed":
+        print(f"Task {args.task_id} already completed — nothing to resume.", file=sys.stderr)
+        return 0
+
+    async def go() -> int:
+        def on_event(event: Event) -> None:
+            line = _fmt(event)
+            if line:
+                print(line)
+        try:
+            run, brief, out_dir = await engine.run(
+                row.get("prompt") or "", task_id=args.task_id, resume=True, on_event=on_event)
+        except LLMError as exc:
+            print(f"\nResume failed: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            await engine.aclose()
+        passed = sum(1 for s in run.subtasks.values() if s.status is RunStatus.PASSED)
+        print(f"\nResumed run finished: {passed}/{len(run.subtasks)} subtasks passed. Docs: {out_dir}/")
+        return 0
+
+    return asyncio.run(go())
 
 
 def _eval(args: argparse.Namespace) -> int:
@@ -61,12 +108,29 @@ def _eval(args: argparse.Namespace) -> int:
     from .evals.harness import run_eval_sync
 
     logging.basicConfig(level=logging.WARNING, format="%(message)s", stream=sys.stderr)
+
+    # Offline modes: replay committed cassettes / regenerate them — no LLM needed.
+    if args.record_cassettes is not None or args.replay is not None:
+        from pathlib import Path as _P
+
+        from .evals import replay_eval
+        if args.record_cassettes is not None:
+            d = _P(args.record_cassettes) if args.record_cassettes else None
+            report = replay_eval.record_cassettes(d)
+        else:
+            d = _P(args.replay) if args.replay else None
+            report = replay_eval.run_replay_eval(d, repeat=args.repeat or 1)
+        print(_json.dumps([c.to_dict() for c in report.cards], indent=2) if args.json
+              else report.summary())
+        return 0 if report.passed == len(report.cards) else 1
+
     settings = Settings.load()
     if settings.requires_api_key and not settings.has_api_key:
         print("ERROR: the eval harness needs a working LLM backend (set a key or use claude_sdk).",
               file=sys.stderr)
         return 2
-    report = run_eval_sync(settings, only=args.only or None)
+    report = run_eval_sync(settings, only=args.only or None,
+                           repeat=args.repeat, task_timeout=args.timeout)
     if args.json:
         print(_json.dumps([c.to_dict() for c in report.cards], indent=2))
     else:
@@ -75,10 +139,15 @@ def _eval(args: argparse.Namespace) -> int:
 
 
 def _serve(args: argparse.Namespace) -> int:
+    import os
+
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     settings = Settings.load()
+    # Let the app factory see the bind host (S8): a non-loopback bind with no
+    # ADA_API_TOKEN auto-generates a token; loopback stays auth-free by default.
+    os.environ["ADA_BIND_HOST"] = args.host
     print(f"AI Dev Assistant UI → http://{args.host}:{args.port}  (backend: {settings.llm_backend})")
     if args.reload:
         # The reloader re-imports the app in a subprocess, so it needs an import
@@ -92,7 +161,8 @@ def _serve(args: argparse.Namespace) -> int:
         )
     else:
         from .web.server import create_app
-        uvicorn.run(create_app(settings), host=args.host, port=args.port, log_level="warning")
+        uvicorn.run(create_app(settings, host=args.host), host=args.host, port=args.port,
+                    log_level="warning")
     return 0
 
 

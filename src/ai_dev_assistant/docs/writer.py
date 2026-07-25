@@ -15,6 +15,7 @@ from ..execution import ExecutionResult
 from ..llm.schemas import BriefDoc
 from ..orchestration.message_bus import Message
 from ..orchestration.task import SubTaskState, TaskRun
+from ..security.redaction import redact
 
 
 def _plan_md(run: TaskRun) -> str:
@@ -106,11 +107,13 @@ def write_task_docs(
 ) -> Path:
     out_dir = settings.docs_dir / run.id
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "plan.md").write_text(_plan_md(run))
-    (out_dir / "report.md").write_text(_report_md(run, messages, execution))
-    (out_dir / "brief.md").write_text(_brief_md(run, brief))
+    # Docs are a durable boundary: scrub secret-shaped strings on the way out (S7).
+    scrub = redact if settings.redact_secrets else (lambda t: t)
+    (out_dir / "plan.md").write_text(scrub(_plan_md(run)))
+    (out_dir / "report.md").write_text(scrub(_report_md(run, messages, execution)))
+    (out_dir / "brief.md").write_text(scrub(_brief_md(run, brief)))
     # Full per-agent activity log (the complete step stream), for the detail popup.
-    (out_dir / "activity.json").write_text(json.dumps(activity or {}, ensure_ascii=False))
+    (out_dir / "activity.json").write_text(scrub(json.dumps(activity or {}, ensure_ascii=False)))
     _append_index(settings, run, brief)
     return out_dir
 

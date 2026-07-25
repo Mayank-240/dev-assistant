@@ -80,11 +80,12 @@ class Settings:
 
     # --- Planning (Tier 3) ---
     adaptive_replan: bool = False   # let the orchestrator amend the DAG between batches
-    clarify: bool = False           # ask the user clarifying questions before planning
+    max_plan_subtasks: int = 24     # reject a plan larger than this (hallucination guard)
 
     # --- Cost guardrail ---
     budget_usd: float = 0.0         # 0 = no cap; otherwise stop scheduling new work past this
     agent_max_turns: int = 24       # per-agent tool-loop cap (lower = cheaper)
+    subtask_max_seconds: float = 900.0  # wall-clock cap per subtask attempt (0 = no cap)
 
     # --- Real-repo binding (Tier 2) ---
     repo_url: str = ""              # git URL to clone into the workspace before the run
@@ -146,9 +147,10 @@ class Settings:
             objective_review=_bool("ADA_OBJECTIVE_REVIEW", True),
             lint_check=_bool("ADA_LINT_CHECK", True),
             adaptive_replan=_bool("ADA_ADAPTIVE_REPLAN", False),
-            clarify=_bool("ADA_CLARIFY", False),
+            max_plan_subtasks=_int("ADA_MAX_PLAN_SUBTASKS", 24),
             budget_usd=_float("ADA_BUDGET_USD", 0.0),
             agent_max_turns=_int("ADA_AGENT_MAX_TURNS", 24),
+            subtask_max_seconds=_float("ADA_SUBTASK_MAX_SECONDS", 900.0),
             repo_url=_get("ADA_REPO_URL", ""),
             repo_path=_get("ADA_REPO_PATH", ""),
             repo_ref=_get("ADA_REPO_REF", ""),

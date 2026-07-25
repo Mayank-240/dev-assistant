@@ -62,7 +62,8 @@ class FakeProvider:
         raise AssertionError(f"unexpected schema {schema}")
 
     async def run_agent(self, *, system_prompt, prompt, toolbox, allowed_tools, model,
-                        effort=None, max_tokens=8000, max_iterations=8, workdir=None, on_step=None):
+                        effort=None, max_tokens=8000, max_iterations=8, workdir=None,
+                        on_step=None, **_kw):
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:

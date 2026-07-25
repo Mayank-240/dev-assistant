@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Type, TypeVar
 
 from pydantic import BaseModel
 
 from ..config import Settings
-from ..tools.registry import ToolBox
 from .client import LLMClient
+from .provider import ToolDispatcher
 from .usage import UsageTotals
+
+logger = logging.getLogger("ada.llm")
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -30,20 +33,29 @@ class AnthropicProvider:
     async def structured(
         self, *, system: str, user: str, schema: Type[T], model: str,
         effort: str | None = None, max_tokens: int = 4000,
+        max_cost_usd: float | None = None,  # accepted for parity; a single turn isn't budget-gated
     ) -> T:
         return await self._client.parse(
             system=system, user=user, schema=schema, model=model, effort=effort, max_tokens=max_tokens
         )
 
     async def run_agent(
-        self, *, system_prompt: str, prompt: str, toolbox: ToolBox, allowed_tools: list[str],
+        self, *, system_prompt: str, prompt: str, toolbox: ToolDispatcher, allowed_tools: list[str],
         model: str, effort: str | None = None, max_tokens: int = 8000, max_iterations: int | None = None,
         workdir: str | None = None,  # accepted for interface parity; the API path has no file tools
-        on_step=None,
+        on_step=None, max_cost_usd: float | None = None,
     ) -> str:
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         last_text = ""
         for _ in range(max_iterations or self._max_turns):
+            # Per-turn budget enforcement (R3): stop before a turn that would overspend,
+            # not just before the subtask starts.
+            if max_cost_usd is not None and self.usage.cost_usd >= max_cost_usd:
+                logger.warning(
+                    "Cost budget exceeded mid-agent-loop ($%.4f >= $%.4f); stopping cleanly.",
+                    self.usage.cost_usd, max_cost_usd,
+                )
+                return (last_text + "\n\n[stopped: budget]").strip()
             resp = await self._client.create(
                 system=system_prompt, messages=messages, model=model, effort=effort,
                 tools=toolbox.definitions(allowed_tools) or None, max_tokens=max_tokens,

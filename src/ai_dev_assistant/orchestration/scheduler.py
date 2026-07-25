@@ -3,6 +3,11 @@
 Generic over how a subtask is executed and verified — the runtime injects those two
 async callables, so the scheduler only owns ordering, parallelism, and retry policy.
 
+Dispatch is *rolling*: whenever any in-flight subtask settles, newly-ready dependents are
+started immediately (asyncio.wait FIRST_COMPLETED) instead of waiting for the whole batch
+— a fast subtask's dependents never wait on its slowest sibling. The session pool's
+semaphore is the single concurrency bound.
+
 Reliability behavior (Tier 1):
   - A transient LLM error (timeout/429/5xx) is retried with backoff and does NOT consume
     the substantive review-retry budget.
@@ -34,9 +39,9 @@ class BudgetExceeded(Exception):
 
 ExecuteFn = Callable[[SubTaskState, dict[str, str], Session], Awaitable[str]]
 VerifyFn = Callable[[SubTaskState, str], Awaitable[Verdict]]
-# Optional hook: given the run after a batch, amend the DAG (add/repair subtasks). Returns
-# the number of subtasks added (0 = no change). Injected by the engine when adaptive
-# replanning is enabled.
+# Optional hook: given the run once it has run dry (nothing ready, nothing in flight),
+# amend the DAG (add/repair subtasks). Returns the number of subtasks added (0 = no
+# change). Injected by the engine when adaptive replanning is enabled.
 ReplanFn = Callable[[TaskRun], Awaitable[int]]
 
 _TRANSIENT_BACKOFF = (0.5, 2.0, 6.0)  # seconds between transient retries
@@ -62,33 +67,59 @@ class Scheduler:
         self._degrade = degrade_on_partial
         self._transient_retries = transient_retries
         self._replan = replan
-        self._gate = gate  # awaited before each batch (pause/resume control)
+        self._gate = gate  # awaited before each dispatch (pause/resume control)
 
     async def run(self, run: TaskRun) -> TaskRun:
+        # Rolling dispatch: keep a set of in-flight tasks; whenever ANY of them settles,
+        # immediately start whatever just became ready. A subtask leaves ready() only once
+        # it flips to RUNNING (inside its pool lease), so `dispatched` guards the window
+        # where a task exists but is still queued on the pool's semaphore.
+        in_flight: set[asyncio.Task] = set()
+        dispatched: set[str] = set()
         try:
             while True:
-                if self._gate is not None:
-                    await self._gate()  # block here while the run is paused
                 run.block_unreachable()
-                ready = run.ready()
-                if not ready:
+                ready = [s for s in run.ready() if s.id not in dispatched]
+                if not ready and not in_flight:
+                    # Run dry (every dispatched subtask is terminal, nothing new became
+                    # ready). Let the replan hook amend the DAG — e.g. add a repair
+                    # subtask for a terminal failure — before declaring the run stalled.
                     if self._replan is not None and await self._replan(run) > 0:
                         continue  # the orchestrator amended the DAG — re-evaluate
                     break
-                logger.info(
-                    "scheduling %d subtask(s) in parallel: %s",
-                    len(ready), ", ".join(s.id for s in ready),
-                )
-                tasks = [asyncio.ensure_future(self._run_one(run, state)) for state in ready]
-                try:
-                    await asyncio.gather(*tasks)
-                except (BudgetExceeded, asyncio.CancelledError):
-                    # Cancel still-running siblings, then settle every subtask's state.
-                    for t in tasks:
-                        t.cancel()
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    self._finalize_nonterminal(run, "stopped: budget exceeded / cancelled")
-                    raise
+                if ready:
+                    logger.info(
+                        "scheduling %d subtask(s) in parallel: %s",
+                        len(ready), ", ".join(s.id for s in ready),
+                    )
+                for state in ready:
+                    if self._gate is not None:
+                        await self._gate()  # block here while the run is paused
+                    dispatched.add(state.id)
+                    in_flight.add(asyncio.ensure_future(self._run_one(run, state)))
+                done, in_flight = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+                # _run_one absorbs per-subtask failures into the subtask's state; the only
+                # exceptions that escape are run-fatal (BudgetExceeded, cancellation, or a
+                # scheduler bug). Retrieve every completed task's exception so none goes
+                # unobserved, then propagate — BudgetExceeded takes priority.
+                fatal: BaseException | None = None
+                for t in done:
+                    exc = None if t.cancelled() else t.exception()
+                    if exc is None:
+                        continue
+                    if isinstance(exc, BudgetExceeded):
+                        fatal = exc
+                    else:
+                        fatal = fatal or exc
+                if fatal is not None:
+                    raise fatal
+        except (BudgetExceeded, asyncio.CancelledError):
+            # Cancel still-running siblings and await them, then settle every subtask.
+            for t in in_flight:
+                t.cancel()
+            await asyncio.gather(*in_flight, return_exceptions=True)
+            self._finalize_nonterminal(run, "stopped: budget exceeded / cancelled")
+            raise
         finally:
             # Anything still pending after we run dry is part of a cycle / unsatisfiable.
             for state in run.subtasks.values():
