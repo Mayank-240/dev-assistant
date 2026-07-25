@@ -27,6 +27,14 @@ from ai_dev_assistant.evals.harness import (
 from ai_dev_assistant.llm.schemas import BriefDoc, Plan, RunLessons, SubTask, Verdict
 from ai_dev_assistant.orchestration.run_store import RunStore
 
+# Slice 3 (F3) lands concurrently: the cross-project tests below activate the moment
+# orchestration.fanout.run_cross_project exists, and are skipped until then.
+try:
+    from ai_dev_assistant.orchestration import fanout as _fanout
+except ImportError:  # pragma: no cover — fanout not landed yet
+    _fanout = None
+_HAS_FANOUT = _fanout is not None and hasattr(_fanout, "run_cross_project")
+
 
 def _track_attempt_dirs(monkeypatch, tmp_path):
     """Route the harness's per-attempt mkdtemp under tmp_path and record the dirs, so
@@ -265,7 +273,8 @@ async def test_missing_required_tool_skips_task(monkeypatch):
 
 def test_golden_suite_shape():
     """The suite spans ~10 tasks; every fixture task has a repo, cross-language tasks
-    declare their toolchain and ship held-out tests."""
+    declare their toolchain and ship held-out tests, and the cross-project task ships
+    a sub-repo + held-out tree per target."""
     ids = [t.id for t in GOLDEN]
     assert len(ids) == len(set(ids))
     assert len(GOLDEN) >= 10
@@ -273,10 +282,17 @@ def test_golden_suite_shape():
         if t.repo_fixture:
             assert (FIXTURES_DIR / t.repo_fixture / "repo").is_dir(), t.id
             assert t.heldout_dir is not None, t.id
+        assert not (t.repo_fixture and t.cross_fixtures), t.id  # mutually exclusive
     for tid in ("fix_js_clamp", "fix_go_leap_year", "fix_rust_temp_conversion",
                 "fix_ruby_titlecase"):
         t = next(x for x in GOLDEN if x.id == tid)
         assert t.required_tools, tid
+    cross = next(t for t in GOLDEN if t.id == "cross_logging_fix")
+    assert cross.cross_fixtures == ("repo_a", "repo_b")
+    assert not cross.required_tools  # pure Python — never toolchain-skipped
+    for sub in cross.cross_fixtures:
+        assert (FIXTURES_DIR / cross.id / sub).is_dir(), sub
+        assert cross.cross_heldout(sub) is not None, sub
 
 
 @pytest.mark.skipif(shutil.which("node") is None or shutil.which("npm") is None,
@@ -345,6 +361,112 @@ async def test_task_timeout_bounds_an_attempt():
     assert not card.passed
     assert "timed out" in card.error
     assert card.wall_s < 10
+
+
+_FIXED_LOGUTIL = '''\
+"""Tiny shared logging helpers (fixed)."""
+
+
+def format_log(level, msg):
+    return f"[{str(level).upper()}] {msg}"
+
+
+def format_lines(level, msgs):
+    return [format_log(level, m) for m in msgs]
+'''
+
+
+def test_cross_fixture_heldout_grading(tmp_path):
+    """The cross-project fixture pair is sound WITHOUT the fan-out machinery: in each
+    sub-repo the held-out tests catch the planted dropped-level-prefix bug and pass
+    once logutil.py is fixed."""
+    task = next(t for t in GOLDEN if t.id == "cross_logging_fix")
+    for sub in task.cross_fixtures:
+        ws = tmp_path / sub
+        shutil.copytree(FIXTURES_DIR / task.id / sub, ws)
+        res = heldout_tests_pass(ws, task.cross_heldout(sub), timeout=60)
+        assert not res.passed, sub  # planted bug is visible to the held-out tests
+        (ws / "logutil.py").write_text(_FIXED_LOGUTIL)
+        res = heldout_tests_pass(ws, task.cross_heldout(sub), timeout=60)
+        assert res.passed, f"{sub}: {res.detail}"
+        # the in-repo suite also passes on the fix (each repo has its own failing test)
+        assert grade_tests(ws, timeout=60).passed, sub
+
+
+@pytest.mark.skipif(_HAS_FANOUT, reason="fanout landed — the degradation path is gone")
+async def test_cross_task_degrades_cleanly_without_fanout(tmp_path, monkeypatch):
+    """Until orchestration/fanout.py lands, the cross task fails its attempt with a
+    clear error instead of crashing the harness or the suite."""
+    _track_attempt_dirs(monkeypatch, tmp_path)
+    report = await run_eval(_offline_settings(), only=["cross_logging_fix"], repeat=1,
+                            task_timeout=60, provider_factory=_RepoFixProvider)
+    card = report.cards[0]
+    assert not card.passed
+    assert not card.skipped
+    assert "fan-out unavailable" in card.error
+    assert card.project == "multi"
+
+
+@pytest.mark.skipif(not _HAS_FANOUT,
+                    reason="orchestration.fanout.run_cross_project not landed yet")
+async def test_cross_project_golden_task_offline(tmp_path, monkeypatch):
+    """F3+F8: the cross-project golden task drives the REAL fan-out path offline — two
+    ephemeral in-place projects, two scripted children each fixing its own repo — then
+    grades per-child held-out tests, per-child branches, lineage, and the rollup."""
+    made = _track_attempt_dirs(monkeypatch, tmp_path)
+    task = next(t for t in GOLDEN if t.id == "cross_logging_fix")
+    report = await run_eval(
+        _offline_settings(), only=[task.id], repeat=1, task_timeout=300,
+        provider_factory=lambda: _RepoFixProvider("logutil.py", _FIXED_LOGUTIL))
+    assert len(report.cards) == 1
+    card = report.cards[0]
+    assert card.error == ""
+    assert card.passed, [f"{g.name}: {g.detail}" for g in card.graders]
+    assert card.project == "multi"
+    assert card.run_status == "completed"
+    assert card.quality > 0
+
+    # ---- rollup dict shape matches the run_cross_project contract ----
+    rollup = card.rollup
+    assert {"parent_id", "status", "children", "docs_dir"} <= set(rollup)
+    assert rollup["status"] == "completed"
+    children = rollup["children"]
+    assert len(children) == 2
+    for ch in children:
+        assert {"slug", "task_id", "status", "quality", "cost_usd", "branch",
+                "review_target", "error"} <= set(ch)
+        assert ch["status"] == "completed"
+        assert ch["branch"]
+        assert ch["quality"] > 0
+
+    # ---- held-out grading ran and passed for BOTH children, plus the rollup grader ----
+    heldout = [g for g in card.graders if g.name.endswith("heldout_tests_pass")]
+    assert sorted(g.name.split(":")[0] for g in heldout) == ["repo_a", "repo_b"]
+    assert all(g.passed for g in heldout), [f"{g.name}: {g.detail}" for g in heldout]
+    assert any(g.name == "cross_rollup" and g.passed for g in card.graders)
+
+    attempts = [Path(d) for d in made if Path(d).name.startswith(f"ada-eval-{task.id}-")]
+    assert len(attempts) == 1
+    attempt = attempts[0]
+
+    # ---- parent/child lineage in the run store ----
+    rows = {r["id"]: r for r in RunStore(attempt / "data" / "runs.db").list()}
+    parent = rows[rollup["parent_id"]]
+    assert parent["project"] == "multi"
+    for ch in children:
+        row = rows[ch["task_id"]]
+        assert row["parent_id"] == rollup["parent_id"]
+        assert row["project"] == ch["slug"]
+
+    # ---- each ephemeral repo has its ada/<child-id> branch; in-place contract held ----
+    slug_to_sub = {f"eval-cross-logging-fix-repo-{x}": f"repo_{x}" for x in ("a", "b")}
+    for ch in children:
+        repo = attempt / slug_to_sub[ch["slug"]]
+        assert _git_out(["log", "-1", "--format=%s", f"ada/{ch['task_id']}"], repo)
+        # the imported repo copy itself was never mutated: same baseline, clean tree
+        assert _git_out(["branch", "--show-current"], repo) != f"ada/{ch['task_id']}"
+        assert _git_out(["log", "-1", "--format=%s"], repo) == "fixture baseline"
+        assert _git_out(["status", "--porcelain"], repo) == ""
 
 
 def test_eval_env_knobs(monkeypatch):

@@ -22,6 +22,11 @@ What the harness measures beyond the toy tasks:
     (``ADA_EVAL_TASK_TIMEOUT``, default 600s).
   - E4  offline replay: see ``evals/replay_eval.py`` — the same harness run over
     committed cassettes in ``evals/cassettes/`` with a ReplayProvider.
+  - F3/F8  cross-project golden task (``cross_logging_fix``): two sub-repo fixtures are
+    imported as two ephemeral projects and the attempt drives the REAL fan-out path
+    (``orchestration.fanout.run_cross_project``); each child is graded on its own
+    held-out tests against its persisted worktree, plus a rollup grader (parent
+    completed, every child has a branch and quality > 0).
   - Cross-language fixtures (JS/npm, Go, Rust, Ruby) exercise non-pytest verification;
     each declares ``required_tools`` and is SKIPPED (``Scorecard.skipped``) rather than
     failed when its toolchain is absent, and skips never count against the pass rate.
@@ -86,6 +91,13 @@ class GoldenTask:
     # Executables the task's toolchain needs (e.g. ("go",), ("node", "npm")). When any
     # is missing from PATH the task is SKIPPED (Scorecard.skipped) instead of failed.
     required_tools: tuple[str, ...] = ()
+    # F3/F8: cross-project task — names of the sub-repo dirs under
+    # evals/fixtures/<task-id>/ (e.g. ("repo_a", "repo_b")). When set, the runner
+    # imports one ephemeral in-place project per sub-repo and drives
+    # orchestration.fanout.run_cross_project instead of a single Engine.run; each
+    # child is graded on its own held-out tree (heldout_a/, heldout_b/, ...) plus a
+    # rollup grader. Mutually exclusive with repo_fixture.
+    cross_fixtures: tuple[str, ...] = ()
 
     @property
     def fixture_repo(self) -> Path | None:
@@ -97,6 +109,20 @@ class GoldenTask:
         if not self.repo_fixture:
             return None
         d = FIXTURES_DIR / self.repo_fixture / "heldout"
+        return d if d.is_dir() else None
+
+    @property
+    def cross_fixture_root(self) -> Path | None:
+        """Fixture dir holding the sub-repos of a cross-project task (by task id)."""
+        return FIXTURES_DIR / self.id if self.cross_fixtures else None
+
+    def cross_heldout(self, sub: str) -> Path | None:
+        """Held-out tree for one sub-repo: repo_a -> heldout_a (else heldout_<sub>)."""
+        root = self.cross_fixture_root
+        if root is None:
+            return None
+        name = "heldout" + sub[len("repo"):] if sub.startswith("repo") else f"heldout_{sub}"
+        d = root / name
         return d if d.is_dir() else None
 
 
@@ -215,6 +241,17 @@ GOLDEN: list[GoldenTask] = [
         expected_agents=("debugger", "coder"),
         required_tools=("ruby", "rake"),
     ),
+    # ---- Cross-project golden task (F3/F8): fan-out + rollup over two repos ----
+    GoldenTask(
+        id="cross_logging_fix",
+        prompt=("Both projects duplicate the same logging helper and the same bug: "
+                "format_log(level, msg) in logutil.py drops the level prefix, so each "
+                "repo's test_logfmt.py currently fails. In EACH project, fix logutil.py "
+                "so format_log returns '[LEVEL] msg' (level uppercased) and that "
+                "project's pytest suite passes. Do NOT change or delete the tests."),
+        graders=[],  # per-child held-out + rollup graders are attached by the runner
+        cross_fixtures=("repo_a", "repo_b"),
+    ),
 ]
 
 
@@ -237,8 +274,13 @@ class Scorecard:
     # to_dict stays backward compatible — the new key is purely additive.
     skipped: bool = False
     # F8: slug of the ephemeral project this attempt ran in ("" for toy/greenfield
-    # tasks, which stay on the default scratch project). Additive in to_dict.
+    # tasks, which stay on the default scratch project; "multi" for cross-project
+    # attempts, matching the parent run row). Additive in to_dict.
     project: str = ""
+    # F3: the raw dict returned by orchestration.fanout.run_cross_project for
+    # cross-project attempts ({} otherwise) — parent_id/status/children/docs_dir.
+    # Additive in to_dict.
+    rollup: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {**dataclasses.asdict(self),
@@ -376,30 +418,143 @@ def _parallelism_from_events(events: list[Event], fallback: int) -> int:
     return peak if saw else fallback
 
 
-def _prepare_ephemeral_project(settings: Settings, task: GoldenTask, tmp: Path) -> Settings:
-    """F8: stand up this attempt's ephemeral project and return settings bound to it.
-
-    Copies the pristine in-package fixture repo into the attempt's tmp dir (the
-    package tree is never touched), makes it a real git repo (init + baseline
-    commit with an explicit identity), imports it in place via
-    ``projects.import_project`` — so the ENGINE runs the real project path — and
-    returns ``settings`` with ``project`` set to the new slug. Everything (registry,
-    project data, workspaces) lives under the attempt's tmp dir, so deleting the
-    attempt dir is the project teardown.
-    """
-    repo = tmp / "fixture-repo"
-    shutil.copytree(task.fixture_repo, repo)
+def _import_fixture_repo(settings: Settings, fixture_src: Path, dest: Path,
+                         name: str) -> dict[str, Any]:
+    """Copy a pristine in-package fixture tree to ``dest`` (the package tree is never
+    touched), make it a real git repo (init + baseline commit with an explicit
+    identity), and import it IN PLACE via ``projects.import_project`` so runs take
+    the real project path. Returns the registry entry."""
+    shutil.copytree(fixture_src, dest)
     for args in (["git", "init", "-q"],
                  ["git", "add", "-A"],
                  ["git", "-c", "user.email=ada-eval@local", "-c", "user.name=Ada Eval",
                   "commit", "-q", "-m", "fixture baseline"]):
-        res = subprocess.run(args, cwd=repo, capture_output=True, text=True, timeout=60)
+        res = subprocess.run(args, cwd=dest, capture_output=True, text=True, timeout=60)
         if res.returncode != 0:
             raise RuntimeError(
                 f"fixture git setup failed ({' '.join(args)}): "
                 f"{(res.stderr or res.stdout).strip()[:300]}")
-    entry = projects.import_project(settings, str(repo), name=f"eval-{task.id}")
+    return projects.import_project(settings, str(dest), name=name)
+
+
+def _prepare_ephemeral_project(settings: Settings, task: GoldenTask, tmp: Path) -> Settings:
+    """F8: stand up this attempt's ephemeral project and return settings bound to it.
+
+    Everything (registry, project data, workspaces) lives under the attempt's tmp
+    dir, so deleting the attempt dir is the project teardown.
+    """
+    entry = _import_fixture_repo(settings, task.fixture_repo, tmp / "fixture-repo",
+                                 f"eval-{task.id}")
     return dataclasses.replace(settings, project=entry["slug"])
+
+
+async def _run_cross_one(
+    base: Settings,
+    task: GoldenTask,
+    *,
+    task_timeout: float,
+    provider_factory: ProviderFactory | None = None,
+) -> Scorecard:
+    """F3/F8: one attempt of a cross-project golden task.
+
+    Imports one ephemeral in-place project per sub-repo fixture (same mechanics as
+    single-repo tasks, one project each), then drives the REAL fan-out path —
+    ``orchestration.fanout.run_cross_project`` — with an ``engine_factory`` that
+    wires the scripted/replayed provider into each child Engine. Grading:
+
+    - per child: that repo's held-out tests (heldout_<x>/) run against the child's
+      persisted worktree (``workspace_dir/<slug>/worktrees/<task_id>``);
+    - rollup: parent status == "completed", every child has a branch and quality > 0.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix=f"ada-eval-{task.id}-"))
+    settings = dataclasses.replace(
+        base, data_dir=tmp / "data", docs_dir=tmp / "docs", workspace_dir=tmp / "ws",
+        git_finalize=False, repo_path="", repo_url="", repo_ref="")
+    card = Scorecard(task_id=task.id, passed=False, graders=[], project="multi")
+    start = time.monotonic()
+    try:
+        from ..orchestration.fanout import run_cross_project
+    except ImportError as exc:
+        card.error = f"cross-project fan-out unavailable (slice 3 not landed?): {exc}"
+        card.wall_s = time.monotonic() - start
+        return card
+    # slug -> (sub-repo dir name, held-out tree) for per-child grading
+    heldouts: dict[str, tuple[str, Path | None]] = {}
+    slugs: list[str] = []
+    try:
+        for sub in task.cross_fixtures:
+            entry = _import_fixture_repo(settings, task.cross_fixture_root / sub,
+                                         tmp / sub, f"eval-{task.id}-{sub}")
+            slugs.append(entry["slug"])
+            heldouts[entry["slug"]] = (sub, task.cross_heldout(sub))
+    except Exception as exc:  # noqa: BLE001 — a broken fixture fails the attempt, not the suite
+        card.error = f"ephemeral project setup failed: {exc}"
+        card.wall_s = time.monotonic() - start
+        return card
+
+    engines: list[Engine] = []
+
+    def engine_factory(child_settings: Settings) -> Engine:
+        eng = Engine(child_settings)
+        if provider_factory is not None:
+            provider = provider_factory()
+            eng.provider = provider
+            eng.orchestrator._provider = provider
+            eng.reviewer._provider = provider
+            eng.reflector._provider = provider
+        engines.append(eng)
+        return eng
+
+    events: list[Event] = []
+    try:
+        result = await asyncio.wait_for(
+            run_cross_project(settings, task.prompt, slugs,
+                              on_event=events.append, engine_factory=engine_factory),
+            timeout=task_timeout if task_timeout > 0 else None)
+        card.rollup = dict(result or {})
+        children = list(card.rollup.get("children") or [])
+        card.run_status = str(card.rollup.get("status") or "")
+        card.subtasks_total = len(children)
+        card.subtasks_passed = sum(1 for c in children if c.get("status") == "completed")
+        for child in children:
+            slug = str(child.get("slug") or "")
+            sub, heldout = heldouts.get(slug, (slug or "?", None))
+            ws = settings.workspace_dir / slug / "worktrees" / str(child.get("task_id") or "")
+            if heldout is None or not ws.is_dir():
+                card.graders.append(GraderResult(
+                    f"{sub}:heldout_tests_pass", False,
+                    f"missing held-out dir or child worktree: {ws}"))
+                continue
+            g = heldout_tests_pass(ws, heldout, timeout=settings.verify_timeout)
+            g.name = f"{sub}:{g.name}"
+            card.graders.append(g)
+        qualities = [float(c.get("quality") or 0.0) for c in children]
+        rollup_ok = (card.run_status == "completed"
+                     and len(children) == len(slugs)
+                     and all(c.get("branch") for c in children)
+                     and all(q > 0 for q in qualities))
+        card.graders.append(GraderResult(
+            "cross_rollup", rollup_ok,
+            f"status={card.run_status or 'n/a'} children={len(children)}/{len(slugs)} "
+            f"branches={sum(1 for c in children if c.get('branch'))} "
+            f"min_quality={min(qualities, default=0.0):.0f}"))
+        card.passed = bool(card.graders) and all(g.passed for g in card.graders)
+        card.quality = _mean(qualities)
+        card.cost_usd = sum(float(c.get("cost_usd") or 0.0) for c in children)
+        card.parallelism = _parallelism_from_events(events, len(children))
+    except asyncio.TimeoutError:
+        card.error = (f"task timed out after {task_timeout:.0f}s "
+                      "(raise ADA_EVAL_TASK_TIMEOUT if it legitimately needs longer)")
+    except Exception as exc:  # noqa: BLE001
+        card.error = str(exc)
+    finally:
+        card.wall_s = time.monotonic() - start
+        for eng in engines:  # belt-and-braces: fanout owns them, but never leak sessions
+            try:
+                await eng.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+    return card
 
 
 async def _run_one(
@@ -409,6 +564,9 @@ async def _run_one(
     task_timeout: float,
     provider_factory: ProviderFactory | None = None,
 ) -> Scorecard:
+    if task.cross_fixtures:  # F3: fan-out tasks take the cross-project path
+        return await _run_cross_one(base, task, task_timeout=task_timeout,
+                                    provider_factory=provider_factory)
     tmp = Path(tempfile.mkdtemp(prefix=f"ada-eval-{task.id}-"))
     overrides: dict[str, Any] = dict(
         data_dir=tmp / "data", docs_dir=tmp / "docs", workspace_dir=tmp / "ws",
