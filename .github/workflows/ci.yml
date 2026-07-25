@@ -15,10 +15,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      # Split into granular steps so a failure pinpoints the exact command even
+      # when only step-level status is visible.
+      - name: uv diagnostics
         run: |
-          uv venv
-          uv pip install -e ".[dev]"
+          uv --version
+          uv python find 3.12 || true
+
+      - name: Create venv
+        run: uv venv --python 3.12
+
+      - name: Install project (editable + dev extras)
+        run: uv pip install -e ".[dev]"
 
       - name: Run tests
         run: uv run pytest -q
