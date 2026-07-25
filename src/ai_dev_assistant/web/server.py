@@ -117,7 +117,7 @@ _EFFORT: dict[str, dict[str, Any]] = {
 
 def _settings_for(base: Settings, effort: str | None, budget: float | None,
                   project: str | None = None, memory_scope: str | None = None,
-                  repo: dict[str, Any] | None = None) -> Settings:
+                  git_finalize: bool | None = None) -> Settings:
     overrides: dict[str, Any] = {}
     cfg = _EFFORT.get(effort or "")
     if cfg:
@@ -134,12 +134,10 @@ def _settings_for(base: Settings, effort: str | None, budget: float | None,
         overrides["project"] = projects.resolve(base, project)
     if memory_scope in ("project", "global"):
         overrides["memory_scope"] = memory_scope
-    # W2: per-run repo binding — request fields beat the server's env defaults.
-    for key in ("repo_path", "repo_url", "repo_ref"):
-        if repo and repo.get(key):
-            overrides[key] = str(repo[key])
-    if repo and repo.get("git_finalize") is not None:
-        overrides["git_finalize"] = bool(repo["git_finalize"])
+    # Per-run repo binding is gone (clean break) — a run targets a *project*, and the
+    # project owns the repo. git_finalize remains a per-run knob.
+    if git_finalize is not None:
+        overrides["git_finalize"] = bool(git_finalize)
     return dataclasses.replace(base, **overrides) if overrides else base
 
 
@@ -172,15 +170,23 @@ class RunRequest(BaseModel):
     project: str | None = None
     memory_scope: str | None = None  # "project" | "global"
     continue_from: str | None = None  # re-engage: continue this completed task's workspace + context
-    # W2: per-run repo binding (optional; overrides the server's env defaults for this run)
-    repo_path: str | None = None    # local repo to copy into the workspace
-    repo_url: str | None = None     # git URL to clone into the workspace
-    repo_ref: str | None = None     # branch/tag/sha to check out
+    # Clean break: repo_path/repo_url/repo_ref are gone — the run's *project* owns the repo.
     git_finalize: bool | None = None  # commit the workspace to a new branch at the end
 
 
 class ProjectRequest(BaseModel):
     name: str
+
+
+class ProjectImportRequest(BaseModel):
+    source: str            # local path or git URL
+    name: str | None = None
+    ref: str | None = None  # branch / tag / sha (git-URL imports)
+
+
+class ProjectPatchRequest(BaseModel):
+    archived: bool | None = None
+    policy: dict[str, Any] | None = None
 
 
 class ReorderRequest(BaseModel):
@@ -275,7 +281,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             task_id, payload.get("prompt", ""), payload.get("plan"),
             payload.get("effort"), payload.get("budget"), payload.get("title"),
             payload.get("project"), payload.get("memory_scope"), payload.get("continue_from"),
-            payload.get("repo"), bool(payload.get("resume"))))
+            payload.get("git_finalize"), bool(payload.get("resume"))))
 
     def _evict_broker_later(task_id: str, broker: Broker) -> None:
         """W4: drop a finished task's broker after a grace period so RAM doesn't hold
@@ -317,13 +323,18 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                         effort: str | None, budget: float | None, title: str | None = None,
                         project: str | None = None, memory_scope: str | None = None,
                         continue_from: str | None = None,
-                        repo: dict[str, Any] | None = None, resume: bool = False) -> None:
+                        git_finalize: bool | None = None, resume: bool = False) -> None:
         broker: Broker = app.state.brokers[task_id]
-        # record up front so cancels-during-planning persist (title auto-derived if blank)
-        app.state.runs.start(task_id, prompt, title=(title or None))
+        # record up front so cancels-during-planning persist (title auto-derived if blank);
+        # the run row carries its project so activity/history can be filtered per project.
+        try:
+            app.state.runs.start(task_id, prompt, title=(title or None),
+                                 project=projects.resolve(settings, project))
+        except TypeError:  # run store without the project column (landing separately)
+            app.state.runs.start(task_id, prompt, title=(title or None))
         if continue_from:
             app.state.runs.set_parent(task_id, continue_from)
-        engine = Engine(_settings_for(settings, effort, budget, project, memory_scope, repo))
+        engine = Engine(_settings_for(settings, effort, budget, project, memory_scope, git_finalize))
         control = RunControl()
         engine.control = control  # enables pause/resume/steer endpoints to reach this run
         app.state.controls[task_id] = control
@@ -397,29 +408,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             "warning": warning,
         })
 
-    def _validate_repo_path(raw: str) -> tuple[Path | None, str]:
-        """W2: a per-run repo_path must be a real directory outside the server's own data."""
-        try:
-            p = Path(raw).expanduser().resolve()
-        except OSError as exc:
-            return None, f"repo_path could not be resolved: {exc}"
-        if not p.is_dir():
-            return None, f"repo_path does not exist or is not a directory: {raw}"
-        for guarded in (settings.data_dir, settings.workspace_dir, settings.docs_dir):
-            g = guarded.resolve()
-            if p == g or p.is_relative_to(g):
-                return None, "repo_path may not point inside the server's data directories"
-        return p, ""
-
     @app.post("/api/run")
     async def start_run(req: RunRequest):
-        repo: dict[str, Any] = {"repo_url": req.repo_url, "repo_ref": req.repo_ref,
-                                "git_finalize": req.git_finalize}
-        if req.repo_path and req.repo_path.strip():
-            p, err = _validate_repo_path(req.repo_path.strip())
-            if p is None:
-                return JSONResponse({"error": err}, status_code=400)
-            repo["repo_path"] = str(p)
         task_id = req.task_id or new_task_id()
         app.state.brokers[task_id] = Broker()
         app.state.brokers[task_id].publish(Event("status", "Backend: " + settings.llm_backend,
@@ -427,7 +417,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         payload = {
             "prompt": req.prompt, "plan": req.plan, "effort": req.effort, "budget": req.budget,
             "title": req.title, "project": req.project, "memory_scope": req.memory_scope,
-            "continue_from": req.continue_from, "repo": repo,
+            "continue_from": req.continue_from, "git_finalize": req.git_finalize,
         }
         plan_title = (req.plan or {}).get("title") if req.plan else None
         app.state.runs.enqueue(task_id, req.prompt, req.title or plan_title, payload)
@@ -465,8 +455,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                                                  {"backend": settings.llm_backend}))
         payload = {
             "prompt": row.get("prompt") or "", "plan": None, "effort": None, "budget": None,
-            "title": row.get("title"), "project": None, "memory_scope": None,
-            "continue_from": None, "repo": None, "resume": True,
+            "title": row.get("title"), "project": row.get("project"), "memory_scope": None,
+            "continue_from": None, "git_finalize": None, "resume": True,
         }
         app.state.runs.enqueue(task_id, payload["prompt"], row.get("title"), payload)
         _pump()
@@ -815,6 +805,131 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         if not (req.name or "").strip():
             return JSONResponse({"error": "name required"}, status_code=400)
         return JSONResponse(projects.create_project(settings, req.name))
+
+    # ---- F1/F6: project lifecycle (import / status / activity / patch / delete) ----
+    # projects.py is growing import_project/project_status/set_policy/archive_project/
+    # delete_project in a parallel change; every call is guarded with AttributeError -> 501
+    # so this module works against either version.
+
+    def _project_known(slug: str) -> bool:
+        return any(p.get("slug") == slug for p in projects.list_projects(settings))
+
+    def _title_of(row: dict[str, Any]) -> str:
+        return row.get("title") or derive_title(row.get("prompt") or "")
+
+    def _project_of_run(row: dict[str, Any] | None) -> str:
+        return (row or {}).get("project") or "default"
+
+    def _running_ids_for(slug: str) -> list[str]:
+        return [tid for tid in sorted(app.state.running)
+                if _project_of_run(app.state.runs.get(tid)) == slug]
+
+    @app.post("/api/projects/import")
+    async def import_project(req: ProjectImportRequest) -> JSONResponse:
+        source = (req.source or "").strip()
+        if not source:
+            return JSONResponse({"error": "source (path or git URL) is required"}, status_code=400)
+        try:
+            entry = await asyncio.to_thread(
+                projects.import_project, settings, source,
+                name=(req.name or "").strip() or None, ref=(req.ref or "").strip())
+        except AttributeError:
+            return JSONResponse({"error": "project import is not available yet"}, status_code=501)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse(entry)
+
+    @app.get("/api/projects/{slug}/status")
+    async def get_project_status(slug: str) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        try:
+            st = await asyncio.to_thread(projects.project_status, settings, slug)
+        except AttributeError:
+            return JSONResponse({"error": "project status is not available yet"}, status_code=501)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        return JSONResponse(st)
+
+    @app.get("/api/projects/{slug}/activity")
+    async def get_project_activity(slug: str) -> JSONResponse:
+        """Live view of one project: running tasks + queued tasks + last 5 run rows."""
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        running = []
+        for tid in _running_ids_for(slug):
+            r = app.state.runs.get(tid) or {}
+            running.append({"id": tid, "title": _title_of(r)})
+        positions = app.state.runs.queue_positions()
+        queued = []
+        for p in app.state.runs.queue_pending():
+            payload = p.get("payload") or {}
+            if isinstance(payload, str):  # queue_pending stores payload as a JSON string
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    payload = {}
+            if projects.resolve(settings, payload.get("project")) != slug:
+                continue
+            queued.append({"id": p["task_id"], "title": _title_of(p),
+                           "position": positions.get(p["task_id"])})
+        try:
+            recent = app.state.runs.list(limit=5, project=slug)
+        except TypeError:  # run store without per-project filtering (landing separately)
+            recent = [r for r in app.state.runs.list(limit=100)
+                      if _project_of_run(r) == slug][:5]
+        recent = [{
+            "id": r.get("id"), "title": _title_of(r), "status": r.get("status"),
+            "run_status": r.get("run_status"), "quality_score": r.get("quality_score"),
+            "cost_usd": r.get("cost_usd"), "tests": r.get("tests"),
+            "created_at": r.get("created_at"), "ended_at": r.get("ended_at"),
+        } for r in recent]
+        return JSONResponse({"slug": slug, "running": running, "queued": queued,
+                             "recent": recent})
+
+    @app.patch("/api/projects/{slug}")
+    async def patch_project(slug: str, req: ProjectPatchRequest) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        try:
+            if req.archived is not None:
+                try:
+                    projects.archive_project(settings, slug, archived=bool(req.archived))
+                except TypeError:  # older archive-only signature
+                    projects.archive_project(settings, slug)
+            if req.policy is not None:
+                projects.set_policy(settings, slug, req.policy)
+        except AttributeError:
+            return JSONResponse({"error": "project archive/policy is not available yet"},
+                                status_code=501)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        try:
+            entry = projects.get_project(settings, slug)
+        except AttributeError:
+            entry = next((p for p in projects.list_projects(settings)
+                          if p.get("slug") == slug), None)
+        return JSONResponse(entry or {"ok": True})
+
+    @app.delete("/api/projects/{slug}")
+    async def remove_project(slug: str) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        if slug == projects.DEFAULT_PROJECT:
+            return JSONResponse({"error": "the default project cannot be deleted"},
+                                status_code=409)
+        active = _running_ids_for(slug)
+        if active:
+            return JSONResponse(
+                {"error": "project has running task(s): " + ", ".join(active)},
+                status_code=409)
+        try:
+            await asyncio.to_thread(projects.delete_project, settings, slug)
+        except AttributeError:
+            return JSONResponse({"error": "project delete is not available yet"}, status_code=501)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True})
 
     @app.get("/api/graph")
     async def get_graph(project: str | None = None) -> JSONResponse:

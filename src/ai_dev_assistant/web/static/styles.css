@@ -555,13 +555,52 @@ body.resizing .sidebar { transition:none; }
 .brief-actions { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:4px; }
 .modal-head-actions { display:flex; align-items:center; gap:8px; }
 
-/* ===== W2: per-run repository binding (composer) ===== */
-.repo-opts { margin-top:10px; }
-.repo-opts summary { cursor:pointer; font-size:10.5px; font-family:var(--mono); letter-spacing:.08em;
-  text-transform:uppercase; color:var(--muted); user-select:none; }
-.repo-opts[open] summary { margin-bottom:6px; }
-.repo-opts .title-input { margin-top:6px; }
-.repo-opts .check { margin-top:8px; }
+/* ===== F1/F4: project status line + live activity strip (composer) ===== */
+.proj-status { display:flex; align-items:center; gap:7px; margin-top:6px;
+  font-size:11.5px; font-family:var(--mono); color:var(--text-2); min-width:0; }
+.ps-branch { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ps-dirty { color:var(--warn); font-size:10px; line-height:1; flex:0 0 auto; }
+.ps-archived { flex:0 0 auto; padding:1px 7px; border-radius:99px; font-size:10px;
+  letter-spacing:.06em; text-transform:uppercase; color:var(--muted);
+  border:1px solid var(--border); background:var(--surface-2); }
+.proj-activity { display:flex; align-items:center; gap:7px; margin-top:5px;
+  font-size:11.5px; color:var(--muted); min-width:0; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }
+.pa-dot { flex:0 0 auto; width:7px; height:7px; border-radius:50%; background:var(--muted); }
+.proj-activity.pa-running { color:var(--text-2); }
+.proj-activity.pa-running .pa-dot { background:var(--accent);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent); }
+.proj-activity.pa-queued .pa-dot { background:var(--warn); }
+
+/* ===== F1: New / Import project dialog ===== */
+.pm-box { width:min(520px,100%); }
+.pm-label { display:block; margin-bottom:4px; font-size:10.5px; font-family:var(--mono);
+  letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
+.pm-box .title-input { margin-top:0; }
+.pm-divider { display:flex; align-items:center; gap:10px; margin:4px 0;
+  font-size:10.5px; font-family:var(--mono); letter-spacing:.08em;
+  text-transform:uppercase; color:var(--muted); }
+.pm-divider::before, .pm-divider::after { content:""; flex:1; height:1px; background:var(--border); }
+.pm-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.pm-error { margin:0; font-size:12px; color:var(--danger); }
+
+/* ===== F4: all-projects activity table (Dashboard) ===== */
+.ds-activity { overflow-x:auto; }
+.dsa-table { width:100%; border-collapse:collapse; font-size:13px; }
+.dsa-table th, .dsa-table td { text-align:left; padding:6px 10px;
+  border-bottom:1px solid var(--border); }
+.dsa-table th { font-size:11px; font-family:var(--mono); letter-spacing:.05em;
+  text-transform:uppercase; color:var(--muted); }
+.dsa-name { color:var(--text); font-weight:600; white-space:nowrap; }
+.dsa-state { display:inline-block; padding:1px 9px; border-radius:99px; font-size:11px;
+  font-family:var(--mono); letter-spacing:.05em; text-transform:uppercase;
+  color:var(--muted); border:1px solid var(--border); }
+.dsa-state-running { color:var(--accent-text); background:var(--accent-soft);
+  border-color:color-mix(in srgb,var(--accent) 28%,transparent); }
+.dsa-state-queued { color:var(--warn); border-color:color-mix(in srgb,var(--warn) 40%,transparent); }
+.dsa-queued { color:var(--text-2); white-space:nowrap; }
+.dsa-task { color:var(--text-2); max-width:340px; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; }
 
 /* ===== W5: diff viewer (doc modal) ===== */
 .d-add { color:var(--green); }

@@ -5,6 +5,7 @@ const {
   escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine,
   makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
   computeBudgetMeter, timelineRows, compareRowModel, isResumable,
+  projectStatusLine, activityStripModel,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -415,14 +416,11 @@ function renderAgentModal(a) {
 function getControls() {
   const b = parseFloat($("budget").value);
   const t = $("task-title").value.trim();
-  // W2: optional per-run repo binding (blank fields fall back to the server's env defaults)
-  const repoPath = $("repo-path").value.trim(), repoUrl = $("repo-url").value.trim(),
-        repoRef = $("repo-ref").value.trim();
+  // Per-run repo binding is gone — the selected *project* owns the repository.
   return {
     effort: $("effort").value, budget: (b && b > 0) ? b : null, title: t || null,
     project: selectedProject(), memory_scope: $("mem-scope").value,
     continue_from: state.continueFrom || null,
-    repo_path: repoPath || null, repo_url: repoUrl || null, repo_ref: repoRef || null,
     git_finalize: $("git-finalize").checked ? true : null,
   };
 }
@@ -459,20 +457,55 @@ async function loadProjects() {
   sel.value = list.some(p => p.slug === saved) ? saved : list[0].slug;
 }
 
-async function createProject() {
-  const name = (window.prompt("New project name:") || "").trim();
-  if (!name) return;
-  let created;
+// ---- F1: New / Import project dialog ----
+function openProjectModal() {
+  ["pm-name", "pm-source", "pm-import-name", "pm-ref"].forEach(id => { $(id).value = ""; });
+  $("pm-error").classList.add("hidden");
+  $("pm-error").textContent = "";
+  openModalEl("project-modal");
+}
+function closeProjectModal() { closeModalEl("project-modal"); }
+
+function _pmFail(msg) {
+  const el = $("pm-error");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+
+async function submitProjectModal() {
+  const name = $("pm-name").value.trim();
+  const source = $("pm-source").value.trim();
+  if (!name && !source) { _pmFail("Enter a project name, or a source path / git URL to import."); return; }
+  const btn = $("pm-submit");
+  btn.disabled = true;
+  $("pm-error").classList.add("hidden");
+  let created = null;
   try {
-    created = await (await fetch("/api/projects", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }),
-    })).json();
-  } catch (e) { showToast("Could not create project", "error"); return; }
+    let resp;
+    if (source) {
+      resp = await fetch("/api/projects/import", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source, name: $("pm-import-name").value.trim() || name || null,
+                               ref: $("pm-ref").value.trim() || null }),
+      });
+    } else {
+      resp = await fetch("/api/projects", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+    }
+    const data = await resp.json();
+    if (!resp.ok || data.error) { _pmFail(data.error || ("HTTP " + resp.status)); btn.disabled = false; return; }
+    created = data;
+  } catch (e) { _pmFail("Request failed: " + e); btn.disabled = false; return; }
+  btn.disabled = false;
   if (created && created.slug) {
+    closeProjectModal();
     await loadProjects();
     $("project").value = created.slug;
     localStorage.setItem("ada-project", created.slug);
-    showToast("Project created · " + (created.name || created.slug), "success");
+    showToast((source ? "Project imported · " : "Project created · ") + (created.name || created.slug), "success");
+    refreshProjectPulse(true);
     if (currentView === "memory") loadMemory();
     if (currentView === "graph") loadGraph();
   }
@@ -480,8 +513,51 @@ async function createProject() {
 
 function onProjectChange() {
   localStorage.setItem("ada-project", selectedProject());
+  refreshProjectPulse(true);
   if (currentView === "memory") loadMemory();
   if (currentView === "graph") loadGraph();
+}
+
+// ---- F1/F4: project status line + live activity strip (under the selector) ----
+async function loadProjectStatus() {
+  const slug = selectedProject();
+  const el = $("project-status");
+  let st = null;
+  try {
+    const resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/status");
+    if (resp.ok) st = await resp.json();
+  } catch (e) { /* leave hidden */ }
+  const m = projectStatusLine(st);
+  if (!m.visible) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  el.classList.remove("hidden");
+  el.innerHTML =
+    `<span class="ps-branch">⎇ ${escapeHtml(m.text)}</span>` +
+    (m.dirty ? '<span class="ps-dirty" title="Uncommitted changes in the checkout">●</span>' : "") +
+    (m.archived ? '<span class="ps-archived">archived</span>' : "");
+}
+
+async function loadProjectActivity() {
+  const slug = selectedProject();
+  const el = $("project-activity");
+  let act = null;
+  try {
+    const resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/activity");
+    if (resp.ok) act = await resp.json();
+  } catch (e) { /* leave as-is */ }
+  if (!act) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  const m = activityStripModel(act);
+  el.classList.remove("hidden");
+  el.className = "proj-activity pa-" + m.state;
+  el.innerHTML = `<span class="pa-dot" aria-hidden="true"></span>${escapeHtml(m.text)}`;
+}
+
+// One "pulse" refreshes the activity strip every tick and the (heavier, git-backed)
+// status line every third tick — or both immediately when force=true.
+let _pulseN = 0;
+function refreshProjectPulse(force) {
+  loadProjectActivity();
+  if (force || _pulseN % 3 === 0) loadProjectStatus();
+  _pulseN++;
 }
 
 // ---- task queue ----
@@ -930,7 +1006,7 @@ async function launchRun(body, prompt) {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
     const data = await resp.json();
-    if (!resp.ok || data.error) {  // e.g. an invalid repo_path (400)
+    if (!resp.ok || data.error) {  // e.g. a validation error (400)
       const msg = data.error || ("HTTP " + resp.status);
       feed("✗ could not start run: " + msg);
       showToast("Could not start run: " + msg, "error", 6000);
@@ -1325,9 +1401,42 @@ async function compareRuns() {
     `</tbody></table>`;
 }
 
+// ---- F4: all-projects activity table (Dashboard) ----
+async function loadProjectsActivity() {
+  const wrap = $("ds-activity");
+  if (!wrap) return;
+  let list = [];
+  try { list = await (await fetch("/api/projects")).json(); } catch (e) { list = []; }
+  if (!list.length) { wrap.innerHTML = '<p class="muted">No projects yet.</p>'; return; }
+  const acts = await Promise.all(list.slice(0, 20).map(async p => {
+    try {
+      const resp = await fetch("/api/projects/" + encodeURIComponent(p.slug) + "/activity");
+      return resp.ok ? await resp.json() : null;
+    } catch (e) { return null; }
+  }));
+  const rows = list.slice(0, 20).map((p, i) => {
+    const m = activityStripModel(acts[i]);
+    const runningTitle = (acts[i] && acts[i].running && acts[i].running[0])
+      ? (acts[i].running[0].title || acts[i].running[0].id) : "—";
+    return `<tr>` +
+      `<td class="dsa-name">${escapeHtml(p.name || p.slug)}` +
+      (p.archived ? ' <span class="ps-archived">archived</span>' : "") + `</td>` +
+      `<td><span class="dsa-state dsa-state-${escapeAttr(m.state)}">${escapeHtml(m.state)}</span></td>` +
+      `<td class="dsa-task">${escapeHtml(runningTitle)}${m.running > 1 ? escapeHtml(" (+" + (m.running - 1) + " more)") : ""}</td>` +
+      `<td class="dsa-queued">${m.queued ? escapeHtml(m.queued + " queued") : "—"}</td>` +
+      `</tr>`;
+  }).join("");
+  wrap.innerHTML =
+    `<table class="dsa-table"><thead><tr>` +
+    `<th scope="col">Project</th><th scope="col">State</th>` +
+    `<th scope="col">Running task</th><th scope="col">Queued</th>` +
+    `</tr></thead><tbody>${rows}</tbody></table>`;
+}
+
 // ---- Dashboard (Tier 5) ----
 async function loadDashboard() {
   populateCompareOptions();
+  loadProjectsActivity();
   let s;
   try { s = await (await fetch("/api/stats")).json(); } catch (e) { return; }
   $("ds-runs").textContent = s.runs ?? 0;
@@ -1675,15 +1784,22 @@ $("roster-modal").onclick = (e) => { if (e.target === $("roster-modal")) closeRo
 // a11y: Escape closes the topmost dialog; Tab is trapped inside an open dialog
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  if (!$("roster-modal").classList.contains("hidden")) closeRosterModal();
+  if (!$("project-modal").classList.contains("hidden")) closeProjectModal();
+  else if (!$("roster-modal").classList.contains("hidden")) closeRosterModal();
   else if (!$("agent-modal").classList.contains("hidden")) closeAgentModal();
   else closeModalEl("modal");
 });
-["modal", "agent-modal", "roster-modal"].forEach(id =>
+["modal", "agent-modal", "roster-modal", "project-modal"].forEach(id =>
   $(id).addEventListener("keydown", (e) => _trapModalTab($(id), e)));
 document.querySelectorAll(".tab").forEach(t => t.onclick = () => selectTab(t.dataset.doc));
 $("project").onchange = onProjectChange;
-$("new-project").onclick = createProject;
+$("new-project").onclick = openProjectModal;
+$("project-modal-close").onclick = closeProjectModal;
+$("pm-cancel").onclick = closeProjectModal;
+$("pm-submit").onclick = submitProjectModal;
+$("project-modal").onclick = (e) => { if (e.target === $("project-modal")) closeProjectModal(); };
+[["pm-name"], ["pm-source"], ["pm-import-name"], ["pm-ref"]].forEach(([id]) =>
+  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitProjectModal(); } }));
 $("q-pause").onclick = togglePause;
 $("q-concurrency").onchange = setConcurrency;
 // in-run control + feedback + dashboard
@@ -1702,7 +1818,11 @@ document.querySelectorAll("#fb-stars button").forEach(b => b.onclick = () => {
   sendFeedback({});
 });
 loadConfig();
-loadProjects();
+loadProjects().then(() => refreshProjectPulse(true));
 loadRecent();
 loadQueue();
 setInterval(loadQueue, 4000);  // keep the queue panel + chip fresh
+setInterval(() => {            // keep the project activity strip (+ dashboard table) live
+  refreshProjectPulse(false);
+  if (currentView === "dashboard") loadProjectsActivity();
+}, 5000);

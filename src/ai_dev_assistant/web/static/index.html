@@ -59,12 +59,14 @@
             <textarea id="prompt" rows="4" placeholder="e.g. Add input validation to a sample function and document it"></textarea>
             <input id="task-title" class="title-input" type="text" maxlength="80"
                    placeholder="Title (optional) — auto-generated from the task if left blank" />
-            <label class="ctl ctl-project" title="Memory & knowledge graph are scoped to this project">Project
+            <label class="ctl ctl-project" title="The project owns the repository, memory & knowledge graph this run works in">Project
               <div class="proj-row">
                 <select id="project" class="select"></select>
-                <button id="new-project" class="ghost" type="button" title="Create a new project" aria-label="Create a new project">＋</button>
+                <button id="new-project" class="ghost" type="button" title="New or import project" aria-label="New or import project">＋</button>
               </div>
             </label>
+            <div id="project-status" class="proj-status hidden" title="Repository state of the selected project"></div>
+            <div id="project-activity" class="proj-activity hidden" role="status" aria-live="polite" title="What is going on in this project right now"></div>
             <div class="controls">
               <label class="ctl" title="Higher effort = deeper reasoning, more agent turns & review retries; lower = cheaper & faster (Sonnet)">Effort
                 <select id="effort" class="select">
@@ -85,16 +87,7 @@
                 <input id="budget" class="num" type="number" min="0" step="0.5" placeholder="none" />
               </label>
             </div>
-            <details class="repo-opts" title="Bind this run to a real repository (optional)">
-              <summary>Repository (optional)</summary>
-              <input id="repo-path" class="title-input" type="text"
-                     placeholder="Local repo path — e.g. ~/projects/myrepo" />
-              <input id="repo-url" class="title-input" type="text"
-                     placeholder="Git URL to clone — e.g. https://github.com/me/repo.git" />
-              <input id="repo-ref" class="title-input" type="text"
-                     placeholder="Branch / tag / SHA (optional)" />
-              <label class="check"><input type="checkbox" id="git-finalize" /> Commit results to a new branch</label>
-            </details>
+            <label class="check" title="At the end, commit the run's workspace to a new branch"><input type="checkbox" id="git-finalize" /> Commit results to a new branch</label>
             <button id="run-btn">Run task →</button>
             <label class="check"><input type="checkbox" id="review-plan" /> Review plan before running</label>
             <p class="hint">Runs via your Claude Code login — no API key needed.</p>
@@ -290,6 +283,10 @@
               </div>
               <button id="dash-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh dashboard">⟳</button>
             </div>
+            <div class="card">
+              <span class="kicker">Project activity — what is going on in every project</span>
+              <div id="ds-activity" class="ds-activity"><p class="muted">Loading…</p></div>
+            </div>
             <div class="metrics dash-metrics">
               <div class="metric"><span class="m-val" id="ds-runs">0</span><span class="m-label">runs</span></div>
               <div class="metric"><span class="m-val" id="ds-cost">$0</span><span class="m-label">total cost</span></div>
@@ -441,6 +438,42 @@
         <div>
           <span class="kicker">Tools</span>
           <div id="rm-tools" class="tool-chips"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- New / Import project dialog -->
+  <div id="project-modal" class="modal hidden">
+    <div class="modal-box pm-box" role="dialog" aria-modal="true" aria-label="New or import project" tabindex="-1">
+      <div class="modal-head">
+        <span class="kicker">New / Import project</span>
+        <button id="project-modal-close" type="button" class="ghost" aria-label="Close dialog">✕</button>
+      </div>
+      <div class="am-body">
+        <div>
+          <label class="pm-label" for="pm-name">Create a new (empty) project</label>
+          <input id="pm-name" class="title-input" type="text" maxlength="80" placeholder="Project name — e.g. Notes API" />
+        </div>
+        <div class="pm-divider" aria-hidden="true">or import an existing repository</div>
+        <div>
+          <label class="pm-label" for="pm-source">Source — local path or git URL</label>
+          <input id="pm-source" class="title-input" type="text" placeholder="~/projects/myrepo  ·  https://github.com/me/repo.git" />
+        </div>
+        <div class="pm-grid">
+          <div>
+            <label class="pm-label" for="pm-import-name">Name (optional)</label>
+            <input id="pm-import-name" class="title-input" type="text" maxlength="80" placeholder="defaults to the repo name" />
+          </div>
+          <div>
+            <label class="pm-label" for="pm-ref">Ref (optional)</label>
+            <input id="pm-ref" class="title-input" type="text" placeholder="branch / tag / SHA" />
+          </div>
+        </div>
+        <p id="pm-error" class="pm-error hidden" role="alert"></p>
+        <div class="pe-actions">
+          <button id="pm-submit">Create / Import</button>
+          <button id="pm-cancel" class="ghost-btn" type="button">Cancel</button>
         </div>
       </div>
     </div>

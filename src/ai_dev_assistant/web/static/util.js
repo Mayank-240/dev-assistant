@@ -206,10 +206,44 @@
   const RESUMABLE_STATUSES = new Set(["interrupted", "failed", "over_budget", "cancelled", "partial"]);
   function isResumable(status) { return RESUMABLE_STATUSES.has(status); }
 
+  // ---- F1: project status line model (branch @ short-head · dirty · archived) ----
+  // Input: GET /api/projects/{slug}/status body (or null). Output drives the compact
+  // line under the project selector; text is plain (caller escapes before injecting).
+  function projectStatusLine(st) {
+    if (!st || (!st.branch && !st.head)) return { visible: false, text: "", dirty: false, archived: false };
+    const head = String(st.head || "").slice(0, 7);
+    const branch = st.branch || "(no branch)";
+    return {
+      visible: true,
+      text: branch + (head ? " @ " + head : ""),
+      dirty: !!st.dirty,
+      archived: !!st.archived,
+    };
+  }
+
+  // ---- F4: per-project activity strip model ----
+  // Input: GET /api/projects/{slug}/activity body (or null).
+  // state: "idle" | "queued" | "running"; text is the human summary line.
+  function activityStripModel(act) {
+    const running = (act && act.running) || [];
+    const queued = (act && act.queued) || [];
+    const state = running.length ? "running" : queued.length ? "queued" : "idle";
+    let text = "idle";
+    if (running.length) {
+      const first = running[0].title || running[0].id || "task";
+      text = "running · " + first + (running.length > 1 ? " (+" + (running.length - 1) + " more)" : "");
+      if (queued.length) text += " · " + queued.length + " queued";
+    } else if (queued.length) {
+      text = queued.length + " queued";
+    }
+    return { state, text, running: running.length, queued: queued.length };
+  }
+
   const AdaUtil = {
     escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine,
     makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
     computeBudgetMeter, timelineRows, compareRowModel, RESUMABLE_STATUSES, isResumable,
+    projectStatusLine, activityStripModel,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = AdaUtil;

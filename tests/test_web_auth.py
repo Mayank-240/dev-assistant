@@ -1,4 +1,4 @@
-"""S8/W2/W4/W5/W6 web-surface tests: bearer-token auth, per-run repo validation,
+"""S8/W4/W5/W6 web-surface tests: bearer-token auth (incl. the project endpoints),
 the diff endpoint, broker-evicted event replay, and import-time laziness (no LLM needed)."""
 
 from __future__ import annotations
@@ -81,32 +81,32 @@ def test_nonloopback_autogenerates_and_prints_token(tmp_path, monkeypatch, capsy
     assert c.get("/api/stats", headers={"Authorization": f"Bearer {token}"}).status_code == 200
 
 
-# ---- W2: per-run repo selection ----
+# ---- Clean break: per-run repo binding is gone; git_finalize is the only per-run knob ----
 
-def test_run_rejects_nonexistent_repo_path(tmp_path):
-    c = _client(tmp_path, api_token="")
-    r = c.post("/api/run", json={"prompt": "x", "repo_path": str(tmp_path / "does-not-exist")})
-    assert r.status_code in (400, 422)
-    assert "repo_path" in r.json().get("error", "")
-
-
-def test_run_rejects_repo_path_inside_data_dir(tmp_path):
-    c = _client(tmp_path, api_token="")
-    inside = tmp_path / "data" / "sneaky"
-    inside.mkdir(parents=True, exist_ok=True)
-    r = c.post("/api/run", json={"prompt": "x", "repo_path": str(inside)})
-    assert r.status_code == 400
-    assert "data directories" in r.json()["error"]
-
-
-def test_settings_for_applies_repo_overrides():
+def test_settings_for_has_no_repo_kwarg_and_applies_git_finalize():
     base = Settings()
-    s = _settings_for(base, None, None,
-                      repo={"repo_path": "/some/repo", "repo_ref": "main", "git_finalize": True})
-    assert s.repo_path == "/some/repo" and s.repo_ref == "main" and s.git_finalize is True
-    # absent fields keep the server's env defaults
-    s2 = _settings_for(base, None, None, repo={})
-    assert s2.repo_path == base.repo_path and s2.git_finalize == base.git_finalize
+    s = _settings_for(base, None, None, git_finalize=True)
+    assert s.git_finalize is True
+    s2 = _settings_for(base, None, None)  # absent -> keep the server default
+    assert s2.git_finalize == base.git_finalize
+    with pytest.raises(TypeError):
+        _settings_for(base, None, None, repo={"repo_path": "/some/repo"})
+
+
+# ---- Project endpoints stay behind the auth middleware ----
+
+def test_project_endpoints_require_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    hdr = {"Authorization": f"Bearer {TOKEN}"}
+    assert c.post("/api/projects/import", json={"source": "/x"}).status_code == 401
+    assert c.get("/api/projects/default/status").status_code == 401
+    assert c.get("/api/projects/default/activity").status_code == 401
+    assert c.patch("/api/projects/default", json={"archived": True}).status_code == 401
+    assert c.delete("/api/projects/default").status_code == 401
+    # with the token, the requests reach the handlers (any non-401 outcome)
+    assert c.get("/api/projects/default/activity", headers=hdr).status_code == 200
+    assert c.delete("/api/projects/default", headers=hdr).status_code == 409
 
 
 # ---- W5: diff endpoint ----
