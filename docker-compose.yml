@@ -1,0 +1,56 @@
+# AI Dev Assistant — containerized deployment (the supported isolation boundary).
+# See docs/DEPLOYMENT.md for the full guide: threat model, auth token retrieval,
+# what state lives in which volume, and resource-limit snippets.
+#
+#   docker compose up -d --build
+#   docker compose logs ada | grep "API token"   # auth token (unless ADA_API_TOKEN is set)
+
+services:
+  ada:
+    build: .
+    image: ai-dev-assistant:latest
+    container_name: ada
+    ports:
+      - "8000:8000"
+
+    environment:
+      # The API key for the 'anthropic' backend (the image's default backend).
+      # Compose passes it through from the host environment / a .env file.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # Pin the bearer token instead of the auto-generated one printed to logs:
+      # - ADA_API_TOKEN=change-me-to-a-long-random-string
+      # Cap total LLM spend per run in USD (0 / unset = no cap):
+      # - ADA_BUDGET_USD=5.00
+
+    volumes:
+      # All mutable state; everything else in the container is immutable.
+      - ada_data:/data/.ada_data      # run store (SQLite), memory, knowledge base
+      - ada_workspace:/data/workspace # agent working tree (repo checkouts, worktrees)
+      - ada_docs:/data/docs           # generated docs output
+
+    # ---- Hardening (verified working with this app) -------------------------
+    # Immutable root filesystem: the app only ever writes under /data (mounted
+    # above) and /tmp (tmpfs below), so read_only holds. If a future change
+    # breaks startup with a "Read-only file system" error, the fix is to route
+    # the new write path onto /data or /tmp — not to drop read_only.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    restart: unless-stopped
+
+    # Optional resource limits — see docs/DEPLOYMENT.md for sizing guidance.
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "2.0"
+    #       memory: 4g
+
+volumes:
+  ada_data:
+  ada_workspace:
+  ada_docs:

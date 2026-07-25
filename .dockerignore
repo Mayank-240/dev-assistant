@@ -20,19 +20,20 @@ venv/
 *.db-shm
 notes.db*
 
-# Tests, docs, and unrelated source trees (not needed to run the API)
+# Tests and docs are not needed to build or run the API.
+# (src/ IS needed — the build stage installs the package from it.)
 tests/
 docs/
-src/
 
 # Secrets & local env
 .env
 .env.*
 !.env.example
 
-# Agent/tooling state & lockfiles not used by the Docker build
+# Agent/tooling state (uv.lock stays IN the context — the uv build stage
+# installs the frozen dependency set from it)
 .ada_data/
-uv.lock
+workspace/
 
 # Editor / OS cruft
 .DS_Store
