@@ -1099,6 +1099,7 @@ function handleEvent(ev) {
       feed("✗ " + (ev.message || "error"));
       stopTimer();
       $("cancel-btn").classList.add("hidden");
+      $("pause-btn").classList.add("hidden"); $("steer-btn").classList.add("hidden");
       setConn(d.message === "cancelled" ? "cancelled" : "error", "badge-err");
       showToast(ev.message || "Run failed", d.message === "cancelled" ? "warn" : "error");
       $("run-btn").disabled = false;
@@ -1119,9 +1120,13 @@ function _attnCount() {
 async function _attnSteer(note) {
   if (!state.taskId) return false;
   try {
-    await fetch(`/api/run/${state.taskId}/steer`, {
+    const resp = await fetch(`/api/run/${state.taskId}/steer`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note }),
     });
+    if (!resp.ok) {  // e.g. the run just ended (404) — don't mark the card resolved
+      showToast("Could not deliver the answer — the run is no longer accepting input", "warn", 6000);
+      return false;
+    }
     return true;
   } catch (e) { showToast("Could not deliver the answer", "warn"); return false; }
 }
@@ -1156,7 +1161,7 @@ function renderAttention(req) {
       b.onclick = async () => {
         const denied = label === "Deny";
         const note = `[permission ${req.id || ""}] ${denied ? "DENIED" : label.toUpperCase()}: ${req.text || ""}`;
-        if (await _attnSteer(note)) resolve(denied ? "denied — the agent will plan around it" : "granted · " + (req.id || "") + " resumed", denied);
+        if (await _attnSteer(note)) resolve(denied ? "denied — the agent will plan around it" : (req.id ? "granted · " + req.id + " resumed" : "granted"), denied);
       };
       row.appendChild(b);
     });
@@ -1184,7 +1189,7 @@ function renderAttention(req) {
     const submit = async () => {
       const v = input.value.trim();
       if (!v) { input.focus(); return; }
-      if (await _attnSteer(`[answer ${req.id || ""}] ${v}`)) resolve("answered — " + req.id + " resumed");
+      if (await _attnSteer(`[answer ${req.id || ""}] ${v}`)) resolve(req.id ? "answered — " + req.id + " resumed" : "answered");
     };
     send.onclick = submit;
     input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } });
@@ -1497,7 +1502,7 @@ async function cancelTask(id) {
     await fetch(`/api/run/${id}/cancel`, { method: "POST" });
     showToast("Cancelling run…", "warn");
   } catch (e) { showToast("Cancel failed", "error"); }
-  setTimeout(loadRecent, 700);
+  setTimeout(() => { loadRecent(); loadQueue(); }, 700);
 }
 
 function deleteTask(id, label) {
@@ -1667,6 +1672,7 @@ function openParentTask(id, docs, kids, meta) {
   $("progress-bar").style.width = "100%";
   $("progress-label").textContent = `${okKids}/${state.children.length} projects`;
   state.docsId = id;
+  updateRunControls();   // historical view — the pill is final, so Pause/Steer hide
 }
 
 async function openTask(id, meta) {
@@ -1762,6 +1768,7 @@ async function openTask(id, meta) {
   $("progress-bar").style.width = "100%";
   $("progress-label").textContent = tally + " subtasks";
   state.docsId = id;
+  updateRunControls();   // historical view — the pill is final, so Pause/Steer hide
 }
 
 // ---- main views: project (tabs) · task detail · all activity · agents · empty ----

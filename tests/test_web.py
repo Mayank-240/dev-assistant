@@ -207,6 +207,28 @@ def test_run_request_has_no_repo_fields(tmp_path):
     assert r.json()["status"] == "queued"
 
 
+# ---- UI-completeness: cancelling a still-queued task must work (task-list Cancel) ----
+
+def test_cancel_queued_task_removes_it_from_the_queue(tmp_path):
+    c = _client(tmp_path)
+    c.app.state.paused = True  # keep the pump from launching a real engine
+    r = c.post("/api/run", json={"prompt": "wait your turn"})
+    tid = r.json()["task_id"]
+    assert r.json()["status"] == "queued"
+    r = c.post(f"/api/run/{tid}/cancel")
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert tid not in [p["task_id"] for p in c.app.state.runs.queue_pending()]
+    assert c.app.state.runs.get(tid)["status"] == "cancelled"
+    # cancelling again (nothing queued or running any more) is a 404, as before
+    assert c.post(f"/api/run/{tid}/cancel").status_code == 404
+
+
+def test_cancel_unknown_task_is_404(tmp_path):
+    c = _client(tmp_path)
+    r = c.post("/api/run/never-existed/cancel")
+    assert r.status_code == 404 and r.json()["ok"] is False
+
+
 # ---- F4 (decision #5): Reviews & Permissions panel + per-subtask accept/reject ----
 # The run-store review columns/methods, the engine's policy event, and
 # projects.accept_commit / vcs.cherry_pick_merge all land concurrently; the

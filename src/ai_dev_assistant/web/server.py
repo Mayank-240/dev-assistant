@@ -544,10 +544,21 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     @app.post("/api/run/{task_id}/cancel")
     async def cancel_run(task_id: str) -> JSONResponse:
         t = app.state.tasks.get(task_id)
-        if t is None or t.done():
-            return JSONResponse({"ok": False, "error": "no running task"}, status_code=404)
-        t.cancel()
-        return JSONResponse({"ok": True})
+        if t is not None and not t.done():
+            t.cancel()
+            return JSONResponse({"ok": True})
+        # Additive: the task may still be waiting in the queue — cancelling there
+        # removes the entry (so the pump can never start it) and marks the run
+        # cancelled, mirroring what a cancel-while-running ends up recording.
+        if any(p["task_id"] == task_id for p in app.state.runs.queue_pending()):
+            app.state.runs.queue_remove(task_id)
+            app.state.runs.set_status(task_id, "cancelled")
+            b = app.state.brokers.get(task_id)
+            if b is not None:
+                b.publish(Event("error", "Run cancelled by user.", {"message": "cancelled"}))
+            _publish_queue_positions()
+            return JSONResponse({"ok": True, "was": "queued"})
+        return JSONResponse({"ok": False, "error": "no running task"}, status_code=404)
 
     # ---- W5: retry/resume a stopped run ----
     @app.post("/api/tasks/{task_id}/resume")
