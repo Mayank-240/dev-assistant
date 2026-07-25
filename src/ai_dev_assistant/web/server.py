@@ -832,6 +832,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                 "passed": r.get("subtasks_passed"), "total": r.get("subtasks_total"),
                 "quality_score": r.get("quality_score"), "run_status": r.get("run_status"),
                 "parent_id": r.get("parent_id"),
+                "project": r.get("project"),  # lets the UI scope recent tasks per project
             } for r in rows])
         # Fallback: docs dirs from runs that predate the run store.
         docs = settings.docs_dir

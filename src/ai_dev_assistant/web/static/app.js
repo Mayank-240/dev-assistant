@@ -6,6 +6,7 @@ const {
   makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
   computeBudgetMeter, timelineRows, compareRowModel, isResumable,
   projectStatusLine, activityStripModel,
+  projectTaglineModel, deliveryControlModel, filterTasksByProject, projectHomeHeaderModel,
   renderDiffHtml, reviewCardModel, permissionsModel, policyFormModel, parsePolicyForm,
   sparklinePoints, childrenFromRows, childrenGridModel,
 } = window.AdaUtil;
@@ -489,6 +490,12 @@ function selectedProject() { return $("project").value || "default"; }
 
 let projectList = [];   // last-fetched /api/projects list (feeds the multi-select too)
 
+// Cached /api/projects entry for a slug (defaults to the selected project).
+function currentProjectEntry(slug) {
+  const s = slug || selectedProject();
+  return projectList.find(p => p.slug === s) || null;
+}
+
 async function loadProjects() {
   let list = [];
   try { list = await (await fetch("/api/projects")).json(); } catch (e) { list = []; }
@@ -499,6 +506,43 @@ async function loadProjects() {
   sel.innerHTML = list.map(p => `<option value="${escapeAttr(p.slug)}">${escapeHtml(p.name)}</option>`).join("");
   sel.value = list.some(p => p.slug === saved) ? saved : list[0].slug;
   renderMultiProjects();
+  updateComposerProject();
+}
+
+// ---- project-first composer: dynamic label + delivery control ----
+// Projects WITH a repo are delivered per the project policy's git_mode — the
+// per-run git_finalize checkbox only survives on the scratch default (no repo).
+function updateComposerProject() {
+  const entry = currentProjectEntry();
+  const name = (entry && entry.name) || selectedProject();
+  $("composer-label").textContent = "New task in " + name;
+  const m = deliveryControlModel(entry || {});
+  const row = $("git-finalize-row"), hint = $("delivery-hint");
+  if (m.control === "hint") {
+    row.classList.add("hidden");
+    $("git-finalize").checked = false;   // policy governs delivery; never send the per-run flag
+    hint.classList.remove("hidden");
+    hint.innerHTML = `⎇ ${escapeHtml(m.text)} ` +
+      `<button type="button" class="link-btn delivery-policy" title="Open this project's policy editor">Edit policy →</button>`;
+    hint.querySelector(".delivery-policy").onclick = () => switchView("project");
+  } else {
+    hint.classList.add("hidden");
+    hint.innerHTML = "";
+    row.classList.remove("hidden");
+  }
+}
+
+// ---- topbar identity: "<project> · ⎇ <branch> @ <shorthead>" (+ dirty/archived) ----
+function renderTagline(st) {
+  const el = $("project-tagline");
+  if (!el) return;
+  const slug = selectedProject();
+  const entry = currentProjectEntry(slug);
+  const m = projectTaglineModel((entry && entry.name) || slug, st);
+  el.innerHTML = escapeHtml(m.name) +
+    (m.branchText ? ` · ⎇ ${escapeHtml(m.branchText)}` : "") +
+    (m.dirty ? ' <span class="ps-dirty" title="Uncommitted changes in the checkout">●</span>' : "") +
+    (m.archived ? ' <span class="ps-archived">archived</span>' : "");
 }
 
 // ---- F3: cross-project fan-out composer (multi-select + stagger) ----
@@ -569,17 +613,16 @@ async function submitProjectModal() {
     closeProjectModal();
     await loadProjects();
     $("project").value = created.slug;
-    localStorage.setItem("ada-project", created.slug);
     showToast((source ? "Project imported · " : "Project created · ") + (created.name || created.slug), "success");
-    refreshProjectPulse(true);
-    if (currentView === "memory") loadMemory();
-    if (currentView === "graph") loadGraph();
+    onProjectChange();   // persists the selection + refreshes tagline, composer, recent & views
   }
 }
 
 function onProjectChange() {
   localStorage.setItem("ada-project", selectedProject());
+  updateComposerProject();
   refreshProjectPulse(true);
+  loadRecent();                     // recent tasks are scoped to the selected project
   if (currentView === "project") loadProjectHome();
   if (currentView === "memory") loadMemory();
   if (currentView === "graph") loadGraph();
@@ -594,6 +637,7 @@ async function loadProjectStatus() {
     const resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/status");
     if (resp.ok) st = await resp.json();
   } catch (e) { /* leave hidden */ }
+  renderTagline(st);   // topbar identity updates on the same cadence (switch + poll)
   const m = projectStatusLine(st);
   if (!m.visible) { el.classList.add("hidden"); el.innerHTML = ""; return; }
   el.classList.remove("hidden");
@@ -1147,11 +1191,19 @@ async function cancelRun() {
 }
 
 // ---- recent tasks + doc viewer ----
+let recentShowAll = false;   // false (default) = only the selected project's tasks
+
 async function loadRecent() {
   try {
-    const items = await (await fetch("/api/tasks")).json();
+    const all = await (await fetch("/api/tasks")).json();
+    const items = filterTasksByProject(all, selectedProject(), recentShowAll);
     const ul = $("recent-list");
-    if (!items.length) { ul.innerHTML = '<li class="muted">none yet</li>'; return; }
+    if (!items.length) {
+      ul.innerHTML = all.length
+        ? '<li class="muted">none in this project</li>'
+        : '<li class="muted">none yet</li>';
+      return;
+    }
     ul.innerHTML = "";
     items.forEach(it => {
       const li = document.createElement("li");
@@ -1580,13 +1632,20 @@ async function loadProjectHome() {
   let list = [];
   try { list = await (await fetch("/api/projects")).json(); } catch (e) { list = []; }
   const entry = (Array.isArray(list) ? list : []).find(p => p.slug === slug) || { slug, name: slug };
-  $("ph-name").textContent = entry.name || slug;
-  renderProjectHomeStatus(slug);
+  const h = projectHomeHeaderModel(entry);
+  $("ph-name").textContent = h.name || slug;
+  $("ph-meta").innerHTML =
+    `<span class="ph-origin ph-origin-${escapeAttr(h.origin)}">${escapeHtml(h.origin)}</span>` +
+    (h.root ? `<code class="ph-root" title="${escapeAttr(h.root)}">${escapeHtml(h.root)}</code>`
+            : '<span class="muted">no repository bound — tasks run greenfield</span>');
+  renderProjectHomeStatus(slug, entry);
   renderProjectHomePolicy(entry);
   renderProjectHomeRuns(slug);
 }
 
-async function renderProjectHomeStatus(slug) {
+async function renderProjectHomeStatus(slug, entry) {
+  entry = entry || currentProjectEntry(slug) || { slug, name: slug };
+  const h = projectHomeHeaderModel(entry);
   let st = null;
   try {
     const r = await fetch("/api/projects/" + encodeURIComponent(slug) + "/status");
@@ -1597,7 +1656,14 @@ async function renderProjectHomeStatus(slug) {
     ? `<span class="ps-branch">⎇ ${escapeHtml(m.text)}</span>` +
       (m.dirty ? '<span class="ps-dirty" title="Uncommitted changes in the checkout">●</span>' : "") +
       (m.archived ? '<span class="ps-archived">archived</span>' : "")
-    : '<span class="muted">No repository info for this project.</span>';
+    : `<span class="muted">${escapeHtml(h.scratch
+        ? h.emptyText : "No repository info for this project.")}</span>`;
+  const idx = $("ph-indexed");
+  if (idx) {
+    const short = st && st.last_indexed_commit ? String(st.last_indexed_commit).slice(0, 7) : "";
+    idx.classList.toggle("hidden", h.scratch);
+    idx.textContent = h.scratch ? "" : (short ? "last indexed @ " + short : "not indexed yet");
+  }
   let act = null;
   try {
     const r = await fetch("/api/projects/" + encodeURIComponent(slug) + "/activity");
@@ -2220,7 +2286,16 @@ $("review-modal-close").onclick = closeReviewPanel;
 $("review-modal").onclick = (e) => { if (e.target === $("review-modal")) closeReviewPanel(); };
 document.querySelectorAll("#review-modal .tab").forEach(t => t.onclick = () => selectReviewTab(t.dataset.rtab));
 $("ph-refresh").onclick = loadProjectHome;
+$("ph-new").onclick = openProjectModal;
 $("ph-policy-save").onclick = saveProjectPolicy;
+$("recent-scope").onclick = () => {
+  recentShowAll = !recentShowAll;
+  $("recent-scope").setAttribute("aria-pressed", String(recentShowAll));
+  $("recent-scope").title = recentShowAll
+    ? "Showing tasks from all projects — click to scope to the selected project"
+    : "Show tasks from all projects (default: selected project only)";
+  loadRecent();
+};
 $("roster-modal-close").onclick = closeRosterModal;
 $("roster-modal").onclick = (e) => { if (e.target === $("roster-modal")) closeRosterModal(); };
 // a11y: Escape closes the topmost dialog; Tab is trapped inside an open dialog
@@ -2262,8 +2337,13 @@ document.querySelectorAll("#fb-stars button").forEach(b => b.onclick = () => {
   sendFeedback({});
 });
 loadConfig();
-loadProjects().then(() => refreshProjectPulse(true));
-loadRecent();
+loadProjects().then(() => {
+  refreshProjectPulse(true);
+  loadRecent();   // recent tasks are scoped to the selected project — wait for it
+  // Project-first landing: PROJECT HOME is the default view. Opening/attaching a
+  // task (openTask/attachToRun/launchRun) still switches to the run view.
+  if (!state.taskId && !state.docsId) switchView("project");
+});
 loadQueue();
 setInterval(loadQueue, 4000);  // keep the queue panel + chip fresh
 setInterval(() => {            // keep the project activity strip (+ dashboard table) live

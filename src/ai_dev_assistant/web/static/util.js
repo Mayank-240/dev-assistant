@@ -432,6 +432,66 @@
     return { ok: !errors.length, errors, policy };
   }
 
+  // ===========================================================
+  // Project-first restructure: pure models for the topbar identity
+  // line, composer delivery control, recent-task scoping and the
+  // Project Home header.
+  // ===========================================================
+
+  // Topbar identity: "<project name> · <branch> @ <shorthead>" (+ dirty/archived
+  // flags). Falls back to the bare project name when there is no repo status.
+  // Text fields are plain — the caller escapes before injecting.
+  function projectTaglineModel(name, st) {
+    const line = projectStatusLine(st);
+    const n = String(name || "");
+    return {
+      name: n,
+      branchText: line.visible ? line.text : "",
+      text: line.visible ? n + " · ⎇ " + line.text : n,
+      dirty: line.dirty,
+      archived: line.archived,
+    };
+  }
+
+  // Composer delivery control. A project WITH a repo (non-empty root) is governed
+  // by its policy git_mode -> render the hint line; only the scratch default
+  // (no repo) keeps the per-run git_finalize checkbox.
+  function deliveryControlModel(entry) {
+    entry = entry || {};
+    if (!entry.root) return { control: "checkbox", gitMode: "", text: "" };
+    const gitMode = (entry.policy && entry.policy.git_mode) || "branch";
+    return {
+      control: "hint",
+      gitMode,
+      text: "Delivery: ada/<task-id> branch for review — policy: " + gitMode,
+    };
+  }
+
+  // Recent-tasks scoping: by default only the selected project's rows.
+  // Rows without a project value (legacy servers / docs-dir fallback) are
+  // never hidden — they cannot be scoped.
+  function filterTasksByProject(items, slug, showAll) {
+    const list = Array.isArray(items) ? items : [];
+    if (showAll || !slug) return list.slice();
+    return list.filter(it => (!it || it.project == null) ? true : it.project === slug);
+  }
+
+  // Project Home header: origin badge + root path, plus the purposeful
+  // empty state for the scratch default (no repo bound).
+  function projectHomeHeaderModel(entry) {
+    entry = entry || {};
+    const root = String(entry.root || "");
+    return {
+      name: String(entry.name || entry.slug || ""),
+      origin: String(entry.origin || "greenfield"),
+      root,
+      scratch: !root,
+      emptyText: !root
+        ? "Scratch project — tasks run greenfield. Create or import a project to bind a repository."
+        : "",
+    };
+  }
+
   // Quality scores (chronological) -> SVG polyline geometry for a sparkline.
   // Nulls are skipped; fewer than 2 points -> not drawable (show the number instead).
   function sparklinePoints(values, w, h, pad) {
@@ -457,6 +517,7 @@
     makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
     computeBudgetMeter, timelineRows, compareRowModel, RESUMABLE_STATUSES, isResumable,
     projectStatusLine, activityStripModel,
+    projectTaglineModel, deliveryControlModel, filterTasksByProject, projectHomeHeaderModel,
     renderDiffHtml, reviewCardModel, permissionsModel, policyFormModel, parsePolicyForm,
     sparklinePoints,
     makeChildRecord, childrenFromRows, childrenGridModel,

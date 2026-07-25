@@ -66,6 +66,15 @@ def test_quality_and_events_endpoints(tmp_path):
     assert c.get("/api/tasks/does-not-exist/trace").json() == []
 
 
+def test_tasks_list_rows_carry_project(tmp_path):
+    """GET /api/tasks exposes each run's project (UI scopes recent tasks by it)."""
+    c = _client(tmp_path)
+    c.app.state.runs.start("run-proj", "scoped task", title="Scoped", project="default")
+    rows = c.get("/api/tasks").json()
+    row = next(r for r in rows if r["id"] == "run-proj")
+    assert row["project"] == "default"
+
+
 # ---- F1/F6: project lifecycle endpoints ----
 
 def _seed_git_repo(path):

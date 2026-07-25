@@ -31,7 +31,7 @@
           <div class="logo" aria-hidden="true">◆</div>
           <div>
             <h1>AI Dev Assistant</h1>
-            <p class="tagline">orchestrator · 14 specialist agents · memory · graph</p>
+            <p class="tagline" id="project-tagline" title="Selected project · repository state">…</p>
           </div>
         </div>
       </div>
@@ -50,8 +50,18 @@
       <aside class="sidebar">
         <div class="sidebar-inner">
 
+          <section class="project-block card" title="The project owns the repository, memory & knowledge graph tasks run in">
+            <span class="block-label">Project</span>
+            <div class="proj-row">
+              <select id="project" class="select" aria-label="Selected project"></select>
+              <button id="new-project" class="ghost" type="button" title="New or import project" aria-label="New or import project">＋</button>
+            </div>
+            <div id="project-status" class="proj-status hidden" title="Repository state of the selected project"></div>
+            <div id="project-activity" class="proj-activity hidden" role="status" aria-live="polite" title="What is going on in this project right now"></div>
+          </section>
+
           <section class="composer card">
-            <label for="prompt">New task</label>
+            <label for="prompt" id="composer-label">New task</label>
             <div id="continue-banner" class="continue-banner hidden">
               <span>↻ Continuing <b id="continue-ref"></b> — your prompt builds on its workspace &amp; context</span>
               <button id="continue-clear" type="button" title="Start a fresh task instead" aria-label="Start a fresh task instead">✕</button>
@@ -59,14 +69,6 @@
             <textarea id="prompt" rows="4" placeholder="e.g. Add input validation to a sample function and document it"></textarea>
             <input id="task-title" class="title-input" type="text" maxlength="80"
                    placeholder="Title (optional) — auto-generated from the task if left blank" />
-            <label class="ctl ctl-project" title="The project owns the repository, memory & knowledge graph this run works in">Project
-              <div class="proj-row">
-                <select id="project" class="select"></select>
-                <button id="new-project" class="ghost" type="button" title="New or import project" aria-label="New or import project">＋</button>
-              </div>
-            </label>
-            <div id="project-status" class="proj-status hidden" title="Repository state of the selected project"></div>
-            <div id="project-activity" class="proj-activity hidden" role="status" aria-live="polite" title="What is going on in this project right now"></div>
             <label class="check" title="Fan this task out across several projects — one child task per project, plus one rolled-up report"><input type="checkbox" id="multi-toggle" /> Multiple projects</label>
             <div id="multi-box" class="multi-box hidden">
               <div id="multi-projects" class="multi-projects" role="group" aria-label="Projects to fan this task out across"></div>
@@ -92,7 +94,8 @@
                 <input id="budget" class="num" type="number" min="0" step="0.5" placeholder="none" />
               </label>
             </div>
-            <label class="check" title="At the end, commit the run's workspace to a new branch"><input type="checkbox" id="git-finalize" /> Commit results to a new branch</label>
+            <label class="check" id="git-finalize-row" title="At the end, commit the run's workspace to a new branch"><input type="checkbox" id="git-finalize" /> Commit results to a new branch</label>
+            <div id="delivery-hint" class="delivery-hint hidden" title="Delivery is governed by the project's git_mode policy"></div>
             <button id="run-btn">Run task →</button>
             <label class="check"><input type="checkbox" id="review-plan" /> Review plan before running</label>
             <p class="hint">Runs via your Claude Code login — no API key needed.</p>
@@ -121,7 +124,12 @@
           </section>
 
           <section class="recent">
-            <span class="recent-label">Recent tasks <button id="refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh recent tasks">⟳</button></span>
+            <span class="recent-label">Recent tasks
+              <span class="q-controls">
+                <button id="recent-scope" type="button" class="ghost" title="Show tasks from all projects (default: selected project only)" aria-pressed="false">all</button>
+                <button id="refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh recent tasks">⟳</button>
+              </span>
+            </span>
             <ul id="recent-list"><li class="muted">none yet</li></ul>
           </section>
 
@@ -329,15 +337,19 @@
             <div class="view-header">
               <div>
                 <h1 id="ph-name">Project home</h1>
-                <p>Repository status, live activity, policy, and run history for the selected project.</p>
+                <p id="ph-meta" class="ph-meta">Repository status, live activity, policy, and run history for the selected project.</p>
               </div>
-              <button id="ph-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh project home">⟳</button>
+              <div class="seg-wrap">
+                <button id="ph-new" type="button" class="ghost-btn" title="Create a new project or import an existing repository">＋ New / Import</button>
+                <button id="ph-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh project home">⟳</button>
+              </div>
             </div>
             <div class="ph-grid">
               <div class="card">
                 <span class="kicker">Repository &amp; activity</span>
                 <div id="ph-status" class="proj-status" title="Repository state of the selected project"><span class="muted">No repository info.</span></div>
                 <div id="ph-activity" class="proj-activity pa-idle" role="status" aria-live="polite"><span class="pa-dot" aria-hidden="true"></span>idle</div>
+                <div id="ph-indexed" class="ph-indexed muted hidden" title="Last commit indexed into the knowledge graph"></div>
               </div>
               <div class="card">
                 <span class="kicker">Policy — applies to every task in this project</span>
