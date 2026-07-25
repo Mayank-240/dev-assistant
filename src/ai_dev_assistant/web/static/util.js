@@ -492,6 +492,95 @@
     };
   }
 
+  // ===========================================================
+  // Project-first IA: sidebar project rows, project tab state,
+  // merged task-list rows and the composer heading/delivery model.
+  // ===========================================================
+
+  // /api/projects list + {slug: activity body} -> sidebar nav rows.
+  // `multi` = { activity, hasRuns } for the "⋔ Across projects" pseudo-entry,
+  // appended only when there is (or was) cross-project work to show.
+  // Text fields are plain — the caller escapes before injecting.
+  function sidebarProjectRows(projects, actBySlug, currentSlug, multi) {
+    const rows = (Array.isArray(projects) ? projects : []).map(p => {
+      const m = activityStripModel((actBySlug || {})[p.slug]);
+      return {
+        slug: String(p.slug || ""), name: String(p.name || p.slug || ""),
+        state: m.state, archived: !!p.archived,
+        current: p.slug === currentSlug, multi: false,
+      };
+    });
+    const mm = multi || {};
+    const multiModel = activityStripModel(mm.activity);
+    if (multiModel.running || multiModel.queued || mm.hasRuns) {
+      rows.push({
+        slug: "multi", name: "⋔ Across projects", state: multiModel.state,
+        archived: false, current: currentSlug === "multi", multi: true,
+      });
+    }
+    return rows;
+  }
+
+  // Which tabs a project shows, with the active one resolved. The "multi"
+  // pseudo-entry only has its cross-project task list.
+  const _TAB_LABELS = {
+    overview: "Overview", tasks: "Tasks", knowledge: "Knowledge", settings: "Settings",
+  };
+  function projectTabsModel(slug, active) {
+    const all = slug === "multi"
+      ? ["tasks"] : ["overview", "tasks", "knowledge", "settings"];
+    const act = all.includes(active) ? active : all[0];
+    return all.map(t => ({ id: t, label: _TAB_LABELS[t], selected: t === act }));
+  }
+
+  // /api/projects/{slug}/runs (or /api/tasks rows) + /activity -> one merged
+  // task list: queued first, then running, then history — deduped by id, with
+  // the live status winning and stored metrics folded in.
+  function projectTaskRows(runs, activity) {
+    const act = activity || {};
+    const rows = [];
+    const idx = {};
+    const push = (r) => { idx[r.id] = rows.length; rows.push(r); };
+    (act.queued || []).forEach(q => push({
+      id: q.id, title: q.title || q.id, status: "queued",
+      position: q.position != null ? q.position : null,
+      quality: null, cost: null, tests: null, run_status: null, live: true,
+    }));
+    (act.running || []).forEach(r => {
+      if (r.id in idx) return;
+      push({ id: r.id, title: r.title || r.id, status: "running", position: null,
+             quality: null, cost: null, tests: null, run_status: null, live: true });
+    });
+    (runs || []).forEach(r => {
+      if (r.id in idx) {  // live row wins on status; fold the stored metrics in
+        const row = rows[idx[r.id]];
+        if (row.quality == null && r.quality_score != null) row.quality = r.quality_score;
+        if (row.cost == null && r.cost_usd != null) row.cost = r.cost_usd;
+        if (!row.title || row.title === row.id) row.title = r.title || row.title;
+        return;
+      }
+      const status = r.status || "";
+      push({
+        id: r.id, title: r.title || r.id, status, position: null,
+        quality: r.quality_score != null ? r.quality_score : null,
+        cost: r.cost_usd != null ? r.cost_usd : null,
+        tests: r.tests || null, run_status: r.run_status || null,
+        live: status === "running" || status === "queued",
+      });
+    });
+    return rows;
+  }
+
+  // Composer heading + delivery control for the selected project entry.
+  function composerModel(entry) {
+    entry = entry || {};
+    const name = entry.name || entry.slug || "this project";
+    return {
+      heading: "What should we work on in " + name + "?",
+      delivery: deliveryControlModel(entry),
+    };
+  }
+
   // Quality scores (chronological) -> SVG polyline geometry for a sparkline.
   // Nulls are skipped; fewer than 2 points -> not drawable (show the number instead).
   function sparklinePoints(values, w, h, pad) {
@@ -521,6 +610,7 @@
     renderDiffHtml, reviewCardModel, permissionsModel, policyFormModel, parsePolicyForm,
     sparklinePoints,
     makeChildRecord, childrenFromRows, childrenGridModel,
+    sidebarProjectRows, projectTabsModel, projectTaskRows, composerModel,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = AdaUtil;

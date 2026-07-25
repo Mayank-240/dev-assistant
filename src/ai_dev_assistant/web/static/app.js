@@ -9,6 +9,7 @@ const {
   projectTaglineModel, deliveryControlModel, filterTasksByProject, projectHomeHeaderModel,
   renderDiffHtml, reviewCardModel, permissionsModel, policyFormModel, parsePolicyForm,
   sparklinePoints, childrenFromRows, childrenGridModel,
+  sidebarProjectRows, projectTabsModel, projectTaskRows, composerModel,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -453,9 +454,9 @@ function renderAgentModal(a) {
 function getControls() {
   const b = parseFloat($("budget").value);
   const t = $("task-title").value.trim();
-  // F3: "Multiple projects" checked -> send projects+stagger (2+ slugs fan out;
+  // F3: "Work across projects…" open -> send projects+stagger (2+ slugs fan out;
   // a single slug behaves exactly like `project` server-side).
-  const multi = $("multi-toggle").checked ? selectedMultiProjects() : [];
+  const multi = multiOpen ? selectedMultiProjects() : [];
   // Per-run repo binding is gone — the selected *project* owns the repository.
   return {
     effort: $("effort").value, budget: (b && b > 0) ? b : null, title: t || null,
@@ -485,10 +486,20 @@ function clearContinue() {
   $("prompt").placeholder = "e.g. Add input validation to a sample function and document it";
 }
 
-// ---- projects (scope memory + knowledge graph) ----
-function selectedProject() { return $("project").value || "default"; }
+// ---- project-first navigation state ----
+// The selected project drives the whole main area. "multi" is the pseudo-entry
+// for cross-project fan-out parents (it only has a task list).
+let currentProject = "default";
+let currentMainView = "project";   // project | task | activity
+let currentTab = "overview";       // overview | tasks | knowledge | settings
+let currentKnow = "memory";        // memory | graph | files
 
-let projectList = [];   // last-fetched /api/projects list (feeds the multi-select too)
+function selectedProject() { return currentProject || "default"; }
+
+let projectList = [];        // last-fetched /api/projects list
+let projectActivity = {};    // slug -> /activity body (feeds sidebar state dots)
+let multiActivity = null;    // /api/projects/multi/activity body
+let multiHasRuns = false;    // any historical fan-out parents?
 
 // Cached /api/projects entry for a slug (defaults to the selected project).
 function currentProjectEntry(slug) {
@@ -501,22 +512,70 @@ async function loadProjects() {
   try { list = await (await fetch("/api/projects")).json(); } catch (e) { list = []; }
   if (!list.length) list = [{ slug: "default", name: "Default" }];
   projectList = list;
-  const sel = $("project");
-  const saved = localStorage.getItem("ada-project") || sel.value || "default";
-  sel.innerHTML = list.map(p => `<option value="${escapeAttr(p.slug)}">${escapeHtml(p.name)}</option>`).join("");
-  sel.value = list.some(p => p.slug === saved) ? saved : list[0].slug;
+  const saved = localStorage.getItem("ada-project") || currentProject || "default";
+  if (currentProject !== "multi") {
+    currentProject = list.some(p => p.slug === saved) ? saved : list[0].slug;
+  }
+  renderSidebar();
   renderMultiProjects();
   updateComposerProject();
+  renderProjectHeader(null);
 }
 
-// ---- project-first composer: dynamic label + delivery control ----
+// ---- sidebar: one nav row per project + the "⋔ Across projects" pseudo-entry ----
+function renderSidebar() {
+  const ul = $("project-list");
+  if (!ul) return;
+  const rows = sidebarProjectRows(projectList, projectActivity, currentProject,
+                                  { activity: multiActivity, hasRuns: multiHasRuns });
+  ul.innerHTML = "";
+  rows.forEach(r => {
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "proj-item pl-state-" + r.state
+      + (r.archived ? " pl-archived" : "") + (r.multi ? " pl-multi" : "");
+    btn.setAttribute("aria-current", r.current ? "true" : "false");
+    btn.title = r.name + (r.state !== "idle" ? " · " + r.state : "")
+      + (r.archived ? " · archived" : "");
+    btn.innerHTML = `<span class="pl-dot" aria-hidden="true"></span>` +
+      `<span class="pl-name">${escapeHtml(r.name)}</span>`;
+    btn.onclick = () => selectProject(r.slug);
+    li.appendChild(btn);
+    ul.appendChild(li);
+  });
+  const nav = $("nav-activity");
+  if (nav) {
+    if (currentMainView === "activity") nav.setAttribute("aria-current", "page");
+    else nav.removeAttribute("aria-current");
+  }
+}
+
+// Refresh per-project activity (sidebar state dots + overview strip inputs).
+async function refreshSidebarActivity() {
+  const fetchAct = async (slug) => {
+    try {
+      const resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/activity");
+      return resp.ok ? await resp.json() : null;
+    } catch (e) { return null; }
+  };
+  const shown = projectList.slice(0, 20);
+  const acts = await Promise.all([...shown.map(p => fetchAct(p.slug)), fetchAct("multi")]);
+  multiActivity = acts.pop();
+  multiHasRuns = !!(multiActivity && (multiActivity.recent || []).length);
+  projectActivity = {};
+  shown.forEach((p, i) => { projectActivity[p.slug] = acts[i]; });
+  renderSidebar();
+}
+
+// ---- work composer: dynamic heading + delivery control ----
 // Projects WITH a repo are delivered per the project policy's git_mode — the
 // per-run git_finalize checkbox only survives on the scratch default (no repo).
 function updateComposerProject() {
   const entry = currentProjectEntry();
-  const name = (entry && entry.name) || selectedProject();
-  $("composer-label").textContent = "New task in " + name;
-  const m = deliveryControlModel(entry || {});
+  const cm = composerModel(entry || { slug: selectedProject() });
+  $("composer-heading").textContent = cm.heading;
+  const m = cm.delivery;
   const row = $("git-finalize-row"), hint = $("delivery-hint");
   if (m.control === "hint") {
     row.classList.add("hidden");
@@ -524,7 +583,7 @@ function updateComposerProject() {
     hint.classList.remove("hidden");
     hint.innerHTML = `⎇ ${escapeHtml(m.text)} ` +
       `<button type="button" class="link-btn delivery-policy" title="Open this project's policy editor">Edit policy →</button>`;
-    hint.querySelector(".delivery-policy").onclick = () => switchView("project");
+    hint.querySelector(".delivery-policy").onclick = () => selectProjectTab("settings");
   } else {
     hint.classList.add("hidden");
     hint.innerHTML = "";
@@ -532,17 +591,25 @@ function updateComposerProject() {
   }
 }
 
-// ---- topbar identity: "<project> · ⎇ <branch> @ <shorthead>" (+ dirty/archived) ----
-function renderTagline(st) {
-  const el = $("project-tagline");
-  if (!el) return;
-  const slug = selectedProject();
-  const entry = currentProjectEntry(slug);
-  const m = projectTaglineModel((entry && entry.name) || slug, st);
-  el.innerHTML = escapeHtml(m.name) +
-    (m.branchText ? ` · ⎇ ${escapeHtml(m.branchText)}` : "") +
-    (m.dirty ? ' <span class="ps-dirty" title="Uncommitted changes in the checkout">●</span>' : "") +
-    (m.archived ? ' <span class="ps-archived">archived</span>' : "");
+// ---- project header: serif name + origin badge + branch chip + root path ----
+function renderProjectHeader(st) {
+  const isMulti = currentProject === "multi";
+  const entry = currentProjectEntry() || { slug: currentProject, name: currentProject };
+  const h = projectHomeHeaderModel(entry);
+  $("proj-name").textContent = isMulti ? "⋔ Across projects" : (h.name || currentProject);
+  const origin = $("proj-origin");
+  origin.classList.toggle("hidden", isMulti);
+  origin.textContent = h.origin;
+  const m = projectTaglineModel(h.name, st);
+  const branch = $("proj-branch");
+  branch.classList.toggle("hidden", isMulti || !m.branchText);
+  branch.textContent = m.branchText ? "⎇ " + m.branchText : "";
+  $("proj-dirty").classList.toggle("hidden", isMulti || !m.dirty);
+  $("proj-archived").classList.toggle("hidden", isMulti || !(entry && entry.archived));
+  const root = $("proj-root");
+  root.classList.toggle("hidden", isMulti || !h.root);
+  root.textContent = h.root;
+  root.title = h.root;
 }
 
 // ---- F3: cross-project fan-out composer (multi-select + stagger) ----
@@ -561,10 +628,20 @@ function selectedMultiProjects() {
   return [...document.querySelectorAll("#multi-projects .mp-check:checked")].map(cb => cb.value);
 }
 
+// "Work across projects…" — a link-button reveals the fan-out multi-select.
+let multiOpen = false;
 function toggleMultiBox() {
-  const on = $("multi-toggle").checked;
-  $("multi-box").classList.toggle("hidden", !on);
-  if (on) renderMultiProjects();
+  multiOpen = !multiOpen;
+  $("multi-box").classList.toggle("hidden", !multiOpen);
+  $("multi-open").setAttribute("aria-expanded", String(multiOpen));
+  $("multi-open").textContent = multiOpen ? "Single project" : "Work across projects…";
+  if (multiOpen) {
+    renderMultiProjects();
+    // pre-check the current project so fan-out starts from where the user is
+    const cb = document.querySelector(
+      `#multi-projects .mp-check[value="${CSS.escape(selectedProject())}"]`);
+    if (cb) cb.checked = true;
+  }
 }
 
 // ---- F1: New / Import project dialog ----
@@ -612,60 +689,57 @@ async function submitProjectModal() {
   if (created && created.slug) {
     closeProjectModal();
     await loadProjects();
-    $("project").value = created.slug;
     showToast((source ? "Project imported · " : "Project created · ") + (created.name || created.slug), "success");
-    onProjectChange();   // persists the selection + refreshes tagline, composer, recent & views
+    selectProject(created.slug);
   }
 }
 
-function onProjectChange() {
-  localStorage.setItem("ada-project", selectedProject());
+// ---- select a project: the main area becomes that project ----
+function selectProject(slug, tab) {
+  currentProject = slug;
+  if (slug !== "multi") localStorage.setItem("ada-project", slug);
+  showMainView("project");
   updateComposerProject();
+  renderProjectHeader(null);
+  renderSidebar();
+  selectProjectTab(tab || (slug === "multi" ? "tasks" : currentTab), true);
   refreshProjectPulse(true);
-  loadRecent();                     // recent tasks are scoped to the selected project
-  if (currentView === "project") loadProjectHome();
-  if (currentView === "memory") loadMemory();
-  if (currentView === "graph") loadGraph();
+  loadRecent();
 }
 
-// ---- F1/F4: project status line + live activity strip (under the selector) ----
+// ---- project header status + overview activity strip ----
 async function loadProjectStatus() {
   const slug = selectedProject();
-  const el = $("project-status");
+  if (slug === "multi") { renderProjectHeader(null); return; }
   let st = null;
   try {
     const resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/status");
     if (resp.ok) st = await resp.json();
-  } catch (e) { /* leave hidden */ }
-  renderTagline(st);   // topbar identity updates on the same cadence (switch + poll)
-  const m = projectStatusLine(st);
-  if (!m.visible) { el.classList.add("hidden"); el.innerHTML = ""; return; }
-  el.classList.remove("hidden");
-  el.innerHTML =
-    `<span class="ps-branch">⎇ ${escapeHtml(m.text)}</span>` +
-    (m.dirty ? '<span class="ps-dirty" title="Uncommitted changes in the checkout">●</span>' : "") +
-    (m.archived ? '<span class="ps-archived">archived</span>' : "");
+  } catch (e) { /* leave as-is */ }
+  renderProjectHeader(st);
+  renderSettingsRepo(st);
 }
 
 async function loadProjectActivity() {
   const slug = selectedProject();
-  const el = $("project-activity");
+  const el = $("ov-activity");
   let act = null;
   try {
     const resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/activity");
     if (resp.ok) act = await resp.json();
   } catch (e) { /* leave as-is */ }
-  if (!act) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  projectActivity[slug] = act;
   const m = activityStripModel(act);
-  el.classList.remove("hidden");
   el.className = "proj-activity pa-" + m.state;
   el.innerHTML = `<span class="pa-dot" aria-hidden="true"></span>${escapeHtml(m.text)}`;
 }
 
-// One "pulse" refreshes the activity strip every tick and the (heavier, git-backed)
-// status line every third tick — or both immediately when force=true.
+// One "pulse" refreshes the sidebar dots + overview strip every tick and the
+// (heavier, git-backed) header status every third tick — or all immediately
+// when force=true.
 let _pulseN = 0;
 function refreshProjectPulse(force) {
+  refreshSidebarActivity();
   loadProjectActivity();
   if (force || _pulseN % 3 === 0) loadProjectStatus();
   _pulseN++;
@@ -978,9 +1052,9 @@ function handleEvent(ev) {
       $("run-btn").disabled = false;
       loadRecent();
       loadQueue();
-      if (currentView === "memory") loadMemory();
-      if (currentView === "graph") loadGraph();
-      if (currentView === "files") loadFiles();
+      if (knowVisible("memory")) loadMemory();
+      if (knowVisible("graph")) loadGraph();
+      if (knowVisible("files")) loadFiles();
       break;
     case "error":
       if (ev.message === "unknown task") {  // live stream gone (e.g. server restarted) — show docs
@@ -1008,7 +1082,7 @@ function handleEvent(ev) {
 function runTask() {
   const prompt = $("prompt").value.trim();
   if (!prompt) { $("prompt").focus(); return; }
-  if ($("multi-toggle").checked && !selectedMultiProjects().length) {
+  if (multiOpen && !selectedMultiProjects().length) {
     showToast("Pick at least one project to fan out across (2+ run in parallel)", "warn");
     return;
   }
@@ -1017,7 +1091,7 @@ function runTask() {
 }
 
 async function requestPlan(prompt) {
-  switchView("run");
+  openTaskDetail("Plan review");
   $("run-btn").disabled = true;
   $("empty").classList.add("hidden");
   $("run-view").classList.add("hidden");
@@ -1121,13 +1195,13 @@ function approvePlan() {
 
 function discardPlan() {
   $("plan-editor").classList.add("hidden");
-  $("empty").classList.remove("hidden");
   $("run-btn").disabled = false;
   clearContinue();
+  backToProject();
 }
 
 async function launchRun(body, prompt) {
-  switchView("run");
+  openTaskDetail((body && body.title) || prompt);
   $("run-btn").disabled = true;
   // per-run budget wins; otherwise fall back to the server's ADA_BUDGET_USD default
   state.budgetUsd = (body && body.budget) || serverConfig.budget_usd || 0;
@@ -1166,7 +1240,7 @@ function connectWS(taskId) {
 // so a running task is reconstructed live, and a recent one shows completely).
 function attachToRun(id, prompt) {
   $("run-btn").disabled = true;
-  switchView("run");
+  openTaskDetail(prompt || id);
   // reattaching we no longer know the run's own cap — use the server default (may be 0)
   state.budgetUsd = serverConfig.budget_usd || 0;
   resetRunView(prompt || id);
@@ -1190,58 +1264,99 @@ async function cancelRun() {
   try { await fetch(`/api/run/${state.taskId}/cancel`, { method: "POST" }); } catch (e) { /* ignore */ }
 }
 
-// ---- recent tasks + doc viewer ----
-let recentShowAll = false;   // false (default) = only the selected project's tasks
+// ---- the project's task lists (Overview: 3 most recent · Tasks tab: all) ----
+
+// Render merged task rows (util.projectTaskRows) into a .task-list <ul>.
+function renderTaskRows(ul, rows, limit) {
+  if (!ul) return;
+  const items = limit ? rows.slice(0, limit) : rows;
+  if (!items.length) {
+    ul.innerHTML = '<li class="muted">No tasks in this project yet.</li>';
+    return;
+  }
+  ul.innerHTML = "";
+  items.forEach(it => {
+    const li = document.createElement("li");
+    li.className = "item";
+    li.dataset.id = it.id;
+    const status = it.status || "";
+    const cost = (it.cost != null && it.cost > 0) ? fmtCost(it.cost) : "";
+    const quality = it.quality != null ? `<span class="r-quality">quality ${escapeHtml(String(it.quality))}/100</span>` : "";
+    const tests = it.tests === "passed" ? '<span class="r-tests-pass">tests ✓</span>'
+                : it.tests === "failed" ? '<span class="r-tests-fail">tests ✗</span>' : "";
+    const statusLabel = status === "queued" && it.position != null ? `queued · #${it.position}` : status;
+    const meta = `<div class="r-meta">${status ? `<span class="r-status ${escapeAttr(status)}"><span class="r-status-dot"></span>${escapeHtml(statusLabel)}</span>` : ""}` +
+                 `${quality}${cost ? `<span class="r-cost">${cost}</span>` : ""}${tests}</div>`;
+    const titleText = it.title || it.id;
+    const cancelBtn = (status === "running" || status === "queued")
+      ? `<button type="button" class="r-act r-cancel" title="Cancel this run">Cancel</button>` : "";
+    // W5: retry/resume affordance on runs that stopped short of completion
+    const resumeBtn = isResumable(status)
+      ? `<button type="button" class="r-act r-resume" title="Retry / resume this run">Resume</button>` : "";
+    li.innerHTML = `<div class="r-title">${escapeHtml(titleText)}</div>` +
+      `${meta}<div class="r-actions"><button type="button" class="r-files">Files →</button>` +
+      `${cancelBtn}${resumeBtn}<button type="button" class="r-act r-delete" title="Delete this task">Delete</button></div>`;
+    makeActivatable(li, (e) => {
+      if (e && e.target && e.target.closest("button")) return;
+      if (it.live) attachToRun(it.id, titleText); else openTask(it.id, it);
+    }, `Open task ${titleText}`);
+    li.querySelector(".r-files").onclick = (e) => {
+      e.stopPropagation();
+      openFilesView(it.id);
+    };
+    const cb = li.querySelector(".r-cancel");
+    if (cb) cb.onclick = (e) => { e.stopPropagation(); cancelTask(it.id); };
+    const rb = li.querySelector(".r-resume");
+    if (rb) rb.onclick = (e) => { e.stopPropagation(); resumeTask(it.id, titleText); };
+    li.querySelector(".r-delete").onclick = (e) => { e.stopPropagation(); deleteTask(it.id, titleText); };
+    ul.appendChild(li);
+  });
+}
+
+// The project's runs: /api/projects/{slug}/runs for real projects; the "multi"
+// pseudo-entry composes /api/tasks rows with project === "multi" client-side.
+async function fetchProjectRuns(slug) {
+  try {
+    if (slug === "multi") {
+      const all = await (await fetch("/api/tasks")).json();
+      return (Array.isArray(all) ? all : []).filter(t => t.project === "multi");
+    }
+    const r = await fetch("/api/projects/" + encodeURIComponent(slug) + "/runs?limit=100");
+    if (!r.ok) return [];
+    const rows = await r.json();
+    return Array.isArray(rows) ? rows : [];
+  } catch (e) { return []; }
+}
 
 async function loadRecent() {
+  const slug = selectedProject();
+  let act = null;
   try {
-    const all = await (await fetch("/api/tasks")).json();
-    const items = filterTasksByProject(all, selectedProject(), recentShowAll);
-    const ul = $("recent-list");
-    if (!items.length) {
-      ul.innerHTML = all.length
-        ? '<li class="muted">none in this project</li>'
-        : '<li class="muted">none yet</li>';
-      return;
-    }
-    ul.innerHTML = "";
-    items.forEach(it => {
-      const li = document.createElement("li");
-      li.className = "item";
-      li.dataset.id = it.id;
-      const status = it.status || "";
-      const cost = (it.cost_usd != null && it.cost_usd > 0) ? "$" + Number(it.cost_usd).toFixed(4) : "";
-      const tests = it.tests === "passed" ? '<span class="r-tests-pass">tests ✓</span>'
-                  : it.tests === "failed" ? '<span class="r-tests-fail">tests ✗</span>' : "";
-      const meta = `<div class="r-meta">${status ? `<span class="r-status ${status}"><span class="r-status-dot"></span>${status}</span>` : ""}` +
-                   `${cost ? `<span class="r-cost">${cost}</span>` : ""}${tests}</div>`;
-      const titleText = it.title || it.tldr || it.id;
-      const cancelBtn = it.status === "running"
-        ? `<button type="button" class="r-act r-cancel" title="Cancel this run">Cancel</button>` : "";
-      // W5: retry/resume affordance on runs that stopped short of completion
-      const resumeBtn = isResumable(it.status)
-        ? `<button type="button" class="r-act r-resume" title="Retry / resume this run">Resume</button>` : "";
-      li.innerHTML = `<div class="r-title">${escapeHtml(titleText)}</div>` +
-        (it.tldr ? `<div class="r-tldr">${escapeHtml(it.tldr)}</div>` : "") +
-        `${meta}<div class="r-actions"><button type="button" class="r-files">Files →</button>` +
-        `${cancelBtn}${resumeBtn}<button type="button" class="r-act r-delete" title="Delete this task">Delete</button></div>`;
-      makeActivatable(li, (e) => {
-        if (e && e.target && e.target.closest("button")) return;
-        if (it.status === "running") attachToRun(it.id, it.prompt); else openTask(it.id, it);
-      }, `Open task ${titleText}`);
-      li.querySelector(".r-files").onclick = (e) => {
-        e.stopPropagation();
-        switchView("files");
-        loadFiles(it.id);
-      };
-      const cb = li.querySelector(".r-cancel");
-      if (cb) cb.onclick = (e) => { e.stopPropagation(); cancelTask(it.id); };
-      const rb = li.querySelector(".r-resume");
-      if (rb) rb.onclick = (e) => { e.stopPropagation(); resumeTask(it.id, titleText); };
-      li.querySelector(".r-delete").onclick = (e) => { e.stopPropagation(); deleteTask(it.id, titleText); };
-      ul.appendChild(li);
-    });
-  } catch (e) { /* ignore */ }
+    const r = await fetch("/api/projects/" + encodeURIComponent(slug) + "/activity");
+    if (r.ok) act = await r.json();
+  } catch (e) { /* tolerate */ }
+  const runs = await fetchProjectRuns(slug);
+  const rows = projectTaskRows(runs, act);
+  renderTaskRows($("ov-recent-list"), rows, 3);
+  renderTaskRows($("task-list"), rows);
+  renderQualitySparkline(runs);
+}
+
+// Quality-trend sparkline in the Tasks tab header (rows arrive newest-first).
+function renderQualitySparkline(runs) {
+  const svg = $("ph-sparkline");
+  if (!svg) return;
+  svg.innerHTML = "";
+  const scores = (runs || []).slice().reverse()
+    .map(r => r.quality_score).filter(v => v != null);
+  const sp = sparklinePoints(scores, 140, 32, 3);
+  $("ph-trend-label").textContent = sp.last != null ? `latest quality ${sp.last}/100` : "";
+  if (sp.drawable) {
+    const pl = document.createElementNS(SVGNS, "polyline");
+    pl.setAttribute("points", sp.points);
+    pl.setAttribute("class", "ph-spark-line");
+    svg.appendChild(pl);
+  }
 }
 
 async function resumeTask(id, title) {
@@ -1267,16 +1382,15 @@ async function cancelTask(id) {
 }
 
 function deleteTask(id, label) {
-  // Optimistic + deferred: hide the row now, actually delete after a grace window
+  // Optimistic + deferred: hide the row(s) now, actually delete after a grace window
   // unless the user clicks Undo. No backend restore needed — the DELETE never fires if undone.
-  const row = document.querySelector(`#recent-list li[data-id="${CSS.escape(id)}"]`);
-  if (row) row.style.display = "none";
+  const rows = [...document.querySelectorAll(`.task-list li[data-id="${CSS.escape(id)}"]`)];
+  rows.forEach(r => { r.style.display = "none"; });
 
   const wasOnScreen = (state.taskId === id || state.docsId === id);
   if (wasOnScreen) {
     state.taskId = null; state.docsId = null;
-    $("run-view").classList.add("hidden");
-    $("empty").classList.remove("hidden");
+    if (currentMainView === "task") backToProject();
   }
 
   let undone = false;
@@ -1290,7 +1404,7 @@ function deleteTask(id, label) {
   showUndoToast(`Deleted "${label || id}"`, () => {
     undone = true;
     clearTimeout(commit);
-    if (row) row.style.display = "";
+    rows.forEach(r => { r.style.display = ""; });
     if (wasOnScreen) loadRecent();   // bring the view back into reach
     showToast("Restored", "success", 2000);
   }, 6000);
@@ -1437,15 +1551,20 @@ function openParentTask(id, docs, kids, meta) {
 }
 
 async function openTask(id, meta) {
-  switchView("run");
+  openTaskDetail((meta && (meta.title || meta.prompt)) || id);
   let docs;
   try { docs = await (await fetch("/api/tasks/" + id)).json(); } catch (e) { docs = null; }
+  // Breadcrumb: "<Project> / <task title>" — resolved from the task's own record.
+  const taskProject = (docs && docs.meta && docs.meta.project) || (meta && meta.project) || currentProject;
+  const crumbTitle = (docs && docs.meta && (docs.meta.title || docs.meta.prompt))
+    || (meta && (meta.title || meta.prompt)) || id;
+  setCrumb(crumbTitle, taskProject);
   // Only a cross-project parent (project "multi") gets the children grid —
   // re-engaged tasks also have child rows but stay ordinary tasks.
   const isMulti = docs && docs.meta && docs.meta.project === "multi";
   const kids = isMulti ? await fetchChildren(id) : null;
   if (kids) { openParentTask(id, docs || {}, kids, meta); return; }  // fan-out parent
-  if (!docs || !docs.plan) { openDocs(id); return; }   // older task without parseable docs
+  if (!docs || !docs.plan) { backToProject(); openDocs(id); return; }   // older task without parseable docs
   const subtasks = parsePlan(docs.plan);
   const rep = parseReport(docs.report || "");
   const prompt = (meta && (meta.prompt || meta.title)) || id;
@@ -1526,24 +1645,87 @@ async function openTask(id, meta) {
   state.docsId = id;
 }
 
-// ---- view tabs (Run / Agents / Memory / Graph) ----
-let currentView = "run";
-const VIEWS = { run: "view-run", project: "view-project", agents: "view-agents", memory: "view-memory", graph: "view-graph", files: "view-files", dashboard: "view-dashboard" };
+// ---- main views: project (tabs) · task detail · all activity ----
+const MAIN_VIEWS = { project: "view-project", task: "view-task", activity: "view-activity" };
 
-function switchView(name) {
-  currentView = name;
-  document.querySelectorAll(".vtab").forEach(b => {
-    const on = b.dataset.view === name;
-    b.classList.toggle("active", on);
-    if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+function showMainView(name) {
+  currentMainView = name;
+  Object.entries(MAIN_VIEWS).forEach(([n, id]) => $(id).classList.toggle("hidden", n !== name));
+  renderSidebar();   // keep the active row / All activity highlight in sync
+}
+
+// Is a given knowledge sub-view currently on screen? (refresh-on-done checks)
+function knowVisible(sub) {
+  return currentMainView === "project" && currentTab === "knowledge" && currentKnow === sub;
+}
+
+// ---- project tab bar: Overview · Tasks · Knowledge · Settings ----
+function selectProjectTab(tab, force) {
+  const tabs = projectTabsModel(currentProject, tab);
+  currentTab = tabs.find(t => t.selected).id;
+  if (currentMainView !== "project" || force) showMainView("project");
+  const visible = new Set(tabs.map(t => t.id));
+  document.querySelectorAll("#project-tabs .ptab").forEach(b => {
+    const id = b.dataset.tab;
+    b.classList.toggle("hidden", !visible.has(id));
+    b.setAttribute("aria-selected", id === currentTab ? "true" : "false");
   });
-  Object.entries(VIEWS).forEach(([n, id]) => $(id).classList.toggle("hidden", n !== name));
-  if (name === "project") loadProjectHome();
-  if (name === "agents") loadAgents();
-  if (name === "memory") loadMemory();
-  if (name === "graph") loadGraph();
-  if (name === "files") loadFiles();
-  if (name === "dashboard") loadDashboard();
+  ["overview", "tasks", "knowledge", "settings"].forEach(t => {
+    $("panel-" + t).classList.toggle("hidden", t !== currentTab);
+  });
+  if (currentTab === "overview") { loadProjectActivity(); loadRecent(); }
+  if (currentTab === "tasks") { loadRecent(); loadQueue(); }
+  if (currentTab === "knowledge") return showKnowledge(currentKnow);
+  if (currentTab === "settings") loadSettingsPanel();
+}
+
+// ---- knowledge sub-tabs: Memory · Knowledge graph · Files ----
+function showKnowledge(sub) {
+  currentKnow = sub;
+  document.querySelectorAll("#know-tabs .ktab").forEach(b => {
+    b.setAttribute("aria-selected", b.dataset.know === sub ? "true" : "false");
+  });
+  ["memory", "graph", "files"].forEach(s => {
+    $("know-" + s).classList.toggle("hidden", s !== sub);
+  });
+  if (sub === "memory") return loadMemory();
+  if (sub === "graph") return loadGraph();
+  if (sub === "files") return loadFiles();
+}
+
+// Jump to a task's files inside the current project's Knowledge tab.
+function openFilesView(taskId) {
+  if (taskId !== undefined) filesTask = taskId;
+  currentKnow = "files";
+  showMainView("project");
+  return selectProjectTab("knowledge");
+}
+
+// ---- task detail: opens INSIDE the project context, with a breadcrumb ----
+function setCrumb(title, projectSlug) {
+  const slug = projectSlug || currentProject;
+  const isMulti = slug === "multi";
+  const entry = currentProjectEntry(slug);
+  $("crumb-project").textContent = isMulti
+    ? "⋔ Across projects" : ((entry && entry.name) || slug);
+  $("crumb-project").onclick = () => selectProject(slug, "tasks");
+  $("crumb-title").textContent = title || "";
+}
+
+function openTaskDetail(title, projectSlug) {
+  setCrumb(title, projectSlug);
+  showMainView("task");
+}
+
+function backToProject() {
+  selectProject(currentProject, currentTab);
+}
+
+// ---- All activity (formerly the Dashboard) ----
+function showActivity() {
+  showMainView("activity");
+  loadDashboard();
+  loadAgents();
 }
 
 // ---- W5: run comparison (Dashboard) ----
@@ -1626,33 +1808,27 @@ async function loadProjectsActivity() {
     `</tr></thead><tbody>${rows}</tbody></table>`;
 }
 
-// ---- F4: project home (status + activity + policy editor + run history) ----
-async function loadProjectHome() {
+// ---- Settings tab: repository state + policy editor + archive/delete ----
+async function loadSettingsPanel() {
   const slug = selectedProject();
+  if (slug === "multi") return;
   let list = [];
   try { list = await (await fetch("/api/projects")).json(); } catch (e) { list = []; }
-  const entry = (Array.isArray(list) ? list : []).find(p => p.slug === slug) || { slug, name: slug };
-  const h = projectHomeHeaderModel(entry);
-  $("ph-name").textContent = h.name || slug;
-  $("ph-meta").innerHTML =
-    `<span class="ph-origin ph-origin-${escapeAttr(h.origin)}">${escapeHtml(h.origin)}</span>` +
-    (h.root ? `<code class="ph-root" title="${escapeAttr(h.root)}">${escapeHtml(h.root)}</code>`
-            : '<span class="muted">no repository bound — tasks run greenfield</span>');
-  renderProjectHomeStatus(slug, entry);
-  renderProjectHomePolicy(entry);
-  renderProjectHomeRuns(slug);
+  if (Array.isArray(list) && list.length) projectList = list;
+  const entry = currentProjectEntry(slug) || { slug, name: slug };
+  renderSettingsPolicy(entry);
+  renderSettingsDanger(entry);
+  loadProjectStatus();   // fills the repository card + header chips
 }
 
-async function renderProjectHomeStatus(slug, entry) {
-  entry = entry || currentProjectEntry(slug) || { slug, name: slug };
+// The Settings tab's repository card (fed by the header's status poll).
+function renderSettingsRepo(st) {
+  const el = $("ph-status");
+  if (!el) return;
+  const entry = currentProjectEntry() || { slug: selectedProject() };
   const h = projectHomeHeaderModel(entry);
-  let st = null;
-  try {
-    const r = await fetch("/api/projects/" + encodeURIComponent(slug) + "/status");
-    if (r.ok) st = await r.json();
-  } catch (e) { /* leave placeholder */ }
   const m = projectStatusLine(st);
-  $("ph-status").innerHTML = m.visible
+  el.innerHTML = m.visible
     ? `<span class="ps-branch">⎇ ${escapeHtml(m.text)}</span>` +
       (m.dirty ? '<span class="ps-dirty" title="Uncommitted changes in the checkout">●</span>' : "") +
       (m.archived ? '<span class="ps-archived">archived</span>' : "")
@@ -1664,24 +1840,78 @@ async function renderProjectHomeStatus(slug, entry) {
     idx.classList.toggle("hidden", h.scratch);
     idx.textContent = h.scratch ? "" : (short ? "last indexed @ " + short : "not indexed yet");
   }
-  let act = null;
-  try {
-    const r = await fetch("/api/projects/" + encodeURIComponent(slug) + "/activity");
-    if (r.ok) act = await r.json();
-  } catch (e) { /* leave as-is */ }
-  const a = activityStripModel(act);
-  const ael = $("ph-activity");
-  ael.className = "proj-activity pa-" + a.state;
-  ael.innerHTML = `<span class="pa-dot" aria-hidden="true"></span>${escapeHtml(a.text)}`;
 }
 
-function renderProjectHomePolicy(entry) {
+function renderSettingsPolicy(entry) {
   const f = policyFormModel(entry.policy || {});
   $("ph-budget").value = f.budget_usd;
   $("ph-effort").value = f.effort;
   $("ph-gitmode").value = f.git_mode;
   $("ph-protected").value = f.protected_paths;
   $("ph-policy-error").classList.add("hidden");
+}
+
+function renderSettingsDanger(entry) {
+  const archived = !!(entry && entry.archived);
+  $("proj-archive").textContent = archived ? "Unarchive project" : "Archive project";
+  $("proj-delete").disabled = entry && entry.slug === "default";
+  $("proj-delete").title = (entry && entry.slug === "default")
+    ? "The default project cannot be deleted" : "Delete this project's data directory and checkout";
+  $("proj-danger-error").classList.add("hidden");
+}
+
+function _dangerFail(msg) {
+  const el = $("proj-danger-error");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+
+async function toggleArchiveProject() {
+  const slug = selectedProject();
+  const entry = currentProjectEntry(slug) || {};
+  const next = !entry.archived;
+  const btn = $("proj-archive");
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/api/projects/" + encodeURIComponent(slug), {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ archived: next }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.status === 501) showToast("Archiving is not available yet on this server", "warn", 6000);
+    else if (!resp.ok || data.error) _dangerFail(data.error || ("HTTP " + resp.status));
+    else {
+      showToast(next ? "Project archived" : "Project unarchived", "success");
+      await loadProjects();
+      renderSettingsDanger(currentProjectEntry(slug) || {});
+      renderProjectHeader(null);
+    }
+  } catch (e) { _dangerFail("Request failed: " + e); }
+  btn.disabled = false;
+}
+
+async function deleteProject() {
+  const slug = selectedProject();
+  const entry = currentProjectEntry(slug) || { slug };
+  const name = entry.name || slug;
+  if (!window.confirm(`Delete project "${name}"? This removes its data directory and checkout.`)) return;
+  const btn = $("proj-delete");
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/api/projects/" + encodeURIComponent(slug), { method: "DELETE" });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.status === 501) showToast("Project delete is not available yet on this server", "warn", 6000);
+    else if (!resp.ok || data.error) _dangerFail(data.error || ("HTTP " + resp.status));
+    else {
+      showToast(`Deleted project "${name}"`, "warn");
+      currentProject = "default";
+      localStorage.setItem("ada-project", "default");
+      await loadProjects();
+      selectProject(currentProject, "overview");
+      return;
+    }
+  } catch (e) { _dangerFail("Request failed: " + e); }
+  btn.disabled = false;
 }
 
 async function saveProjectPolicy() {
@@ -1706,42 +1936,6 @@ async function saveProjectPolicy() {
     else showToast("Policy saved", "success");
   } catch (e) { showToast("Save failed: " + e, "error"); }
   btn.disabled = false;
-}
-
-async function renderProjectHomeRuns(slug) {
-  let runs = [];
-  try {
-    const r = await fetch("/api/projects/" + encodeURIComponent(slug) + "/runs");
-    if (r.ok) runs = await r.json();
-  } catch (e) { /* keep empty */ }
-  if (!Array.isArray(runs)) runs = [];
-  const svg = $("ph-sparkline");
-  svg.innerHTML = "";
-  // rows arrive newest-first; the sparkline reads oldest -> newest
-  const scores = runs.slice().reverse().map(r => r.quality_score).filter(v => v != null);
-  const sp = sparklinePoints(scores, 140, 32, 3);
-  $("ph-trend-label").textContent = sp.last != null ? `latest quality ${sp.last}/100` : "no quality data yet";
-  if (sp.drawable) {
-    const pl = document.createElementNS(SVGNS, "polyline");
-    pl.setAttribute("points", sp.points);
-    pl.setAttribute("class", "ph-spark-line");
-    svg.appendChild(pl);
-  }
-  const wrap = $("ph-runs");
-  if (!runs.length) { wrap.innerHTML = '<p class="muted">No runs yet for this project.</p>'; return; }
-  wrap.innerHTML =
-    `<table class="dsa-table"><thead><tr><th scope="col">Task</th><th scope="col">Status</th>` +
-    `<th scope="col">Quality</th><th scope="col">Tests</th><th scope="col">Cost</th></tr></thead><tbody>` +
-    runs.map(r => `<tr class="ph-run-row" data-id="${escapeAttr(r.id)}" title="Open this task">` +
-      `<td class="dsa-task">${escapeHtml(r.title || r.id)}</td>` +
-      `<td>${escapeHtml(r.status || "—")}${r.run_status && r.run_status !== r.status ? escapeHtml(" · " + r.run_status) : ""}</td>` +
-      `<td>${r.quality_score != null ? escapeHtml(r.quality_score + "/100") : "—"}</td>` +
-      `<td>${r.tests === "passed" ? "✓" : r.tests === "failed" ? "✗" : "—"}</td>` +
-      `<td>${(r.cost_usd != null && r.cost_usd > 0) ? escapeHtml(fmtCost(r.cost_usd)) : "—"}</td></tr>`).join("") +
-    `</tbody></table>`;
-  wrap.querySelectorAll(".ph-run-row").forEach(tr => {
-    makeActivatable(tr, () => openTask(tr.dataset.id, null), `Open task ${tr.dataset.id}`);
-  });
 }
 
 // ---- F4 decision #5: Reviews & Permissions panel ----
@@ -2007,9 +2201,8 @@ async function sendFeedback(extra) {
     $("fb-thanks").classList.remove("hidden");
   } catch (e) { showToast("Feedback failed", "warn"); }
 }
-document.querySelectorAll(".vtab").forEach(b => b.onclick = () => switchView(b.dataset.view));
 
-// ---- Agents roster ----
+// ---- Agents roster (a card in the All activity view) ----
 let agentsLoaded = false;
 let rosterAgents = {};   // name -> agent profile, for the detail popup
 async function loadAgents() {
@@ -2148,7 +2341,7 @@ function showNode(n, facts) {
   $("node-detail").innerHTML = `<b>${escapeHtml(n.id)}</b> <span class="muted">(${n.type})</span><br>` +
     (facts.length ? facts.map(f => escapeHtml(f)).join("<br>") : "<span class='muted'>no relations</span>") + extra;
   const of = $("node-detail").querySelector(".open-file");
-  if (of) of.onclick = async () => { switchView("files"); await loadFiles(of.dataset.task); selectFile(of.dataset.path, null); };
+  if (of) of.onclick = async () => { await openFilesView(of.dataset.task); selectFile(of.dataset.path, null); };
 }
 
 function layout(nodes, edges, W, H) {
@@ -2259,7 +2452,6 @@ async function selectFile(path, li) {
 
 // ---- wire up ----
 $("run-btn").onclick = runTask;
-document.querySelectorAll(".ex-chip").forEach(b => b.onclick = () => { $("prompt").value = b.textContent; $("prompt").focus(); });
 $("approve-btn").onclick = approvePlan;
 $("discard-btn").onclick = discardPlan;
 $("refine-btn").onclick = refinePlan;
@@ -2273,29 +2465,22 @@ $("mem-refresh").onclick = loadMemory;
 $("graph-refresh").onclick = loadGraph;
 $("files-refresh").onclick = () => loadFiles();
 $("files-task").onchange = () => { filesTask = $("files-task").value; renderFileList(); };
-$("refresh").onclick = loadRecent;
+$("tasks-refresh").onclick = loadRecent;
 $("prompt").addEventListener("keydown", (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") runTask(); });
 $("docs-link").onclick = (e) => { e.preventDefault(); if (state.docsId) openDocs(state.docsId); };
 $("modal-close").onclick = () => closeModalEl("modal");
 $("modal").onclick = (e) => { if (e.target === $("modal")) closeModalEl("modal"); };
 $("agent-modal-close").onclick = closeAgentModal;
 $("agent-modal").onclick = (e) => { if (e.target === $("agent-modal")) closeAgentModal(); };
-// F4: Reviews & Permissions panel + project home
+// F4: Reviews & Permissions panel + project settings
 $("review-btn").onclick = openReviewPanel;
 $("review-modal-close").onclick = closeReviewPanel;
 $("review-modal").onclick = (e) => { if (e.target === $("review-modal")) closeReviewPanel(); };
 document.querySelectorAll("#review-modal .tab").forEach(t => t.onclick = () => selectReviewTab(t.dataset.rtab));
-$("ph-refresh").onclick = loadProjectHome;
 $("ph-new").onclick = openProjectModal;
 $("ph-policy-save").onclick = saveProjectPolicy;
-$("recent-scope").onclick = () => {
-  recentShowAll = !recentShowAll;
-  $("recent-scope").setAttribute("aria-pressed", String(recentShowAll));
-  $("recent-scope").title = recentShowAll
-    ? "Showing tasks from all projects — click to scope to the selected project"
-    : "Show tasks from all projects (default: selected project only)";
-  loadRecent();
-};
+$("proj-archive").onclick = toggleArchiveProject;
+$("proj-delete").onclick = deleteProject;
 $("roster-modal-close").onclick = closeRosterModal;
 $("roster-modal").onclick = (e) => { if (e.target === $("roster-modal")) closeRosterModal(); };
 // a11y: Escape closes the topmost dialog; Tab is trapped inside an open dialog
@@ -2310,8 +2495,11 @@ document.addEventListener("keydown", (e) => {
 ["modal", "agent-modal", "roster-modal", "project-modal", "review-modal"].forEach(id =>
   $(id).addEventListener("keydown", (e) => _trapModalTab($(id), e)));
 document.querySelectorAll("#modal .tab").forEach(t => t.onclick = () => selectTab(t.dataset.doc));
-$("project").onchange = onProjectChange;
-$("multi-toggle").onchange = toggleMultiBox;   // F3: cross-project fan-out composer
+// project tab bar + knowledge sub-tabs + sidebar global nav
+document.querySelectorAll("#project-tabs .ptab").forEach(b => b.onclick = () => selectProjectTab(b.dataset.tab));
+document.querySelectorAll("#know-tabs .ktab").forEach(b => b.onclick = () => showKnowledge(b.dataset.know));
+$("nav-activity").onclick = showActivity;
+$("multi-open").onclick = toggleMultiBox;   // F3: cross-project fan-out composer
 $("new-project").onclick = openProjectModal;
 $("project-modal-close").onclick = closeProjectModal;
 $("pm-cancel").onclick = closeProjectModal;
@@ -2338,16 +2526,13 @@ document.querySelectorAll("#fb-stars button").forEach(b => b.onclick = () => {
 });
 loadConfig();
 loadProjects().then(() => {
-  refreshProjectPulse(true);
-  loadRecent();   // recent tasks are scoped to the selected project — wait for it
-  // Project-first landing: PROJECT HOME is the default view. Opening/attaching a
-  // task (openTask/attachToRun/launchRun) still switches to the run view.
-  if (!state.taskId && !state.docsId) switchView("project");
+  // Project-first landing: the selected project's Overview is the default view.
+  // Opening/attaching a task (openTask/attachToRun/launchRun) switches to its detail.
+  selectProject(currentProject, "overview");
 });
 loadQueue();
 setInterval(loadQueue, 4000);  // keep the queue panel + chip fresh
-setInterval(() => {            // keep the project activity strip (+ dashboard table) live
+setInterval(() => {            // keep sidebar dots, activity strips & header status live
   refreshProjectPulse(false);
-  if (currentView === "dashboard") loadProjectsActivity();
-  if (currentView === "project") renderProjectHomeStatus(selectedProject());
+  if (currentMainView === "activity") loadProjectsActivity();
 }, 5000);

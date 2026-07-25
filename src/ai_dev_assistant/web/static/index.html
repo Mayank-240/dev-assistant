@@ -22,153 +22,264 @@
 </head>
 <body>
   <div class="app">
-
-    <!-- ===== TOP BAR ===== -->
-    <header class="topbar">
-      <div class="top-left">
-        <button id="sidebar-toggle" class="sidebar-toggle" type="button" title="Hide / show sidebar" aria-label="Toggle sidebar" aria-expanded="true">«</button>
-        <div class="brand">
-          <div class="logo" aria-hidden="true">◆</div>
-          <div>
-            <h1>AI Dev Assistant</h1>
-            <p class="tagline" id="project-tagline" title="Selected project · repository state">…</p>
-          </div>
-        </div>
-      </div>
-      <div class="top-right">
-        <span id="queue-chip" class="badge badge-muted hidden" title="Task queue">queue: idle</span>
-        <span id="backend-badge" class="badge badge-muted">backend: …</span>
-        <span id="conn" class="badge badge-idle" role="status" aria-live="polite">idle</span>
-        <button id="theme-btn" type="button" title="Toggle theme (light · dark · auto)">◐ Auto</button>
-      </div>
-    </header>
-
-    <!-- ===== BODY ===== -->
     <div class="layout">
 
-      <!-- ===== SIDEBAR ===== -->
+      <!-- ===== SIDEBAR — projects are the navigation ===== -->
       <aside class="sidebar">
-        <div class="sidebar-inner">
+        <div class="sb-brand">
+          <div class="logo" aria-hidden="true">◆</div>
+          <h1>AI Dev Assistant</h1>
+        </div>
 
-          <section class="project-block card" title="The project owns the repository, memory & knowledge graph tasks run in">
-            <span class="block-label">Project</span>
-            <div class="proj-row">
-              <select id="project" class="select" aria-label="Selected project"></select>
-              <button id="new-project" class="ghost" type="button" title="New or import project" aria-label="New or import project">＋</button>
-            </div>
-            <div id="project-status" class="proj-status hidden" title="Repository state of the selected project"></div>
-            <div id="project-activity" class="proj-activity hidden" role="status" aria-live="polite" title="What is going on in this project right now"></div>
-          </section>
+        <nav class="sb-projects" aria-label="Projects">
+          <span class="sb-label" id="projects-label" aria-hidden="true">Projects</span>
+          <ul id="project-list" class="project-list" aria-labelledby="projects-label"></ul>
+          <button id="new-project" class="sb-new" type="button" title="Create a new project or import an existing repository">+ New / Import</button>
+        </nav>
 
-          <section class="composer card">
-            <label for="prompt" id="composer-label">New task</label>
-            <div id="continue-banner" class="continue-banner hidden">
-              <span>↻ Continuing <b id="continue-ref"></b> — your prompt builds on its workspace &amp; context</span>
-              <button id="continue-clear" type="button" title="Start a fresh task instead" aria-label="Start a fresh task instead">✕</button>
-            </div>
-            <textarea id="prompt" rows="4" placeholder="e.g. Add input validation to a sample function and document it"></textarea>
-            <input id="task-title" class="title-input" type="text" maxlength="80"
-                   placeholder="Title (optional) — auto-generated from the task if left blank" />
-            <label class="check" title="Fan this task out across several projects — one child task per project, plus one rolled-up report"><input type="checkbox" id="multi-toggle" /> Multiple projects</label>
-            <div id="multi-box" class="multi-box hidden">
-              <div id="multi-projects" class="multi-projects" role="group" aria-label="Projects to fan this task out across"></div>
-              <label class="check" title="run the first project alone so its lessons inform the rest"><input type="checkbox" id="stagger" /> Stagger</label>
-            </div>
-            <div class="controls">
-              <label class="ctl" title="Higher effort = deeper reasoning, more agent turns & review retries; lower = cheaper & faster (Sonnet)">Effort
-                <select id="effort" class="select">
-                  <option value="max">Max · Opus</option>
-                  <option value="xhigh">X-High · Opus</option>
-                  <option value="high" selected>High · Opus</option>
-                  <option value="medium">Medium · Sonnet</option>
-                  <option value="low">Low · fast</option>
-                </select>
-              </label>
-              <label class="ctl" title="Where new memories are written. Recall always reads project + global. The knowledge graph is always project-scoped.">Memory
-                <select id="mem-scope" class="select">
-                  <option value="project">Project</option>
-                  <option value="global">Global</option>
-                </select>
-              </label>
-              <label class="ctl" title="Stop scheduling new work once this run's cost exceeds the cap">Budget $
-                <input id="budget" class="num" type="number" min="0" step="0.5" placeholder="none" />
-              </label>
-            </div>
-            <label class="check" id="git-finalize-row" title="At the end, commit the run's workspace to a new branch"><input type="checkbox" id="git-finalize" /> Commit results to a new branch</label>
-            <div id="delivery-hint" class="delivery-hint hidden" title="Delivery is governed by the project's git_mode policy"></div>
-            <button id="run-btn">Run task →</button>
-            <label class="check"><input type="checkbox" id="review-plan" /> Review plan before running</label>
-            <p class="hint">Runs via your Claude Code login — no API key needed.</p>
-          </section>
+        <div class="sb-divider" aria-hidden="true"></div>
 
-          <nav class="nav" aria-label="Workspace views">
-            <span class="nav-label" aria-hidden="true">Workspace</span>
-            <button type="button" class="vtab" data-view="project"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 13.5v-8l5.5-3.5 5.5 3.5v8z"/><path d="M6.5 13.5v-4h3v4"/></svg>Project&nbsp;Home</button>
-            <button type="button" class="vtab" data-view="agents"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="currentColor"><circle cx="4" cy="4" r="2"/><circle cx="12" cy="4" r="2"/><circle cx="4" cy="12" r="2"/><circle cx="12" cy="12" r="2"/></svg>Agents</button>
-            <button type="button" class="vtab" data-view="memory"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2.5" y="3" width="11" height="3" rx="1"/><rect x="2.5" y="9.5" width="11" height="3" rx="1"/></svg>Memory</button>
-            <button type="button" class="vtab" data-view="graph"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="3.5" cy="12" r="2" fill="currentColor" stroke="none"/><circle cx="12.5" cy="11" r="2" fill="currentColor" stroke="none"/><circle cx="8" cy="3.5" r="2" fill="currentColor" stroke="none"/><path d="M8 4.5l-4 6.5M8 4.5l4 5.5"/></svg>Knowledge&nbsp;Graph</button>
-            <button type="button" class="vtab" data-view="files"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 2.5h5l3 3v8H4z"/><path d="M9 2.5v3h3"/></svg>Files</button>
-            <button type="button" class="vtab" data-view="dashboard"><svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 13h12"/><rect x="3" y="8" width="2.4" height="4"/><rect x="7" y="5" width="2.4" height="7"/><rect x="11" y="9" width="2.4" height="3"/></svg>Dashboard</button>
-          </nav>
+        <nav class="sb-global" aria-label="Global views">
+          <button type="button" id="nav-activity" class="sb-item">
+            <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 13h12"/><rect x="3" y="8" width="2.4" height="4"/><rect x="7" y="5" width="2.4" height="7"/><rect x="11" y="9" width="2.4" height="3"/></svg>
+            All activity
+          </button>
+        </nav>
 
-          <section class="queue hidden" id="queue-section">
-            <span class="recent-label">Queue
-              <span class="q-controls">
-                <label class="q-conc" title="How many tasks run at once">conc
-                  <select id="q-concurrency"><option>1</option><option>2</option><option>3</option><option>4</option></select>
-                </label>
-                <button id="q-pause" type="button" class="ghost" title="Pause / resume starting new tasks" aria-label="Pause queue">⏸</button>
-              </span>
-            </span>
-            <ul id="queue-list"></ul>
-          </section>
-
-          <section class="recent">
-            <span class="recent-label">Recent tasks
-              <span class="q-controls">
-                <button id="recent-scope" type="button" class="ghost" title="Show tasks from all projects (default: selected project only)" aria-pressed="false">all</button>
-                <button id="refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh recent tasks">⟳</button>
-              </span>
-            </span>
-            <ul id="recent-list"><li class="muted">none yet</li></ul>
-          </section>
-
+        <div class="sb-foot">
+          <span id="queue-chip" class="badge badge-muted hidden" title="Task queue">queue: idle</span>
+          <span id="backend-badge" class="badge badge-muted">backend: …</span>
+          <span id="conn" class="badge badge-idle" role="status" aria-live="polite">idle</span>
+          <button id="theme-btn" type="button" title="Toggle theme (light · dark · auto)">◐ Auto</button>
         </div>
       </aside>
 
-      <!-- drag to resize the sidebar -->
-      <div id="sidebar-resizer" class="sidebar-resizer" role="separator" aria-orientation="vertical" title="Drag to resize"></div>
-
-      <!-- ===== MAIN ===== -->
+      <!-- ===== MAIN — the selected project ===== -->
       <section class="main-col">
         <div class="content">
 
-          <!-- ============ RUN VIEW ============ -->
-          <div id="view-run" class="view">
-            <div class="view-header">
-              <div>
-                <h1>Latest run</h1>
-                <p>Submit a task — the orchestrator plans it and routes the pieces to specialist agents in parallel.</p>
+          <!-- ============ PROJECT VIEW ============ -->
+          <div id="view-project" class="view">
+
+            <header class="proj-header">
+              <div class="proj-id">
+                <h1 id="proj-name">…</h1>
+                <div class="proj-meta">
+                  <span id="proj-origin" class="origin-badge hidden"></span>
+                  <span id="proj-branch" class="branch-chip hidden"></span>
+                  <span id="proj-dirty" class="dirty-dot hidden" title="Uncommitted changes in the checkout">●</span>
+                  <span id="proj-archived" class="archived-tag hidden">archived</span>
+                  <code id="proj-root" class="proj-root hidden"></code>
+                </div>
               </div>
-              <div class="seg-wrap">
-                <span class="seg-label" id="layout-seg-label">Layout</span>
-                <div class="seg" id="layout-seg" role="group" aria-labelledby="layout-seg-label">
-                  <button class="lseg active" data-layout="focus">Focus</button>
-                  <button class="lseg" data-layout="split">Split</button>
-                  <button class="lseg" data-layout="board">Board</button>
+              <div class="proj-actions">
+                <button id="ph-new" type="button" class="btn-secondary" title="Create a new project or import an existing repository">+ New / Import</button>
+              </div>
+            </header>
+
+            <div id="project-tabs" class="tabbar" role="tablist" aria-label="Project sections">
+              <button type="button" id="tab-overview" class="ptab" role="tab" aria-selected="true" aria-controls="panel-overview" data-tab="overview">Overview</button>
+              <button type="button" id="tab-tasks" class="ptab" role="tab" aria-selected="false" aria-controls="panel-tasks" data-tab="tasks">Tasks</button>
+              <button type="button" id="tab-knowledge" class="ptab" role="tab" aria-selected="false" aria-controls="panel-knowledge" data-tab="knowledge">Knowledge</button>
+              <button type="button" id="tab-settings" class="ptab" role="tab" aria-selected="false" aria-controls="panel-settings" data-tab="settings">Settings</button>
+            </div>
+
+            <!-- ------------ Overview: the work composer ------------ -->
+            <div id="panel-overview" class="panel" role="tabpanel" aria-labelledby="tab-overview">
+              <div class="composer card">
+                <h2 id="composer-heading" class="composer-heading">What should we work on?</h2>
+                <div id="continue-banner" class="continue-banner hidden">
+                  <span>↻ Continuing <b id="continue-ref"></b> — your prompt builds on its workspace &amp; context</span>
+                  <button id="continue-clear" type="button" title="Start a fresh task instead" aria-label="Start a fresh task instead">✕</button>
+                </div>
+                <textarea id="prompt" rows="4" placeholder="Describe the work — e.g. add input validation to the parser and cover it with tests"></textarea>
+                <input id="task-title" class="title-input" type="text" maxlength="80"
+                       placeholder="Title (optional) — auto-generated from the task if left blank" />
+
+                <details id="options-box" class="options">
+                  <summary>Options</summary>
+                  <div class="options-body">
+                    <div class="controls">
+                      <label class="ctl" title="Higher effort = deeper reasoning, more agent turns & review retries; lower = cheaper & faster (Sonnet)">Effort
+                        <select id="effort" class="select">
+                          <option value="max">Max · Opus</option>
+                          <option value="xhigh">X-High · Opus</option>
+                          <option value="high" selected>High · Opus</option>
+                          <option value="medium">Medium · Sonnet</option>
+                          <option value="low">Low · fast</option>
+                        </select>
+                      </label>
+                      <label class="ctl" title="Where new memories are written. Recall always reads project + global. The knowledge graph is always project-scoped.">Memory
+                        <select id="mem-scope" class="select">
+                          <option value="project">Project</option>
+                          <option value="global">Global</option>
+                        </select>
+                      </label>
+                      <label class="ctl" title="Stop scheduling new work once this run's cost exceeds the cap">Budget $
+                        <input id="budget" class="num" type="number" min="0" step="0.5" placeholder="none" />
+                      </label>
+                    </div>
+                    <label class="check"><input type="checkbox" id="review-plan" /> Review plan before running</label>
+                    <label class="check" id="git-finalize-row" title="At the end, commit the run's workspace to a new branch"><input type="checkbox" id="git-finalize" /> Commit results to a new branch</label>
+                    <div id="delivery-hint" class="delivery-hint hidden" title="Delivery is governed by the project's git_mode policy"></div>
+                  </div>
+                </details>
+
+                <div id="multi-box" class="multi-box hidden">
+                  <span class="multi-label">Fan this task out — one child task per project, plus one rolled-up report</span>
+                  <div id="multi-projects" class="multi-projects" role="group" aria-label="Projects to fan this task out across"></div>
+                  <label class="check" title="run the first project alone so its lessons inform the rest"><input type="checkbox" id="stagger" /> Stagger</label>
+                </div>
+
+                <div class="composer-foot">
+                  <button type="button" id="multi-open" class="link-btn" aria-expanded="false">Work across projects…</button>
+                  <button id="run-btn" class="btn-primary">Start working →</button>
+                </div>
+                <p class="hint">Runs via your Claude Code login — no API key needed.</p>
+              </div>
+
+              <div id="ov-activity" class="proj-activity pa-idle" role="status" aria-live="polite"><span class="pa-dot" aria-hidden="true"></span>idle</div>
+
+              <section class="ov-recent">
+                <h3 class="section-label">Recent tasks</h3>
+                <ul id="ov-recent-list" class="task-list"><li class="muted">none yet</li></ul>
+              </section>
+            </div>
+
+            <!-- ------------ Tasks: queue + full task list ------------ -->
+            <div id="panel-tasks" class="panel hidden" role="tabpanel" aria-labelledby="tab-tasks">
+              <section class="queue card hidden" id="queue-section">
+                <div class="queue-head">
+                  <h3 class="section-label">Queue</h3>
+                  <span class="q-controls">
+                    <label class="q-conc" title="How many tasks run at once">conc
+                      <select id="q-concurrency"><option>1</option><option>2</option><option>3</option><option>4</option></select>
+                    </label>
+                    <button id="q-pause" type="button" class="ghost" title="Pause / resume starting new tasks" aria-label="Pause queue">⏸</button>
+                  </span>
+                </div>
+                <ul id="queue-list"></ul>
+              </section>
+
+              <div class="card tasks-card">
+                <div class="tasks-head">
+                  <h3 class="section-label">Tasks in this project</h3>
+                  <span class="ph-trend" aria-hidden="true"><svg id="ph-sparkline" width="140" height="32" viewBox="0 0 140 32" preserveAspectRatio="none"></svg></span>
+                  <span id="ph-trend-label" class="muted"></span>
+                  <button id="tasks-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh task list">⟳</button>
+                </div>
+                <ul id="task-list" class="task-list"><li class="muted">none yet</li></ul>
+              </div>
+            </div>
+
+            <!-- ------------ Knowledge: memory · graph · files ------------ -->
+            <div id="panel-knowledge" class="panel hidden" role="tabpanel" aria-labelledby="tab-knowledge">
+              <div id="know-tabs" class="subtabs" role="tablist" aria-label="Knowledge views">
+                <button type="button" id="ktab-memory" class="ktab" role="tab" aria-selected="true" aria-controls="know-memory" data-know="memory">Memory</button>
+                <button type="button" id="ktab-graph" class="ktab" role="tab" aria-selected="false" aria-controls="know-graph" data-know="graph">Knowledge graph</button>
+                <button type="button" id="ktab-files" class="ktab" role="tab" aria-selected="false" aria-controls="know-files" data-know="files">Files</button>
+              </div>
+
+              <div id="know-memory" class="know-panel" role="tabpanel" aria-labelledby="ktab-memory">
+                <div class="know-head">
+                  <p class="know-desc">Durable notes and facts agents saved during their runs.</p>
+                  <button id="mem-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh memory list">⟳</button>
+                </div>
+                <div id="memory-list" class="mem-list"><p class="muted">No memories yet — run a task.</p></div>
+              </div>
+
+              <div id="know-graph" class="know-panel hidden" role="tabpanel" aria-labelledby="ktab-graph">
+                <div class="know-head">
+                  <p class="know-desc">Entities and relationships the agents recorded. Click a node to trace its facts.</p>
+                  <span id="graph-stats" class="muted"></span>
+                  <button id="graph-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh knowledge graph">⟳</button>
+                </div>
+                <div class="graph-wrap"><svg id="graph-svg" viewBox="0 0 800 520" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Knowledge graph of recorded entities and relationships"></svg></div>
+                <div id="graph-legend" class="legend"></div>
+                <div id="node-detail" class="node-detail muted">Click a node to see its facts.</div>
+              </div>
+
+              <div id="know-files" class="know-panel hidden" role="tabpanel" aria-labelledby="ktab-files">
+                <div class="know-head">
+                  <p class="know-desc">Artifacts the agents wrote to disk — code, tests, and config.</p>
+                  <span id="files-stats" class="muted"></span>
+                  <select id="files-task" class="select" title="Filter by task" aria-label="Filter files by task"></select>
+                  <button id="files-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh file list">⟳</button>
+                </div>
+                <div class="files-pane">
+                  <ul id="file-list" class="file-list"><li class="muted">No files yet — run a task that writes code.</li></ul>
+                  <div class="file-view">
+                    <div class="file-view-head">
+                      <span id="file-name" class="muted">No file selected</span>
+                      <a id="file-download" class="dl hidden" download>↓ Download</a>
+                    </div>
+                    <pre id="file-content" class="file-content muted">Select a file to view its contents.</pre>
+                  </div>
                 </div>
               </div>
             </div>
 
-            <div id="empty" class="empty">
-              <div class="empty-mark" aria-hidden="true">◆</div>
-              <h2>Describe a task to begin</h2>
-              <p>The orchestrator will break it down and route the pieces to specialized agents running in parallel.</p>
-              <div class="examples">
-                <button class="ex-chip">Build a REST API for notes (create/list) with pytest tests and a Dockerfile</button>
-                <button class="ex-chip">Write a Python CLI to-do app (add/list/done) with tests and a README</button>
-                <button class="ex-chip">Implement a rate limiter class with unit tests and a security review</button>
+            <!-- ------------ Settings: policy + archive/delete ------------ -->
+            <div id="panel-settings" class="panel hidden" role="tabpanel" aria-labelledby="tab-settings">
+              <div class="card settings-card">
+                <h3 class="section-label">Repository</h3>
+                <div id="ph-status" class="proj-status" title="Repository state of this project"><span class="muted">No repository info.</span></div>
+                <div id="ph-indexed" class="ph-indexed muted hidden" title="Last commit indexed into the knowledge graph"></div>
               </div>
+
+              <div class="card settings-card">
+                <h3 class="section-label">Policy — applies to every task in this project</h3>
+                <div class="ph-policy">
+                  <label class="pm-label" for="ph-budget">Budget $ per run</label>
+                  <input id="ph-budget" class="title-input" type="number" min="0" step="0.5" placeholder="none (server default)" />
+                  <label class="pm-label" for="ph-effort">Effort</label>
+                  <select id="ph-effort" class="select">
+                    <option value="">(default)</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="xhigh">xhigh</option>
+                    <option value="max">max</option>
+                  </select>
+                  <label class="pm-label" for="ph-gitmode">Git mode</label>
+                  <select id="ph-gitmode" class="select">
+                    <option value="">(default: branch)</option>
+                    <option value="branch">branch — leave ada/&lt;task&gt; for review</option>
+                    <option value="merge">merge — auto-merge on pass</option>
+                  </select>
+                  <label class="pm-label" for="ph-protected">Protected paths — one glob per line; agents refuse to write them</label>
+                  <textarea id="ph-protected" rows="3" placeholder="infra/**&#10;*.lock"></textarea>
+                  <p id="ph-policy-error" class="pm-error hidden" role="alert"></p>
+                  <div class="pe-actions">
+                    <button id="ph-policy-save" class="btn-primary">Save policy</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card settings-card danger-card">
+                <h3 class="section-label">Archive &amp; delete</h3>
+                <p class="muted">Archiving hides the project from composers; deleting removes its data directory and checkout.</p>
+                <div class="pe-actions">
+                  <button id="proj-archive" type="button" class="btn-secondary">Archive project</button>
+                  <button id="proj-delete" type="button" class="btn-danger">Delete project…</button>
+                </div>
+                <p id="proj-danger-error" class="pm-error hidden" role="alert"></p>
+              </div>
+            </div>
+          </div>
+
+          <!-- ============ TASK DETAIL (inside the project context) ============ -->
+          <div id="view-task" class="view hidden">
+            <nav class="crumb" aria-label="Breadcrumb">
+              <button type="button" id="crumb-project" class="crumb-link"></button>
+              <span class="crumb-sep" aria-hidden="true">/</span>
+              <span id="crumb-title" class="crumb-title"></span>
+            </nav>
+
+            <div id="empty" class="empty hidden">
+              <div class="empty-mark" aria-hidden="true">◆</div>
+              <h2>No task selected</h2>
+              <p>Pick a task from the project's Tasks tab, or start new work from its Overview.</p>
             </div>
 
             <div id="plan-editor" class="card hidden">
@@ -182,7 +293,7 @@
               </div>
               <p id="pe-warning" class="hint hidden"></p>
               <div class="pe-actions">
-                <button id="approve-btn">Approve &amp; Run</button>
+                <button id="approve-btn" class="btn-primary">Approve &amp; Run</button>
                 <button id="discard-btn" class="ghost-btn">Discard</button>
               </div>
             </div>
@@ -293,19 +404,19 @@
               </details>
 
             </div><!-- /run-view -->
-          </div><!-- /view-run -->
+          </div><!-- /view-task -->
 
-          <!-- ============ DASHBOARD ============ -->
-          <div id="view-dashboard" class="view hidden">
+          <!-- ============ ALL ACTIVITY (formerly Dashboard) ============ -->
+          <div id="view-activity" class="view hidden">
             <div class="view-header">
               <div>
-                <h1>Dashboard</h1>
-                <p>Is the assistant good — and getting better? Cost, run quality, and per-agent track record.</p>
+                <h1>All activity</h1>
+                <p>Every project's current state, cost, run quality, and per-agent track record.</p>
               </div>
-              <button id="dash-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh dashboard">⟳</button>
+              <button id="dash-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh activity">⟳</button>
             </div>
             <div class="card">
-              <span class="kicker">Project activity — what is going on in every project</span>
+              <h3 class="section-label">Project activity — what is going on in every project</h3>
               <div id="ds-activity" class="ds-activity"><p class="muted">Loading…</p></div>
             </div>
             <div class="metrics dash-metrics">
@@ -317,11 +428,11 @@
               <div class="metric"><span class="m-val" id="ds-failed">0</span><span class="m-label">failed</span></div>
             </div>
             <div class="card">
-              <span class="kicker">Agent track record — learned from review outcomes</span>
+              <h3 class="section-label">Agent track record — learned from review outcomes</h3>
               <div id="ds-agents" class="ds-agents"><p class="muted">No data yet — run a few tasks.</p></div>
             </div>
             <div class="card">
-              <span class="kicker">Compare two runs — status, quality, tests, cost &amp; time, side by side</span>
+              <h3 class="section-label">Compare two runs — status, quality, tests, cost &amp; time, side by side</h3>
               <div class="cmp-controls">
                 <select id="cmp-a" class="select" title="First run"></select>
                 <span class="cmp-vs">vs</span>
@@ -330,121 +441,9 @@
               </div>
               <div id="cmp-result" class="cmp-result muted">Pick two runs from history and press Compare.</div>
             </div>
-          </div>
-
-          <!-- ============ PROJECT HOME (F4) ============ -->
-          <div id="view-project" class="view hidden">
-            <div class="view-header">
-              <div>
-                <h1 id="ph-name">Project home</h1>
-                <p id="ph-meta" class="ph-meta">Repository status, live activity, policy, and run history for the selected project.</p>
-              </div>
-              <div class="seg-wrap">
-                <button id="ph-new" type="button" class="ghost-btn" title="Create a new project or import an existing repository">＋ New / Import</button>
-                <button id="ph-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh project home">⟳</button>
-              </div>
-            </div>
-            <div class="ph-grid">
-              <div class="card">
-                <span class="kicker">Repository &amp; activity</span>
-                <div id="ph-status" class="proj-status" title="Repository state of the selected project"><span class="muted">No repository info.</span></div>
-                <div id="ph-activity" class="proj-activity pa-idle" role="status" aria-live="polite"><span class="pa-dot" aria-hidden="true"></span>idle</div>
-                <div id="ph-indexed" class="ph-indexed muted hidden" title="Last commit indexed into the knowledge graph"></div>
-              </div>
-              <div class="card">
-                <span class="kicker">Policy — applies to every task in this project</span>
-                <div class="ph-policy">
-                  <label class="pm-label" for="ph-budget">Budget $ per run</label>
-                  <input id="ph-budget" class="title-input" type="number" min="0" step="0.5" placeholder="none (server default)" />
-                  <label class="pm-label" for="ph-effort">Effort</label>
-                  <select id="ph-effort" class="select">
-                    <option value="">(default)</option>
-                    <option value="low">low</option>
-                    <option value="medium">medium</option>
-                    <option value="high">high</option>
-                    <option value="xhigh">xhigh</option>
-                    <option value="max">max</option>
-                  </select>
-                  <label class="pm-label" for="ph-gitmode">Git mode</label>
-                  <select id="ph-gitmode" class="select">
-                    <option value="">(default: branch)</option>
-                    <option value="branch">branch — leave ada/&lt;task&gt; for review</option>
-                    <option value="merge">merge — auto-merge on pass</option>
-                  </select>
-                  <label class="pm-label" for="ph-protected">Protected paths — one glob per line; agents refuse to write them</label>
-                  <textarea id="ph-protected" rows="3" placeholder="infra/**&#10;*.lock"></textarea>
-                  <p id="ph-policy-error" class="pm-error hidden" role="alert"></p>
-                  <div class="pe-actions">
-                    <button id="ph-policy-save">Save policy</button>
-                  </div>
-                </div>
-              </div>
-            </div>
             <div class="card">
-              <div class="ph-trend-head">
-                <span class="kicker">Recent runs — quality trend</span>
-                <span class="ph-trend" aria-hidden="true"><svg id="ph-sparkline" width="140" height="32" viewBox="0 0 140 32" preserveAspectRatio="none"></svg></span>
-                <span id="ph-trend-label" class="muted"></span>
-              </div>
-              <div id="ph-runs" class="ph-runs"><p class="muted">No runs yet for this project.</p></div>
-            </div>
-          </div>
-
-          <!-- ============ AGENTS ============ -->
-          <div id="view-agents" class="view hidden">
-            <div class="view-header">
-              <div>
-                <h1>Agent roster</h1>
-                <p>The specialist team the orchestrator routes work to, by capability match.</p>
-              </div>
-            </div>
-            <div id="agents-roster" class="agents-grid"></div>
-          </div>
-
-          <!-- ============ MEMORY ============ -->
-          <div id="view-memory" class="view hidden">
-            <div class="view-header">
-              <div>
-                <h1>Working memory</h1>
-                <p>Durable notes and facts agents saved during their runs.</p>
-              </div>
-              <button id="mem-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh memory list">⟳</button>
-            </div>
-            <div id="memory-list" class="mem-list"><p class="muted">No memories yet — run a task.</p></div>
-          </div>
-
-          <!-- ============ GRAPH ============ -->
-          <div id="view-graph" class="view hidden">
-            <div class="view-header">
-              <div>
-                <h1>Knowledge graph</h1>
-                <p>Entities and relationships the agents recorded. Click a node to trace its facts.</p>
-              </div>
-              <div class="seg-wrap"><span id="graph-stats" class="muted"></span><button id="graph-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh knowledge graph">⟳</button></div>
-            </div>
-            <div class="graph-wrap"><svg id="graph-svg" viewBox="0 0 800 520" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Knowledge graph of recorded entities and relationships"></svg></div>
-            <div id="graph-legend" class="legend"></div>
-            <div id="node-detail" class="node-detail muted">Click a node to see its facts.</div>
-          </div>
-
-          <!-- ============ FILES ============ -->
-          <div id="view-files" class="view hidden">
-            <div class="view-header">
-              <div>
-                <h1>Workspace files</h1>
-                <p>Artifacts the agents wrote to disk — code, tests, and config the team can run and verify.</p>
-              </div>
-              <div class="seg-wrap"><span id="files-stats" class="muted"></span><select id="files-task" class="select" title="Filter by task" aria-label="Filter files by task"></select><button id="files-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh file list">⟳</button></div>
-            </div>
-            <div class="files-pane">
-              <ul id="file-list" class="file-list"><li class="muted">No files yet — run a task that writes code.</li></ul>
-              <div class="file-view">
-                <div class="file-view-head">
-                  <span id="file-name" class="muted">No file selected</span>
-                  <a id="file-download" class="dl hidden" download>↓ Download</a>
-                </div>
-                <pre id="file-content" class="file-content muted">Select a file to view its contents.</pre>
-              </div>
+              <h3 class="section-label">Agent roster — the specialist team the orchestrator routes work to</h3>
+              <div id="agents-roster" class="agents-grid"></div>
             </div>
           </div>
 
@@ -569,7 +568,7 @@
         </div>
         <p id="pm-error" class="pm-error hidden" role="alert"></p>
         <div class="pe-actions">
-          <button id="pm-submit">Create / Import</button>
+          <button id="pm-submit" class="btn-primary">Create / Import</button>
           <button id="pm-cancel" class="ghost-btn" type="button">Cancel</button>
         </div>
       </div>
