@@ -1,24 +1,47 @@
 """Run generated code/tests in a workspace to get objective verification.
 
-Detects a test command in the workspace (pytest for Python, ``npm test`` for Node) and
-runs it with a timeout. Both async (engine) and sync (agent tool) entry points share the
-same detection + result shape.
+Detects a test command in the workspace (pytest, ``npm test``, ``go test``,
+``cargo test``, Maven/Gradle, rspec/rake) and runs it with a timeout. Both async
+(engine) and sync (agent tool) entry points share the same detection + result shape.
 
-Hardening (Tier 2): model-authored tests/scripts are untrusted, so the sync path can run
-with a scrubbed environment (no API keys leak), POSIX rlimits (CPU/address-space), and a
-new process group that is killed as a whole on timeout — not just the direct child.
+Isolation comes in three tiers, selected by the ``ADA_SANDBOX`` env var (the
+``sandbox: bool`` parameter stays the on/off switch):
+
+- ``subprocess`` (default): scrubbed environment (no API keys leak), POSIX rlimits
+  (CPU/address-space, plus process count on Linux), and a new process group that is
+  killed as a whole on timeout. This is *not* filesystem or network isolation — a
+  sandboxed command can still read world-readable files and reach the network; it just
+  cannot see the parent's secrets or outlive its timeout.
+- ``bwrap``: additionally wraps the command in bubblewrap (Linux) — read-only system
+  dirs, the workspace bound read-write, a private ``/tmp``, and no network unless
+  ``ADA_SANDBOX_NET=1``. Real filesystem + network containment.
+- ``container``: runs the command in a throwaway Docker container
+  (``--network=none`` unless ``ADA_SANDBOX_NET=1``) with only the workspace mounted;
+  image via ``ADA_SANDBOX_IMAGE`` (python-ish commands default to ``python:3.12-slim``).
+
+If the chosen backend's binary is missing, execution falls back to the ``subprocess``
+tier with a one-time warning — the guarantee degrades, it never blocks the run.
+
+Cancellation (R5): callers may pass ``tag=`` to register the child's process group in a
+module-level registry; ``terminate_tag(tag)`` SIGKILLs every group registered under it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger("ada.exec")
 
 _MAX_OUT = 6000
 
@@ -51,14 +74,17 @@ def scrubbed_env() -> dict[str, str]:
 
 
 def _rlimit_preexec(cpu_seconds: int, mem_mb: int):
-    """Return a preexec_fn that sets CPU/address-space limits + a new session (POSIX only)."""
+    """Return a preexec_fn that sets CPU/address-space/process rlimits (POSIX only).
+
+    The new session/process group comes from ``start_new_session=True`` at the spawn
+    site (calling ``os.setsid()`` here too would fail — the child is already a leader).
+    """
     if os.name != "posix":
         return None
 
     def _apply() -> None:  # pragma: no cover - exercised only in subprocesses
         import resource
 
-        os.setsid()  # new process group so we can kill the whole tree on timeout
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 2))
         except (ValueError, OSError):
@@ -69,16 +95,180 @@ def _rlimit_preexec(cpu_seconds: int, mem_mb: int):
                 resource.setrlimit(resource.RLIMIT_AS, (soft, soft))
             except (ValueError, OSError):
                 pass
+        # A fork bomb survives RLIMIT_AS; cap process count. Linux only — on darwin
+        # NPROC is per-user, so a low cap would break the host session.
+        if sys.platform.startswith("linux"):
+            try:
+                resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
+            except (ValueError, OSError):
+                pass
 
     return _apply
 
 
-def detect_test_command(workspace: Path) -> list[str] | None:
-    """Best-effort detection of how to test the project in ``workspace``."""
+def _kill_process_group(pid: int) -> None:
+    """SIGKILL the whole process group so grandchildren can't outlive a timeout."""
+    if os.name != "posix":
+        return
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _spawn_kwargs(sandbox: bool, cpu_seconds: int, mem_mb: int) -> dict:
+    """Shared spawn options: own session (group-kill on timeout) + optional scrub/rlimits."""
+    kwargs: dict = {}
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    if sandbox:
+        kwargs["env"] = scrubbed_env()
+        preexec = _rlimit_preexec(cpu_seconds, mem_mb)
+        if preexec is not None:
+            kwargs["preexec_fn"] = preexec
+    return kwargs
+
+
+# ---------------------------------------------------------------------------
+# Isolation backends (S5). ADA_SANDBOX selects the tier; the sandbox: bool param
+# on run_command(_sync) stays the on/off switch. Missing binaries fall back to
+# the subprocess tier with a one-time warning.
+# ---------------------------------------------------------------------------
+
+_FALLBACK_WARNED: set[str] = set()
+_fallback_lock = threading.Lock()
+
+_PYTHONISH = ("python", "python3", "pytest", "pip", "pip3")
+
+
+def _sandbox_mode() -> str:
+    return (os.environ.get("ADA_SANDBOX") or "subprocess").strip().lower()
+
+
+def _warn_fallback_once(backend: str, reason: str) -> None:
+    with _fallback_lock:
+        if backend in _FALLBACK_WARNED:
+            return
+        _FALLBACK_WARNED.add(backend)
+    logger.warning("ADA_SANDBOX=%s requested but %s; falling back to subprocess hardening",
+                   backend, reason)
+
+
+def _looks_pythonish(command: list[str]) -> bool:
+    if not command:
+        return False
+    base = Path(command[0]).name
+    return base in _PYTHONISH or base.startswith("python")
+
+
+def _wrap_bwrap(command: list[str], cwd: Path) -> list[str]:
+    wrapped = ["bwrap", "--die-with-parent", "--proc", "/proc", "--dev", "/dev",
+               "--tmpfs", "/tmp"]
+    for sysdir in ("/usr", "/lib", "/lib64", "/lib32", "/bin", "/sbin", "/etc"):
+        if os.path.exists(sysdir):
+            wrapped += ["--ro-bind", sysdir, sysdir]
+    wrapped += ["--bind", str(cwd), str(cwd), "--chdir", str(cwd)]
+    if os.environ.get("ADA_SANDBOX_NET") != "1":
+        wrapped += ["--unshare-net"]
+    return wrapped + list(command)
+
+
+def _wrap_container(command: list[str], cwd: Path) -> list[str]:
+    pythonish = _looks_pythonish(command)
+    image = os.environ.get("ADA_SANDBOX_IMAGE") or (
+        "python:3.12-slim" if pythonish else "debian:stable-slim")
+    wrapped = ["docker", "run", "--rm", "-v", f"{cwd}:/w", "-w", "/w"]
+    if os.environ.get("ADA_SANDBOX_NET") != "1":
+        wrapped += ["--network=none"]
+    inner = list(command)
+    if pythonish and Path(inner[0]).name.startswith("python"):
+        inner[0] = "python"  # the host interpreter path does not exist in the image
+    return wrapped + [image] + inner
+
+
+def _apply_sandbox_backend(command: list[str], cwd: Path) -> list[str]:
+    """Rewrite ``command`` for the configured isolation backend, if any.
+
+    Returns the command unchanged for the default ``subprocess`` tier, an unknown
+    mode, or when the chosen backend's binary is missing (one-time warning).
+    """
+    mode = _sandbox_mode()
+    if mode in ("", "subprocess"):
+        return command
+    if mode == "bwrap":
+        if shutil.which("bwrap") is None:
+            _warn_fallback_once("bwrap", "bwrap is not on PATH")
+            return command
+        return _wrap_bwrap(command, cwd)
+    if mode == "container":
+        if shutil.which("docker") is None:
+            _warn_fallback_once("container", "docker is not on PATH")
+            return command
+        return _wrap_container(command, cwd)
+    _warn_fallback_once(mode, "it is not a known backend (subprocess|bwrap|container)")
+    return command
+
+
+# ---------------------------------------------------------------------------
+# Process registry (R5): tag -> process-group ids of live children, so the engine
+# can hard-cancel everything a run spawned via terminate_tag(run_id).
+# ---------------------------------------------------------------------------
+
+_registry_lock = threading.Lock()
+_process_registry: dict[str, set[int]] = {}
+
+
+def _register_pgid(tag: str, pid: int) -> None:
+    if os.name != "posix":
+        return
+    with _registry_lock:
+        _process_registry.setdefault(tag, set()).add(pid)
+
+
+def _unregister_pgid(tag: str, pid: int) -> None:
+    if os.name != "posix":
+        return
+    with _registry_lock:
+        pgids = _process_registry.get(tag)
+        if pgids is not None:
+            pgids.discard(pid)
+            if not pgids:
+                _process_registry.pop(tag, None)
+
+
+def terminate_tag(tag: str) -> int:
+    """SIGKILL every process group registered under ``tag``; returns groups killed.
+
+    The engine calls this with the run id on cancellation, so children spawned by
+    run_command/run_workspace_tests do not outlive a cancelled run.
+    """
+    with _registry_lock:
+        pgids = _process_registry.pop(tag, set())
+    killed = 0
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            killed += 1
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    return killed
+
+
+def detect_test_command(workspace: Path, paths: list[str] | None = None) -> list[str] | None:
+    """Best-effort detection of how to test the project in ``workspace``.
+
+    Precedence: pytest, ``npm test``, then Go, Rust, Java (Maven/Gradle), Ruby.
+    ``paths`` (workspace-relative test files) narrows the run for pytest and Go
+    (mapped to package dirs); the other runners have no portable file-selection so
+    paths are ignored there.
+    """
     if not workspace.exists():
         return None
     if any(workspace.rglob("test_*.py")) or any(workspace.rglob("*_test.py")):
-        return [sys.executable, "-m", "pytest", "-q"]
+        cmd = [sys.executable, "-m", "pytest", "-q"]
+        if paths:
+            cmd += [str(p) for p in paths]
+        return cmd
     pkg = workspace / "package.json"
     if pkg.is_file():
         try:
@@ -87,22 +277,62 @@ def detect_test_command(workspace: Path) -> list[str] | None:
                 return ["npm", "test", "--silent"]
         except Exception:
             pass
+    if (workspace / "go.mod").is_file():
+        cmd = ["go", "test"]
+        if paths:
+            pkgs = sorted({_go_package(p) for p in paths})
+            return cmd + pkgs
+        return cmd + ["./..."]
+    if (workspace / "Cargo.toml").is_file():
+        return ["cargo", "test", "-q"]
+    if (workspace / "mvnw").is_file() or (workspace / "pom.xml").is_file():
+        return ["mvn", "-q", "test"]
+    if (workspace / "gradlew").is_file():
+        return ["./gradlew", "test"]
+    if (workspace / "Rakefile").is_file():
+        if (workspace / "spec").is_dir():
+            return ["bundle", "exec", "rspec"]
+        return ["rake", "test"]
     return None
 
 
-async def run_command(command: list[str], cwd: Path, timeout: float) -> ExecutionResult:
+def _go_package(path: str) -> str:
+    """Map a changed file to the Go package dir ``go test`` accepts."""
+    parent = Path(path).parent.as_posix()
+    return "." if parent == "." else f"./{parent}"
+
+
+async def run_command(command: list[str], cwd: Path, timeout: float, *,
+                      sandbox: bool = False, cpu_seconds: int = 60, mem_mb: int = 1024,
+                      tag: str | None = None) -> ExecutionResult:
     start = time.monotonic()
-    proc = await asyncio.create_subprocess_exec(
-        *command, cwd=str(cwd),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
+    actual = _apply_sandbox_backend(command, cwd) if sandbox else command
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *actual, cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            **_spawn_kwargs(sandbox, cpu_seconds, mem_mb),
+        )
+    except FileNotFoundError as exc:
+        return ExecutionResult(" ".join(command), -1, "", f"command not found: {exc}",
+                               time.monotonic() - start, False)
+    if tag:
+        _register_pgid(tag, proc.pid)
     timed_out = False
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout)
-    except asyncio.TimeoutError:
-        timed_out = True
-        proc.kill()
-        out, err = await proc.communicate()
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            timed_out = True
+            _kill_process_group(proc.pid)
+            try:
+                proc.kill()  # belt-and-braces if the group kill raced
+            except ProcessLookupError:
+                pass
+            out, err = await proc.communicate()
+    finally:
+        if tag:
+            _unregister_pgid(tag, proc.pid)
     return ExecutionResult(
         command=" ".join(command),
         return_code=proc.returncode if proc.returncode is not None else -1,
@@ -114,32 +344,51 @@ async def run_command(command: list[str], cwd: Path, timeout: float) -> Executio
 
 
 def run_command_sync(command: list[str], cwd: Path, timeout: float, *,
-                     sandbox: bool = False, cpu_seconds: int = 60, mem_mb: int = 1024) -> ExecutionResult:
+                     sandbox: bool = False, cpu_seconds: int = 60, mem_mb: int = 1024,
+                     tag: str | None = None) -> ExecutionResult:
     start = time.monotonic()
-    kwargs: dict = {"cwd": str(cwd), "capture_output": True, "timeout": timeout, "text": True}
-    if sandbox:
-        kwargs["env"] = scrubbed_env()
-        preexec = _rlimit_preexec(cpu_seconds, mem_mb)
-        if preexec is not None:
-            kwargs["preexec_fn"] = preexec
-            kwargs["start_new_session"] = True
+    actual = _apply_sandbox_backend(command, cwd) if sandbox else command
     try:
-        p = subprocess.run(command, **kwargs)
-        return ExecutionResult(" ".join(command), p.returncode, _trim(p.stdout), _trim(p.stderr),
-                               time.monotonic() - start, False)
-    except subprocess.TimeoutExpired as exc:
-        return ExecutionResult(" ".join(command), -1, _trim(exc.stdout or ""), _trim(exc.stderr or ""),
-                               time.monotonic() - start, True)
+        proc = subprocess.Popen(actual, cwd=str(cwd), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                **_spawn_kwargs(sandbox, cpu_seconds, mem_mb))
     except FileNotFoundError as exc:
         return ExecutionResult(" ".join(command), -1, "", f"command not found: {exc}",
                                time.monotonic() - start, False)
+    if tag:
+        _register_pgid(tag, proc.pid)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return ExecutionResult(" ".join(command), proc.returncode, _trim(out), _trim(err),
+                               time.monotonic() - start, False)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc.pid)
+        proc.kill()  # belt-and-braces if the group kill raced
+        out, err = proc.communicate()
+        return ExecutionResult(" ".join(command), -1, _trim(out or ""), _trim(err or ""),
+                               time.monotonic() - start, True)
+    finally:
+        if tag:
+            _unregister_pgid(tag, proc.pid)
 
 
-async def run_workspace_tests(workspace: Path, timeout: float) -> ExecutionResult | None:
-    cmd = detect_test_command(workspace)
-    return await run_command(cmd, workspace, timeout) if cmd else None
+async def run_workspace_tests(workspace: Path, timeout: float, *,
+                              paths: list[str] | None = None, sandbox: bool = True,
+                              cpu_seconds: int = 60, mem_mb: int = 1024,
+                              tag: str | None = None) -> ExecutionResult | None:
+    cmd = detect_test_command(workspace, paths)
+    if cmd is None:
+        return None
+    return await run_command(cmd, workspace, timeout,
+                             sandbox=sandbox, cpu_seconds=cpu_seconds, mem_mb=mem_mb, tag=tag)
 
 
-def run_workspace_tests_sync(workspace: Path, timeout: float) -> ExecutionResult | None:
-    cmd = detect_test_command(workspace)
-    return run_command_sync(cmd, workspace, timeout) if cmd else None
+def run_workspace_tests_sync(workspace: Path, timeout: float, *,
+                             paths: list[str] | None = None, sandbox: bool = True,
+                             cpu_seconds: int = 60, mem_mb: int = 1024,
+                             tag: str | None = None) -> ExecutionResult | None:
+    cmd = detect_test_command(workspace, paths)
+    if cmd is None:
+        return None
+    return run_command_sync(cmd, workspace, timeout,
+                            sandbox=sandbox, cpu_seconds=cpu_seconds, mem_mb=mem_mb, tag=tag)
