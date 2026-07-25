@@ -1,13 +1,37 @@
-.venv/
+# --- Python ---
 __pycache__/
-*.pyc
-.env
-.ada_data/
-workspace/
-docs/*/
-docs/INDEX.md
-.pytest_cache/
+*.py[cod]
 *.egg-info/
+.eggs/
 dist/
 build/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# --- Secrets / local env (keep the template) ---
+.env
+.env.*
+!.env.example
+
+# --- Runtime state this app produces ---
+.ada_data/       # memory/run stores, knowledge graphs (incl. *.db-wal/-shm, *.lock)
+workspace/       # per-run agent sandboxes
+docs/*/          # per-task generated docs (plan/report/brief/events/trace/audit);
+                 # top-level files like docs/ARCHITECTURE.md stay tracked
+docs/INDEX.md
+
+# --- Node (JS helper tests) ---
+node_modules/
+npm-debug.log*
+
+# --- Editors / OS ---
 .DS_Store
+.idea/
+.vscode/
+*.log
