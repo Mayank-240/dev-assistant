@@ -35,6 +35,35 @@ templates, regenerate offline with `ai-dev-assistant eval --record-cassettes`; `
 spawn runs on a worker-thread event loop, so a loop-bound provider surfaces a tool error
 rather than delegating (degrades safely).
 
+### Third pass (same day): every residual closed
+
+- **SDK mid-run budget stop**: the PreToolUse gate now denies ALL tool calls once
+  `max_cost_usd` is spent — an over-budget SDK agent can only wrap up with text.
+- **Per-subtask git worktrees** (`ADA_WORKTREE_PER_SUBTASK`): parallel subtasks work in
+  isolated checkouts under `.ada_worktrees/` and merge back serially with conflict
+  detection. Building this surfaced and fixed a context-poisoning bug: sibling worktrees
+  were leaking into the repo map / context packs / reviewer file lists — all workspace
+  scans now exclude engine-internal dirs.
+- **Golden suite → 10 tasks** across Python/JS/Go/Rust/Ruby with per-language held-out
+  grading and toolchain-aware skips; secret-gated `workflow_dispatch` live-eval workflow
+  uploads the JSON scorecard.
+- **A/B tuning harness**: `ada eval --ab ADA_KNOB=V1,V2 [--replay]` compares pass-rate /
+  quality / cost per arm with a verdict line — config choices are now tunable with data.
+- **Web UI**: remaining pure logic (event reducer, budget meter, comparison/timeline
+  models, resume gate) extracted into `util.js` (31 node tests total) and a full a11y
+  pass (dialog semantics + focus traps, tablist roles, keyboard activation, aria-labels,
+  focus-visible, reduced-motion, contrast). Also removed a claude.ai preview-harness
+  script that had been embedded in `index.html` since the initial commit.
+- **Deployment**: multi-stage non-root Dockerfile (fixed a `.dockerignore` bug that made
+  the previous image unbuildable), hardened docker-compose (`read_only` rootfs verified
+  live, `cap_drop: ALL`, `no-new-privileges`), and `docs/DEPLOYMENT.md` with the threat
+  model. `RunContext` now threads the run phases (A1 closed).
+
+Remaining by design: mandatory containerization stays a deployment choice (see
+DEPLOYMENT.md); browser-DOM code in app.js is untested beyond the extracted logic
+(a Playwright harness would be the first new dev dependency); live-LLM evals run via the
+manual workflow, not on every push.
+
 Highlights of what changed: SDK built-ins are now confined by a PreToolUse deny-hook
 (no more `bypassPermissions`); the async exec path is sandboxed and process groups are
 actually killed; `install_packages` validates PEP 508 and installs to a per-workspace
