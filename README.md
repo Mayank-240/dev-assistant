@@ -8,7 +8,9 @@ real test/lint signals**, and each task is **documented** as a full report plus 
 one-glance **brief**. There's a **modern web UI** with live progress.
 
 It works on **real repositories** — clone or open an existing codebase, make verified
-multi-file changes with real file/grep/patch/exec/git tools in a **sandbox**, and deliver
+multi-file changes with real file/grep/patch/exec/git tools in a **hardened per-run
+workspace** (path-confined tools, scrubbed env, rlimits, process-group kill — note: not
+full filesystem/network isolation; run in a container for that), and deliver
 the work as a **branch + commit**. Runs are **reliable** (a strict-review miss degrades
 gracefully instead of cascading failure), **measurable** (a golden-task `ada eval` harness,
 per-run quality scores, cost attribution, span tracing, durable event logs), and they
