@@ -160,6 +160,28 @@ class Engine:
                     emit(status(f"Onboarded {onb['files']} repo file(s) into the KB + graph."))
             except Exception as exc:  # never let repo setup abort the whole run
                 emit(status(f"Repository setup failed ({exc}); continuing greenfield."))
+        elif (checkout := self._project_checkout()) is not None:
+            # Project-level flow (PLAN F1/F2): the project owns a durable checkout;
+            # refresh its index incrementally, then materialize the run workspace from it.
+            emit(status(f"Preparing workspace from project '{self.settings.project}'…"))
+            try:
+                try:
+                    from . import projects as _projects
+                    ref = await asyncio.to_thread(
+                        _projects.refresh_index, self.settings, self.settings.project,
+                        self.kb, self.kg)
+                    if ref.get("files"):
+                        emit(status(f"Project index refreshed: {ref['files']} file(s) "
+                                    f"({ref.get('mode', '?')})."))
+                except Exception as exc:  # indexing is best-effort
+                    logger.info("project index refresh skipped: %s", exc)
+                info = await asyncio.to_thread(
+                    vcs.materialize, dest=run_ws, repo_url="",
+                    repo_path=str(checkout), repo_ref="")
+                emit(status(f"Project workspace ready @ {info.get('head', '')[:8]}."))
+                repo_context = await asyncio.to_thread(build_repo_map, run_ws)
+            except Exception as exc:
+                emit(status(f"Project workspace setup failed ({exc}); continuing greenfield."))
         elif continue_from:
             # Re-engagement: carry the prior task's workspace + outcome forward.
             repo_context = await self._prepare_continuation(continue_from, run_ws, rid, emit)
@@ -177,6 +199,14 @@ class Engine:
             except Exception as exc:
                 emit(status(f"Baseline capture skipped: {exc}"))
         return repo_context
+
+    def _project_checkout(self) -> Path | None:
+        """The active project's durable repo checkout, if it has one (PLAN F1)."""
+        try:
+            from . import projects as _projects
+            return _projects.project_checkout(self.settings, self.settings.project)
+        except Exception:
+            return None
 
     async def _prepare_continuation(self, parent_id: str, run_ws: Path, rid: str, emit: EventFn) -> str:
         """Carry the parent task's workspace + context forward into this run."""
@@ -271,7 +301,7 @@ class Engine:
             raise
 
         final_title = (title or "").strip() or (getattr(plan, "title", "") or "").strip() or None
-        self.runs.start(run.id, prompt, title=final_title)
+        self.runs.start(run.id, prompt, title=final_title, project=self.settings.project)
         try:
             self.runs.save_plan(run.id, plan.model_dump_json())  # resumable (R1)
         except Exception:

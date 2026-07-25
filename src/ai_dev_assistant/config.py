@@ -87,10 +87,12 @@ class Settings:
     agent_max_turns: int = 24       # per-agent tool-loop cap (lower = cheaper)
     subtask_max_seconds: float = 900.0  # wall-clock cap per subtask attempt (0 = no cap)
 
-    # --- Real-repo binding (Tier 2) ---
-    repo_url: str = ""              # git URL to clone into the workspace before the run
-    repo_path: str = ""            # local repo path to copy/worktree into the workspace
-    repo_ref: str = ""             # branch/tag/sha to check out
+    # --- Real-repo binding (programmatic only; per-run env binding was removed in
+    # favor of projects — see docs/PLAN.md. The eval harness still constructs
+    # Settings(repo_path=...) directly for fixture repos.) ---
+    repo_url: str = ""
+    repo_path: str = ""
+    repo_ref: str = ""
     git_finalize: bool = False      # at the end, commit the workspace on a new branch
     git_branch_prefix: str = "ada/"
     worktree_per_subtask: bool = False  # isolate parallel subtasks in git worktrees, merge on pass
@@ -152,9 +154,6 @@ class Settings:
             budget_usd=_float("ADA_BUDGET_USD", 0.0),
             agent_max_turns=_int("ADA_AGENT_MAX_TURNS", 24),
             subtask_max_seconds=_float("ADA_SUBTASK_MAX_SECONDS", 900.0),
-            repo_url=_get("ADA_REPO_URL", ""),
-            repo_path=_get("ADA_REPO_PATH", ""),
-            repo_ref=_get("ADA_REPO_REF", ""),
             git_finalize=_bool("ADA_GIT_FINALIZE", False),
             git_branch_prefix=_get("ADA_GIT_BRANCH_PREFIX", "ada/"),
             worktree_per_subtask=_bool("ADA_WORKTREE_PER_SUBTASK", False),

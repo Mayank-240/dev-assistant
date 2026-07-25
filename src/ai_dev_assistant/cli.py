@@ -23,6 +23,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
     runp = sub.add_parser("run", help="Run a task end-to-end")
     runp.add_argument("prompt", help="The task to perform, in quotes")
+    runp.add_argument("-p", "--project", default=None, metavar="SLUG",
+                      help="Run inside this project (memory, knowledge, and repo checkout)")
     runp.add_argument("--ingest", action="append", default=[], metavar="FILE",
                       help="Ingest a file into the knowledge base first (repeatable)")
     runp.add_argument("-i", "--interactive", action="store_true",
@@ -30,6 +32,23 @@ def _build_parser() -> argparse.ArgumentParser:
     runp.add_argument("--continue", dest="continue_from", metavar="TASK_ID", default=None,
                       help="Re-engage a completed task: continue its workspace + context with this prompt")
     runp.add_argument("-q", "--quiet", action="store_true", help="Hide internal INFO logs")
+
+    projp = sub.add_parser("project", help="Manage projects (the durable unit of work)")
+    projsub = projp.add_subparsers(dest="pcmd", required=True)
+    p_new = projsub.add_parser("new", help="Create a greenfield project (own git repo)")
+    p_new.add_argument("name")
+    p_imp = projsub.add_parser("import", help="Import an existing repo (local path: in place; URL: clone)")
+    p_imp.add_argument("source", help="Local repo path or git URL")
+    p_imp.add_argument("--name", default=None)
+    p_imp.add_argument("--ref", default="", help="Branch/tag/sha for URL imports")
+    projsub.add_parser("list", help="List projects")
+    p_show = projsub.add_parser("show", help="Show a project's status")
+    p_show.add_argument("slug")
+    p_arch = projsub.add_parser("archive", help="Archive a project (hide, keep data)")
+    p_arch.add_argument("slug")
+    p_del = projsub.add_parser("delete", help="Delete a project's data (never a local-origin checkout)")
+    p_del.add_argument("slug")
+    p_del.add_argument("--yes", action="store_true", help="Skip confirmation")
 
     resumep = sub.add_parser("resume", help="Resume an interrupted run from its checkpoints")
     resumep.add_argument("task_id", help="The interrupted run's task id")
@@ -63,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.cmd == "run":
         return _run(args)
+    if args.cmd == "project":
+        return _project(args)
     if args.cmd == "resume":
         return _resume(args)
     if args.cmd == "server":
@@ -70,6 +91,47 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "eval":
         return _eval(args)
     return 1
+
+
+def _project(args: argparse.Namespace) -> int:
+    from . import projects
+
+    settings = Settings.load()
+    try:
+        if args.pcmd == "new":
+            p = projects.create_project(settings, args.name)
+            print(f"Created project '{p['slug']}' ({p.get('origin', 'greenfield')}) "
+                  f"at {p.get('root') or '(no checkout)'}")
+        elif args.pcmd == "import":
+            p = projects.import_project(settings, args.source, name=args.name, ref=args.ref)
+            mode = "in place" if p.get("origin") == "local" else "cloned"
+            print(f"Imported '{p['slug']}' ({mode}) — root: {p.get('root')}, "
+                  f"branch: {p.get('default_branch', '?')}")
+        elif args.pcmd == "list":
+            for p in projects.list_projects(settings):
+                flag = " [archived]" if p.get("archived") else ""
+                root = p.get("root") or "(scratch)"
+                print(f"{p['slug']:<24} {p.get('origin', '-'):<11} {root}{flag}")
+        elif args.pcmd == "show":
+            st = projects.project_status(settings, args.slug)
+            for k in ("slug", "origin", "root", "branch", "head", "dirty",
+                      "last_indexed_commit", "archived"):
+                print(f"{k:>20}: {st.get(k, '')}")
+        elif args.pcmd == "archive":
+            projects.archive_project(settings, args.slug)
+            print(f"Archived '{args.slug}'.")
+        elif args.pcmd == "delete":
+            if not args.yes:
+                confirm = input(f"Delete project '{args.slug}' data? [y/N] ").strip().lower()
+                if confirm not in ("y", "yes"):
+                    print("Aborted.")
+                    return 0
+            projects.delete_project(settings, args.slug)
+            print(f"Deleted '{args.slug}' (local-origin checkouts are never removed).")
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    return 0
 
 
 def _resume(args: argparse.Namespace) -> int:
@@ -252,6 +314,12 @@ def _run(args: argparse.Namespace) -> int:
         stream=sys.stderr,
     )
     settings = Settings.load()
+    if getattr(args, "project", None):
+        import dataclasses
+
+        from . import projects
+        settings = dataclasses.replace(settings, project=projects.resolve(settings, args.project))
+        print(f"Project: {settings.project}")
     if settings.requires_api_key and not settings.has_api_key:
         print("ERROR: ANTHROPIC_API_KEY is not set (required for the 'anthropic' backend). "
               "Use ADA_LLM_BACKEND=claude_sdk to run via your Claude Code login instead.", file=sys.stderr)

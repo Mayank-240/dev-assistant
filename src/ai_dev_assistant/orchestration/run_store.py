@@ -104,18 +104,20 @@ class RunStore:
         for col, decl in (("title", "TEXT"), ("kg_nodes", "INTEGER"), ("kg_edges", "INTEGER"),
                           ("memories", "INTEGER"), ("messages", "INTEGER"),
                           ("quality_score", "REAL"), ("run_status", "TEXT"),
-                          ("parent_id", "TEXT"), ("plan_json", "TEXT")):
+                          ("parent_id", "TEXT"), ("plan_json", "TEXT"),
+                          ("project", "TEXT")):
             try:
                 self._conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError:
                 pass
         self._conn.commit()
 
-    def start(self, run_id: str, prompt: str, title: str | None = None) -> None:
+    def start(self, run_id: str, prompt: str, title: str | None = None,
+              project: str | None = None) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO runs(id, prompt, title, status, created_at) "
-            "VALUES (?, ?, ?, 'running', ?)",
-            (run_id, prompt, title or derive_title(prompt), time.time()),
+            "INSERT OR REPLACE INTO runs(id, prompt, title, status, created_at, project) "
+            "VALUES (?, ?, ?, 'running', ?, ?)",
+            (run_id, prompt, title or derive_title(prompt), time.time(), project or "default"),
         )
         self._conn.commit()
 
@@ -151,10 +153,14 @@ class RunStore:
         row = self._conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         return dict(row) if row else None
 
-    def list(self, limit: int = 100) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
-            "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
-        ).fetchall()
+    def list(self, limit: int = 100, project: str | None = None) -> list[dict[str, Any]]:
+        if project:
+            rows = self._conn.execute(
+                "SELECT * FROM runs WHERE COALESCE(project,'default') = ? "
+                "ORDER BY created_at DESC LIMIT ?", (project, limit)).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
     def delete(self, run_id: str) -> None:
