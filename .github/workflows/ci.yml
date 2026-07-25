@@ -15,15 +15,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Split into granular steps so a failure pinpoints the exact command even
-      # when only step-level status is visible.
-      - name: uv diagnostics
-        run: |
-          uv --version
-          uv python find 3.12 || true
-
+      # setup-uv with a python-version already provisions .venv — recreate with
+      # --clear so this works regardless of that behavior.
       - name: Create venv
-        run: uv venv --python 3.12
+        run: uv venv --clear --python 3.12
 
       - name: Install project (editable + dev extras)
         run: uv pip install -e ".[dev]"
