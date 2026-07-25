@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .graph import KnowledgeGraph
 
-_SKIP_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "dist", "build"}
+_SKIP_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "dist", "build", ".ada_worktrees", ".ada_deps"}
 _MAX_FILES = 80
 _MAX_DEFS_PER_FILE = 50
 

@@ -19,7 +19,7 @@ from .graph import KnowledgeGraph
 
 logger = logging.getLogger("ada.repomap")
 
-_SKIP = {"__pycache__", ".git", "node_modules", ".venv", "dist", "build", ".pytest_cache", ".ada_data"}
+_SKIP = {"__pycache__", ".git", "node_modules", ".venv", "dist", "build", ".pytest_cache", ".ada_data", ".ada_worktrees", ".ada_deps"}
 _CODE_EXT = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".rb", ".c", ".cpp", ".h"}
 _JS_EXT = {".js", ".ts", ".tsx", ".jsx"}
 _ENTRYPOINTS = {"main.py", "app.py", "__main__.py", "cli.py", "index.js", "server.py", "manage.py"}

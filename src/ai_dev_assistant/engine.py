@@ -58,6 +58,17 @@ _SUMMARY_SYSTEM = (
 
 EventFn = Callable[[Event], None]
 _MAX_REPAIRS = 2  # adaptive-replan safety cap per run
+# Engine-internal dirs inside the run workspace that must never leak into context,
+# diffs, or the reviewer's ground truth (sibling worktrees, vendored deps).
+_INTERNAL_DIRS = {".git", "__pycache__", ".ada_worktrees", ".ada_deps"}
+
+
+@dataclasses.dataclass(frozen=True)
+class RunContext:
+    """Per-run identifiers and channels threaded through the phases (A1)."""
+    rid: str
+    run_ws: Path
+    emit: EventFn
 
 
 class Engine:
@@ -129,8 +140,9 @@ class Engine:
         )
 
     # ---- phase: workspace setup (A1) — repo materialization / continuation / baseline ----
-    async def _setup_workspace(self, run_ws: Path, rid: str, *, continue_from: str | None,
-                               resume: bool, emit: EventFn) -> str:
+    async def _setup_workspace(self, ctx: RunContext, *, continue_from: str | None,
+                               resume: bool) -> str:
+        run_ws, rid, emit = ctx.run_ws, ctx.rid, ctx.emit
         repo_context = ""
         if resume:
             pass  # the workspace already holds the interrupted run's state — don't re-materialize
@@ -232,8 +244,8 @@ class Engine:
                 plan = Plan.model_validate_json(stored)
                 emit(status(f"Resuming task {task_id} from its checkpointed plan."))
 
-        repo_context = await self._setup_workspace(run_ws, rid, continue_from=continue_from,
-                                                   resume=resume, emit=emit)
+        ctx = RunContext(rid=rid, run_ws=run_ws, emit=emit)
+        repo_context = await self._setup_workspace(ctx, continue_from=continue_from, resume=resume)
 
         if plan is None:
             prior = self._recall_prior(prompt)
@@ -315,7 +327,7 @@ class Engine:
                        {"created": pool.created_total, "reaped": pool.reaped_total}))
 
             brief, out_dir = await self._finalize_run(
-                run, run_ws, emit, over_budget=over_budget, final_title=final_title,
+                run, ctx, over_budget=over_budget, final_title=final_title,
                 prompt=prompt, pool=pool)
             finalized = True
             return run, brief, out_dir
@@ -340,9 +352,10 @@ class Engine:
                     self.runs.set_status(run.id, "failed")
 
     # ---- phase: finalize (A1) — objective tests, delivery, summary, learning, docs ----
-    async def _finalize_run(self, run: TaskRun, run_ws: Path, emit: EventFn, *,
+    async def _finalize_run(self, run: TaskRun, ctx: RunContext, *,
                             over_budget: bool, final_title: str | None, prompt: str,
                             pool: SessionPool) -> tuple[BriefDoc, Path]:
+        run_ws, emit = ctx.run_ws, ctx.emit
         # Objective verification: run the generated tests in the run's workspace.
         if self.settings.verify_run_tests:
             from .execution import run_workspace_tests
@@ -630,7 +643,7 @@ class Engine:
             return []
         out = []
         for p in sorted(ws.rglob("*")):
-            if p.is_file() and ".git" not in p.parts and "__pycache__" not in p.parts:
+            if p.is_file() and not _INTERNAL_DIRS.intersection(p.parts):
                 out.append(str(p.relative_to(ws)))
         return out[:200]
 
@@ -640,7 +653,7 @@ class Engine:
         if not run_ws.is_dir():
             return idx
         for p in run_ws.rglob("*"):
-            if p.is_file() and ".git" not in p.parts and "__pycache__" not in p.parts:
+            if p.is_file() and not _INTERNAL_DIRS.intersection(p.parts):
                 try:
                     idx[str(p.relative_to(run_ws))] = p.stat().st_size
                 except OSError:
@@ -690,6 +703,8 @@ class Engine:
         return ToolBox(ToolContext(**{k: v for k, v in kwargs.items() if k in fields}))
 
     def _make_execute(self, run: TaskRun, emit: EventFn, run_workspace: Path):
+        git_lock = asyncio.Lock()  # serializes worktree add/merge on the shared repo
+
         def usage_snapshot() -> dict[str, Any]:
             u = getattr(self.provider, "usage", None)
             return u.snapshot() if u and hasattr(u, "snapshot") else {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "calls": 0}
@@ -709,21 +724,51 @@ class Engine:
             before_cost = usage_snapshot()
             agent = session.agent  # the BaseAgent for this session
 
+            # Per-subtask worktree isolation (opt-in): parallel subtasks each work on
+            # their own checkout and merge back on completion, so siblings can't
+            # clobber each other's files mid-write.
+            use_wt = (self.settings.worktree_per_subtask and len(run.subtasks) > 1
+                      and (run_workspace / ".git").exists())
+            exec_ws = run_workspace
+            if use_wt:
+                try:
+                    async with git_lock:
+                        exec_ws = await asyncio.to_thread(vcs.worktree_add, run_workspace, state.id)
+                except Exception as exc:
+                    emit(status(f"{state.id}: worktree isolation unavailable ({exc}); "
+                                "using the shared workspace."))
+                    exec_ws, use_wt = run_workspace, False
+
             async def spawn(agent_name: str, task: str) -> str:
                 """Depth-1 delegation (T4): run a specialist inline on a bounded subtask."""
                 sub = self.agents.get(agent_name)
                 if sub is None:
                     return f"unknown agent '{agent_name}'"
-                sub_box = self._build_toolbox(agent_name, run.id, run_workspace, spawn=None)
-                try:
+
+                async def _go(provider) -> str:
+                    sub_box = self._build_toolbox(agent_name, run.id, exec_ws, spawn=None)
                     return await asyncio.wait_for(sub.run(
                         task_text=task[:4000], context="", toolbox=sub_box,
-                        provider=self.provider, workdir=str(run_workspace), on_step=on_step),
+                        provider=provider, workdir=str(exec_ws), on_step=on_step),
                         timeout=self.settings.subtask_max_seconds or None)
+
+                try:
+                    return await _go(self.provider)
                 except asyncio.TimeoutError:
                     return "[delegation stopped: wall-clock cap]"
+                except RuntimeError:
+                    # The delegate tool runs this coroutine on a worker-thread event loop;
+                    # a provider client bound to the main loop fails with RuntimeError.
+                    # Retry once with a dedicated provider instance.
+                    fresh = get_provider(self.settings)
+                    try:
+                        return await _go(fresh)
+                    except asyncio.TimeoutError:
+                        return "[delegation stopped: wall-clock cap]"
+                    finally:
+                        await fresh.aclose()
 
-            toolbox = self._build_toolbox(state.agent, run.id, run_workspace, spawn=spawn)
+            toolbox = self._build_toolbox(state.agent, run.id, exec_ws, spawn=spawn)
             criteria = "\n".join(f"- {c}" for c in state.spec.acceptance_criteria) or "- (none)"
             task_text = (
                 f"{state.spec.title}\n\n{state.spec.description}\n\nAcceptance criteria:\n{criteria}"
@@ -766,22 +811,38 @@ class Engine:
             cap = self.settings.subtask_max_seconds or None
             run_kwargs: dict[str, Any] = dict(
                 task_text=task_text, context=context, toolbox=toolbox,
-                provider=self.provider, workdir=str(run_workspace), on_step=on_step)
+                provider=self.provider, workdir=str(exec_ws), on_step=on_step)
             if budget:
                 # R3: hand the tool loop the remaining budget so it can stop mid-subtask.
                 run_kwargs["max_cost_usd"] = max(0.0, budget - float(usage_snapshot()["cost_usd"]))
-            with self._tracer.span("subtask", state.id, agent=state.agent):
-                try:
+            try:
+                with self._tracer.span("subtask", state.id, agent=state.agent):
                     try:
-                        coro = agent.run(**run_kwargs)
-                    except TypeError:  # BaseAgent without max_cost_usd support
-                        run_kwargs.pop("max_cost_usd", None)
-                        coro = agent.run(**run_kwargs)
-                    result = await asyncio.wait_for(coro, timeout=cap)
-                except asyncio.TimeoutError:
-                    raise RuntimeError(
-                        f"subtask exceeded the wall-clock cap ({cap:.0f}s); "
-                        "raise ADA_SUBTASK_MAX_SECONDS if this task legitimately needs longer")
+                        try:
+                            coro = agent.run(**run_kwargs)
+                        except TypeError:  # BaseAgent without max_cost_usd support
+                            run_kwargs.pop("max_cost_usd", None)
+                            coro = agent.run(**run_kwargs)
+                        result = await asyncio.wait_for(coro, timeout=cap)
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(
+                            f"subtask exceeded the wall-clock cap ({cap:.0f}s); "
+                            "raise ADA_SUBTASK_MAX_SECONDS if this task legitimately needs longer")
+                if use_wt:
+                    async with git_lock:
+                        mres = await asyncio.to_thread(
+                            vcs.worktree_merge, run_workspace, state.id,
+                            message=f"ada: subtask {state.id} ({state.spec.title[:50]})")
+                    if mres.get("conflict"):
+                        conflicts = ", ".join(mres.get("files", [])) or "unknown files"
+                        result += (f"\n\n[worktree merge conflict on: {conflicts} — these changes "
+                                   "were NOT merged into the shared workspace]")
+                        emit(status(f"{state.id}: merge conflict ({conflicts}); changes not merged."))
+            finally:
+                if use_wt:
+                    # under the same lock: a concurrent remove/prune corrupts a sibling's merge
+                    async with git_lock:
+                        await asyncio.to_thread(vcs.worktree_remove, run_workspace, state.id)
             self.memory.remember(
                 run.id, self._scrub(f"[{state.agent}] {state.spec.title} -> {result[:400]}"),
                 metadata={"subtask": state.id},
