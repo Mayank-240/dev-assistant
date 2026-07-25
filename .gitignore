@@ -20,10 +20,12 @@ htmlcov/
 !.env.example
 
 # --- Runtime state this app produces ---
-.ada_data/       # memory/run stores, knowledge graphs (incl. *.db-wal/-shm, *.lock)
-workspace/       # per-run agent sandboxes
-docs/*/          # per-task generated docs (plan/report/brief/events/trace/audit);
-                 # top-level files like docs/ARCHITECTURE.md stay tracked
+# .ada_data: memory/run stores, knowledge graphs (incl. *.db-wal/-shm, *.lock)
+# workspace: per-run agent sandboxes
+# docs/*/: per-task generated docs; top-level files like docs/ARCHITECTURE.md stay tracked
+.ada_data/
+workspace/
+docs/*/
 docs/INDEX.md
 
 # --- Node (JS helper tests) ---
