@@ -538,11 +538,11 @@
   // Which tabs a project shows, with the active one resolved. The "multi"
   // pseudo-entry only has its cross-project task list.
   const _TAB_LABELS = {
-    overview: "Overview", tasks: "Tasks", knowledge: "Knowledge", settings: "Settings",
+    overview: "Overview", tasks: "Tasks", run: "Run", knowledge: "Knowledge", settings: "Settings",
   };
   function projectTabsModel(slug, active) {
     const all = slug === "multi"
-      ? ["tasks"] : ["overview", "tasks", "knowledge", "settings"];
+      ? ["tasks"] : ["overview", "tasks", "run", "knowledge", "settings"];
     const act = all.includes(active) ? active : all[0];
     return all.map(t => ({ id: t, label: _TAB_LABELS[t], selected: t === act }));
   }

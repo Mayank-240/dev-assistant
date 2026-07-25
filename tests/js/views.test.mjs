@@ -66,9 +66,9 @@ test("sidebarProjectRows tolerates bad input", () => {
 
 // ---- projectTabsModel ----
 
-test("projectTabsModel lists all four tabs for a real project", () => {
+test("projectTabsModel lists all five tabs for a real project", () => {
   const tabs = projectTabsModel("api", "knowledge");
-  assert.deepEqual(tabs.map(t => t.id), ["overview", "tasks", "knowledge", "settings"]);
+  assert.deepEqual(tabs.map(t => t.id), ["overview", "tasks", "run", "knowledge", "settings"]);
   assert.deepEqual(tabs.filter(t => t.selected).map(t => t.id), ["knowledge"]);
   assert.equal(tabs[0].label, "Overview");
 });

@@ -14,8 +14,12 @@ import json
 import os
 import secrets
 import shutil
+import signal
 import sqlite3
 import subprocess
+import threading
+import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -129,10 +133,19 @@ _EFFORT: dict[str, dict[str, Any]] = {
                "orch": "max",    "agent": "max",    "rev": "max"},
 }
 
+# UI model choice -> concrete model ids. Chosen independently of effort (the two are
+# separate controls in the composer); an explicit choice overrides the effort preset's
+# cheaper-model default.
+_MODELS: dict[str, str] = {
+    "opus": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
+}
+
 
 def _settings_for(base: Settings, effort: str | None, budget: float | None,
                   project: str | None = None, memory_scope: str | None = None,
-                  git_finalize: bool | None = None) -> Settings:
+                  git_finalize: bool | None = None, model: str | None = None) -> Settings:
     overrides: dict[str, Any] = {}
     cfg = _EFFORT.get(effort or "")
     if cfg:
@@ -143,6 +156,11 @@ def _settings_for(base: Settings, effort: str | None, budget: float | None,
         overrides["reviewer_effort"] = cfg["rev"]
         if cfg["model"]:
             overrides["sdk_model"] = cfg["model"]  # cheaper than the default Opus
+    mid = _MODELS.get((model or "").lower())
+    if mid:  # explicit model choice wins over the effort preset's model default
+        overrides["sdk_model"] = mid
+        overrides["agent_model"] = mid
+        overrides["orchestrator_model"] = mid
     if budget and budget > 0:
         overrides["budget_usd"] = budget
     if project:
@@ -161,6 +179,7 @@ class PlanRequest(BaseModel):
     project: str | None = None
     memory_scope: str | None = None
     effort: str | None = None
+    model: str | None = None   # "opus" | "sonnet" | "haiku" (independent of effort)
     budget: float | None = None
     continue_from: str | None = None   # re-engage: plan as a continuation of this task
 
@@ -172,6 +191,7 @@ class RefinePlanRequest(BaseModel):
     project: str | None = None
     memory_scope: str | None = None
     effort: str | None = None
+    model: str | None = None
     budget: float | None = None
 
 
@@ -180,6 +200,7 @@ class RunRequest(BaseModel):
     plan: dict[str, Any] | None = None  # an approved/edited plan (skips re-planning)
     task_id: str | None = None
     effort: str | None = None
+    model: str | None = None   # "opus" | "sonnet" | "haiku" (independent of effort)
     budget: float | None = None
     title: str | None = None  # optional; auto-derived from the prompt when blank
     project: str | None = None
@@ -305,13 +326,14 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             app.state.tasks[task_id] = asyncio.create_task(_run_fanout(
                 task_id, payload.get("prompt", ""), list(slugs),
                 payload.get("effort"), payload.get("budget"), payload.get("title"),
-                bool(payload.get("stagger"))))
+                bool(payload.get("stagger")), model=payload.get("model")))
             return
         app.state.tasks[task_id] = asyncio.create_task(_run_task(
             task_id, payload.get("prompt", ""), payload.get("plan"),
             payload.get("effort"), payload.get("budget"), payload.get("title"),
             payload.get("project"), payload.get("memory_scope"), payload.get("continue_from"),
-            payload.get("git_finalize"), bool(payload.get("resume"))))
+            payload.get("git_finalize"), bool(payload.get("resume")),
+            model=payload.get("model")))
 
     def _evict_broker_later(task_id: str, broker: Broker) -> None:
         """W4: drop a finished task's broker after a grace period so RAM doesn't hold
@@ -353,7 +375,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                         effort: str | None, budget: float | None, title: str | None = None,
                         project: str | None = None, memory_scope: str | None = None,
                         continue_from: str | None = None,
-                        git_finalize: bool | None = None, resume: bool = False) -> None:
+                        git_finalize: bool | None = None, resume: bool = False,
+                        model: str | None = None) -> None:
         broker: Broker = app.state.brokers[task_id]
         # record up front so cancels-during-planning persist (title auto-derived if blank);
         # the run row carries its project so activity/history can be filtered per project.
@@ -364,7 +387,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             app.state.runs.start(task_id, prompt, title=(title or None))
         if continue_from:
             app.state.runs.set_parent(task_id, continue_from)
-        engine = Engine(_settings_for(settings, effort, budget, project, memory_scope, git_finalize))
+        engine = Engine(_settings_for(settings, effort, budget, project, memory_scope,
+                                      git_finalize, model=model))
         control = RunControl()
         engine.control = control  # enables pause/resume/steer endpoints to reach this run
         app.state.controls[task_id] = control
@@ -400,7 +424,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
 
     async def _run_fanout(task_id: str, prompt: str, slugs: list[str],
                           effort: str | None, budget: float | None,
-                          title: str | None = None, stagger: bool = False) -> None:
+                          title: str | None = None, stagger: bool = False,
+                          model: str | None = None) -> None:
         """F3: cross-project fan-out parent. run_cross_project owns the run rows
         (parent project='multi', children with parent_id) and emits plan/child_start/
         child_done/brief/done on the parent stream — we just wire it into the Broker."""
@@ -412,7 +437,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                 broker.publish(Event("error", msg, {"message": msg}))
                 app.state.runs.set_status(task_id, "failed")
                 return
-            await fn(_settings_for(settings, effort, budget), prompt, slugs,
+            await fn(_settings_for(settings, effort, budget, model=model), prompt, slugs,
                      title=(title or None), stagger=bool(stagger), task_id=task_id,
                      on_event=broker.publish)
         except asyncio.CancelledError:
@@ -434,7 +459,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
 
     @app.post("/api/plan")
     async def make_plan(req: PlanRequest) -> JSONResponse:
-        engine = Engine(_settings_for(settings, req.effort, req.budget, req.project, req.memory_scope))
+        engine = Engine(_settings_for(settings, req.effort, req.budget, req.project,
+                                      req.memory_scope, model=req.model))
         try:
             plan = await engine.make_plan(req.prompt, continue_from=req.continue_from)
         except LLMError as exc:
@@ -451,7 +477,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     async def refine_plan(req: RefinePlanRequest) -> JSONResponse:
         if not (req.instruction or "").strip():
             return JSONResponse({"error": "instruction is required"}, status_code=400)
-        engine = Engine(_settings_for(settings, req.effort, req.budget, req.project, req.memory_scope))
+        engine = Engine(_settings_for(settings, req.effort, req.budget, req.project,
+                                      req.memory_scope, model=req.model))
         try:
             current = Plan.model_validate(req.plan)
             plan = await engine.refine_plan(req.prompt, current, req.instruction)
@@ -498,12 +525,12 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         if slugs:
             payload: dict[str, Any] = {
                 "prompt": req.prompt, "projects": slugs, "stagger": bool(req.stagger),
-                "effort": req.effort, "budget": req.budget, "title": req.title,
+                "effort": req.effort, "model": req.model, "budget": req.budget, "title": req.title,
             }
         else:
             payload = {
                 "prompt": req.prompt, "plan": req.plan, "effort": req.effort,
-                "budget": req.budget, "title": req.title, "project": project,
+                "model": req.model, "budget": req.budget, "title": req.title, "project": project,
                 "memory_scope": req.memory_scope, "continue_from": req.continue_from,
                 "git_finalize": req.git_finalize,
             }
@@ -1376,6 +1403,129 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         if not root.is_relative_to(ws) or not target.is_relative_to(root) or not target.is_file():
             return JSONResponse({"error": "not found"}, status_code=404)
         return FileResponse(str(target), filename=target.name, media_type="application/octet-stream")
+
+    # ---- Run the project (UI "Run" tab): start/stop the checkout's app ----
+    # One process per project, launched in its checkout with a scrubbed env in its own
+    # process group; stdout/stderr stream into a ring buffer the UI polls. A convenience
+    # runner for trying delivered work before merging — same isolation stance as agent
+    # runs (the container is the real boundary).
+    _APP_PORT = 8123
+    _APP_ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "VIRTUAL_ENV")
+    _app_procs: dict[str, dict[str, Any]] = {}
+
+    def _detect_app(root: Path) -> dict[str, Any] | None:
+        """Best-effort detection of a runnable app in the checkout."""
+        port = _APP_PORT
+        if (root / "manage.py").is_file():
+            return {"detected": "Django app (manage.py)",
+                    "cmd": ["python", "manage.py", "runserver", f"127.0.0.1:{port}"],
+                    "url": f"http://127.0.0.1:{port}"}
+        pkg = root / "package.json"
+        if pkg.is_file():
+            try:
+                scripts = json.loads(pkg.read_text()).get("scripts") or {}
+            except (json.JSONDecodeError, OSError):
+                scripts = {}
+            for script in ("dev", "start"):
+                if script in scripts:
+                    return {"detected": f"npm project (scripts.{script})",
+                            "cmd": ["npm", "run", script], "url": ""}
+        for cand in ("main.py", "app.py", "server.py"):
+            f = root / cand
+            if not f.is_file():
+                continue
+            try:
+                text = f.read_text(errors="replace").lower()
+            except OSError:
+                continue
+            mod = cand[:-3]
+            if "fastapi" in text:
+                return {"detected": f"FastAPI app ({cand})",
+                        "cmd": ["uvicorn", f"{mod}:app", "--port", str(port)],
+                        "url": f"http://127.0.0.1:{port}"}
+            if "flask" in text:
+                return {"detected": f"Flask app ({cand})",
+                        "cmd": ["flask", "--app", mod, "run", "--port", str(port)],
+                        "url": f"http://127.0.0.1:{port}"}
+        return None
+
+    def _app_running(entry: dict[str, Any] | None) -> bool:
+        return bool(entry and entry["proc"].poll() is None)
+
+    def _app_state(slug: str) -> dict[str, Any]:
+        root = projects.project_checkout(settings, slug)
+        entry = _app_procs.get(slug)
+        running = _app_running(entry)
+        if root is None or not root.is_dir():
+            return {"runnable": False, "running": False,
+                    "reason": "This project has no repository checkout to run."}
+        det = _detect_app(root)
+        if det is None and not running:
+            return {"runnable": False, "running": False,
+                    "reason": "Nothing runnable detected in the checkout — no FastAPI/Flask "
+                              "entrypoint, manage.py, or npm start script."}
+        cmd = entry["cmd"] if running else det["cmd"]
+        url = entry["url"] if running else (det or {}).get("url", "")
+        return {"runnable": True, "running": running,
+                "detected": (det or {}).get("detected") or "App",
+                "cmd": " ".join(cmd), "cwd": str(root), "url": url,
+                "pid": entry["proc"].pid if running else None}
+
+    def _pump_app_logs(proc: subprocess.Popen, buf: deque) -> None:
+        try:
+            for line in proc.stdout:  # text mode; ends when the process exits
+                buf.append(line.rstrip("\n"))
+        except ValueError:
+            pass  # stream closed on stop
+
+    @app.get("/api/projects/{slug}/app")
+    async def get_app_state(slug: str) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        return JSONResponse(_app_state(slug))
+
+    @app.post("/api/projects/{slug}/app/start")
+    async def start_project_app(slug: str) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        st = _app_state(slug)
+        if st.get("running"):
+            return JSONResponse(st)
+        if not st.get("runnable"):
+            return JSONResponse({"error": st.get("reason") or "nothing runnable detected"},
+                                status_code=400)
+        root = projects.project_checkout(settings, slug)
+        det = _detect_app(root)  # runnable + not running -> det is not None
+        env = {k: os.environ[k] for k in _APP_ENV_KEEP if k in os.environ}
+        env["PYTHONUNBUFFERED"] = "1"
+        try:
+            proc = subprocess.Popen(det["cmd"], cwd=str(root), env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, start_new_session=True)
+        except OSError as exc:
+            return JSONResponse({"error": f"could not start: {exc}"}, status_code=500)
+        buf: deque[str] = deque(maxlen=500)
+        buf.append("$ " + " ".join(det["cmd"]))
+        threading.Thread(target=_pump_app_logs, args=(proc, buf), daemon=True).start()
+        _app_procs[slug] = {"proc": proc, "logs": buf, "cmd": det["cmd"],
+                            "url": det.get("url", ""), "started": time.time()}
+        return JSONResponse(_app_state(slug))
+
+    @app.post("/api/projects/{slug}/app/stop")
+    async def stop_project_app(slug: str) -> JSONResponse:
+        entry = _app_procs.get(slug)
+        if entry and entry["proc"].poll() is None:
+            try:  # kill the whole process group (uvicorn reloaders, npm children, …)
+                os.killpg(os.getpgid(entry["proc"].pid), signal.SIGTERM)
+            except (AttributeError, ProcessLookupError, PermissionError, OSError):
+                entry["proc"].terminate()
+        return JSONResponse({"ok": True, "running": False})
+
+    @app.get("/api/projects/{slug}/app/logs")
+    async def get_app_logs(slug: str) -> JSONResponse:
+        entry = _app_procs.get(slug)
+        return JSONResponse({"lines": list(entry["logs"]) if entry else [],
+                             "running": _app_running(entry)})
 
     if _STATIC.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")

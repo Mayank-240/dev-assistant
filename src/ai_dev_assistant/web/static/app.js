@@ -50,23 +50,10 @@ window.fetch = async (url, opts = {}) => {
   return res;
 };
 
-// Editorial colored-dot palette (no emoji) — one stable hue per specialist.
-const AGENT_STYLE = {
-  architect:        { color: "#7b86c9" },
-  researcher:       { color: "#5a9bc4" },
-  coder:            { color: "#3f9f7a" },
-  test_engineer:    { color: "#8fae4f" },
-  debugger:         { color: "#cf6a4f" },
-  refactorer:       { color: "#9a7bd0" },
-  security_auditor: { color: "#c2607f" },
-  devops:           { color: "#5b93a6" },
-  database:         { color: "#6f86c9" },
-  frontend:         { color: "#c074a8" },
-  performance:      { color: "#bf9540" },
-  integrator:       { color: "#5fae84" },
-  documenter:       { color: "#c79248" },
-};
-const agentStyle = (n) => AGENT_STYLE[n] || { color: "#8a8374" };
+// Modernist mono discipline: every specialist prints in ink; state (running/passed/
+// failed) carries the color. --agent-ink flips with the theme.
+const AGENT_STYLE = {};
+const agentStyle = (n) => AGENT_STYLE[n] || { color: "var(--agent-ink)" };
 const PHASES = ["plan", "execute", "verify", "document", "done"];
 
 const state = Object.assign({
@@ -158,6 +145,9 @@ function resetRunView(prompt) {
   $("plan-dag").innerHTML = "";
   $("timeline-card").classList.add("hidden");
   $("timeline").innerHTML = "";
+  $("attention-card").classList.add("hidden");
+  $("attention-list").innerHTML = "";
+  _attnOpen = 0;
   Object.assign(state, initialRunAggregates());   // timeline / agentData / total / reviewed / messages / costUsd / phase
   state.openAgentId = null;
   setPhase("plan");
@@ -277,7 +267,7 @@ function renderPlanDag(subtasks) {
   $("plan-dag-card").classList.remove("hidden");
 
   const defs = document.createElementNS(SVGNS, "defs");
-  defs.innerHTML = '<marker id="dag-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#3a4256"></path></marker>';
+  defs.innerHTML = '<marker id="dag-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"></path></marker>';
   svg.appendChild(defs);
 
   const byId = Object.fromEntries(subtasks.map(s => [s.id, s]));
@@ -453,6 +443,17 @@ function renderAgentModal(a) {
 }
 
 // ---- controls / toasts / timeline ----
+// Model · Effort segmented controls (split — the old single select bundled both).
+const segState = { model: "opus", effort: "high" };
+function wireSeg(id, key) {
+  const seg = $(id);
+  if (!seg) return;
+  seg.querySelectorAll(".seg-opt").forEach(b => b.onclick = () => {
+    segState[key] = b.dataset.v;
+    seg.querySelectorAll(".seg-opt").forEach(x =>
+      x.setAttribute("aria-pressed", x === b ? "true" : "false"));
+  });
+}
 function getControls() {
   const b = parseFloat($("budget").value);
   const t = $("task-title").value.trim();
@@ -461,7 +462,8 @@ function getControls() {
   const multi = multiOpen ? selectedMultiProjects() : [];
   // Per-run repo binding is gone — the selected *project* owns the repository.
   return {
-    effort: $("effort").value, budget: (b && b > 0) ? b : null, title: t || null,
+    effort: segState.effort, model: segState.model,
+    budget: (b && b > 0) ? b : null, title: t || null,
     project: selectedProject(), memory_scope: $("mem-scope").value,
     continue_from: state.continueFrom || null,
     git_finalize: $("git-finalize").checked ? true : null,
@@ -495,7 +497,8 @@ function clearContinue() {
 // "default" project is never rendered or auto-selected.
 let currentProject = null;
 let currentMainView = "project";   // project | task | activity | agents | empty
-let currentTab = "overview";       // overview | tasks | knowledge | settings
+let currentTab = "overview";       // overview | tasks | run | knowledge | settings
+
 let currentKnow = "memory";        // memory | graph | files
 
 function selectedProject() { return currentProject; }
@@ -559,6 +562,7 @@ function renderSidebar() {
   if (navAgents) {
     if (currentMainView === "agents") navAgents.setAttribute("aria-current", "page");
     else navAgents.removeAttribute("aria-current");
+
   }
 }
 
@@ -1010,6 +1014,17 @@ function handleEvent(ev) {
       else if (d.paused === false) { $("status-pill").className = "pill pill-running"; $("status-pill").textContent = "running"; }
       updateRunControls();
       break;
+    // Provision: an agent needs the user mid-run — a clarifying question (`ask`) or a
+    // permission request (`permission`, e.g. a protected path). Answers/decisions are
+    // delivered to the run through the steer endpoint.
+    case "ask":
+      renderAttention({ kind: "question", id: d.id, agent: d.agent, text: d.question || ev.message, options: d.options || [] });
+      feed("? " + ev.message);
+      break;
+    case "permission":
+      renderAttention({ kind: "permission", id: d.id, agent: d.agent, text: d.request || ev.message, options: [] });
+      feed("⚠ " + ev.message);
+      break;
     case "execution": {
       setPhase("verify");
       const el = $("m-tests");
@@ -1093,6 +1108,93 @@ function handleEvent(ev) {
     default:
       feed(ev.message || ev.type);
   }
+}
+
+// ---- needs-your-input cards (clarifying questions + permission requests) ----
+let _attnOpen = 0;
+function _attnCount() {
+  $("attn-count").textContent = _attnOpen ? _attnOpen + " open" : "";
+  if (!_attnOpen) $("attention-card").classList.add("hidden");
+}
+async function _attnSteer(note) {
+  if (!state.taskId) return false;
+  try {
+    await fetch(`/api/run/${state.taskId}/steer`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note }),
+    });
+    return true;
+  } catch (e) { showToast("Could not deliver the answer", "warn"); return false; }
+}
+function renderAttention(req) {
+  const list = $("attention-list");
+  const item = document.createElement("div");
+  item.className = "attn-item";
+  const kindLabel = req.kind === "permission" ? "permission request" : "clarifying question";
+  item.innerHTML =
+    `<div class="attn-top">` +
+    `<span class="ac-agent"><span class="ac-dot"></span>${escapeHtml(req.agent || "agent")}</span>` +
+    (req.id ? `<span class="chip">${escapeHtml(req.id)}</span>` : "") +
+    `<span class="attn-kind${req.kind === "permission" ? " attn-kind-permission" : ""}">${kindLabel}</span></div>` +
+    `<p class="attn-q">${escapeHtml(req.text || "")}</p>` +
+    `<div class="attn-controls"></div>`;
+  const controls = item.querySelector(".attn-controls");
+  const resolve = (label, denied) => {
+    controls.remove();
+    const done = document.createElement("div");
+    done.className = "attn-done" + (denied ? " attn-denied" : "");
+    done.textContent = label;
+    item.appendChild(done);
+    _attnOpen = Math.max(0, _attnOpen - 1);
+    _attnCount();
+  };
+  if (req.kind === "permission") {
+    const row = document.createElement("div");
+    row.className = "attn-row";
+    [["Allow once", "btn-primary"], ["Allow for this run", "ghost-btn"], ["Deny", "btn-danger"]].forEach(([label, cls]) => {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = cls; b.textContent = label;
+      b.onclick = async () => {
+        const denied = label === "Deny";
+        const note = `[permission ${req.id || ""}] ${denied ? "DENIED" : label.toUpperCase()}: ${req.text || ""}`;
+        if (await _attnSteer(note)) resolve(denied ? "denied — the agent will plan around it" : "granted · " + (req.id || "") + " resumed", denied);
+      };
+      row.appendChild(b);
+    });
+    controls.appendChild(row);
+  } else {
+    if ((req.options || []).length) {
+      const row = document.createElement("div");
+      row.className = "attn-row";
+      req.options.forEach(opt => {
+        const b = document.createElement("button");
+        b.type = "button"; b.className = "ghost-btn"; b.textContent = opt;
+        b.onclick = async () => {
+          if (await _attnSteer(`[answer ${req.id || ""}] ${opt}`)) resolve("answered · " + opt);
+        };
+        row.appendChild(b);
+      });
+      controls.appendChild(row);
+    }
+    const row = document.createElement("div");
+    row.className = "attn-row";
+    const input = document.createElement("input");
+    input.type = "text"; input.className = "title-input"; input.placeholder = "…or answer in plain English";
+    const send = document.createElement("button");
+    send.type = "button"; send.className = "btn-primary"; send.textContent = "Send";
+    const submit = async () => {
+      const v = input.value.trim();
+      if (!v) { input.focus(); return; }
+      if (await _attnSteer(`[answer ${req.id || ""}] ${v}`)) resolve("answered — " + req.id + " resumed");
+    };
+    send.onclick = submit;
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } });
+    row.appendChild(input); row.appendChild(send);
+    controls.appendChild(row);
+  }
+  list.appendChild(item);
+  _attnOpen++;
+  _attnCount();
+  $("attention-card").classList.remove("hidden");
 }
 
 function runTask() {
@@ -1668,6 +1770,7 @@ const MAIN_VIEWS = {
   agents: "view-agents", empty: "view-empty",
 };
 
+
 function showMainView(name) {
   currentMainView = name;
   Object.entries(MAIN_VIEWS).forEach(([n, id]) => $(id).classList.toggle("hidden", n !== name));
@@ -1695,11 +1798,12 @@ function selectProjectTab(tab, force) {
     b.classList.toggle("hidden", !visible.has(id));
     b.setAttribute("aria-selected", id === currentTab ? "true" : "false");
   });
-  ["overview", "tasks", "knowledge", "settings"].forEach(t => {
+  ["overview", "tasks", "run", "knowledge", "settings"].forEach(t => {
     $("panel-" + t).classList.toggle("hidden", t !== currentTab);
   });
   if (currentTab === "overview") { loadProjectActivity(); loadRecent(); }
   if (currentTab === "tasks") { loadRecent(); loadQueue(); }
+  if (currentTab === "run") loadRunPanel();
   if (currentTab === "knowledge") return showKnowledge(currentKnow);
   if (currentTab === "settings") loadSettingsPanel();
 }
@@ -1755,6 +1859,7 @@ function showActivity() {
 
 // ---- Agents: the specialist roster as its own view ----
 function showAgents() {
+
   showMainView("agents");
   loadAgents();
 }
@@ -2378,7 +2483,7 @@ async function loadMemory() {
 }
 
 // ---- Knowledge graph (dependency-free force layout) ----
-const TYPE_COLOR = { task: "#2f7d5e", subtask: "#5a9bc4", agent: "#7b86c9", concept: "#c79248" };
+const TYPE_COLOR = { task: "var(--g-task)", subtask: "var(--g-subtask)", agent: "var(--g-agent)", concept: "var(--g-concept)" };
 const SVGNS = "http://www.w3.org/2000/svg";
 let graphData = { nodes: [], edges: [] };
 let graphProjects = null;   // combined-view slugs (null = single-project view)
@@ -2607,6 +2712,93 @@ async function selectFile(path, li) {
   } catch (e) { pre.textContent = "Could not load file."; }
 }
 
+// ---- Run tab: start/stop the project's app inside its checkout ----
+let _appPoll = null;
+function _appUrl(path) {
+  return "/api/projects/" + encodeURIComponent(selectedProject()) + "/app" + (path || "");
+}
+async function loadRunPanel() {
+  clearInterval(_appPoll); _appPoll = null;
+  const detect = $("run-detect");
+  let st = null;
+  try {
+    const resp = await fetch(_appUrl());
+    if (resp.status === 404 || resp.status === 501) {
+      detect.textContent = "Running the project is not available on this server build.";
+      ["run-info", "app-start", "app-stop", "app-status", "run-url", "app-logs", "run-detect-tag"].forEach(id => $(id).classList.add("hidden"));
+      return;
+    }
+    st = await resp.json();
+  } catch (e) {
+    detect.textContent = "Could not reach the server.";
+    return;
+  }
+  renderRunPanel(st);
+  if (st && st.running) _startAppPoll();
+}
+function renderRunPanel(st) {
+  const detect = $("run-detect");
+  $("run-detect-tag").classList.toggle("hidden", !(st && st.runnable));
+  if (!st || !st.runnable) {
+    detect.className = "runp-na";
+    detect.textContent = (st && st.reason) ||
+      "Nothing runnable detected in this project's checkout — no FastAPI/Flask entrypoint, manage.py, or npm start script.";
+    ["run-info", "app-start", "app-stop", "app-status", "run-url", "app-logs"].forEach(id => $(id).classList.add("hidden"));
+    return;
+  }
+  detect.className = "runp-detect";
+  detect.textContent = (st.detected || "App") +
+    " detected — start it in the project's checkout to try the delivered work before merging.";
+  $("run-info").classList.remove("hidden");
+  $("run-cmd").textContent = st.cmd || "";
+  $("run-dir").textContent = st.cwd || "";
+  const running = !!st.running;
+  $("app-start").classList.toggle("hidden", running);
+  $("app-stop").classList.toggle("hidden", !running);
+  $("app-status").classList.toggle("hidden", !running);
+  $("app-status").textContent = "running" + (st.pid ? " · pid " + st.pid : "");
+  const url = $("run-url");
+  url.classList.toggle("hidden", !running || !st.url);
+  if (st.url) { url.href = st.url; url.textContent = "Open " + st.url + " →"; }
+  $("app-logs").classList.toggle("hidden", !running);
+}
+function _startAppPoll() {
+  clearInterval(_appPoll);
+  const tick = async () => {
+    if (currentMainView !== "project" || currentTab !== "run") { clearInterval(_appPoll); _appPoll = null; return; }
+    try {
+      const d = await (await fetch(_appUrl("/logs"))).json();
+      const pre = $("app-logs");
+      const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
+      pre.textContent = (d.lines || []).join("\n");
+      if (stick) pre.scrollTop = pre.scrollHeight;
+      if (!d.running) { clearInterval(_appPoll); _appPoll = null; loadRunPanel(); }
+    } catch (e) { /* transient */ }
+  };
+  tick();
+  _appPoll = setInterval(tick, 2000);
+}
+async function startApp() {
+  $("app-start").disabled = true;
+  try {
+    const resp = await fetch(_appUrl("/start"), { method: "POST" });
+    const d = await resp.json().catch(() => ({}));
+    if (!resp.ok || d.error) showToast("Could not start: " + (d.error || ("HTTP " + resp.status)), "error", 6000);
+    else { showToast("Project started", "success"); renderRunPanel(d); _startAppPoll(); }
+  } catch (e) { showToast("Start failed: " + e, "error"); }
+  $("app-start").disabled = false;
+}
+async function stopApp() {
+  $("app-stop").disabled = true;
+  try {
+    await fetch(_appUrl("/stop"), { method: "POST" });
+    showToast("Project stopped", "warn");
+  } catch (e) { /* ignore */ }
+  $("app-stop").disabled = false;
+  clearInterval(_appPoll); _appPoll = null;
+  loadRunPanel();
+}
+
 // ---- wire up ----
 $("run-btn").onclick = runTask;
 $("approve-btn").onclick = approvePlan;
@@ -2634,7 +2826,6 @@ $("review-btn").onclick = openReviewPanel;
 $("review-modal-close").onclick = closeReviewPanel;
 $("review-modal").onclick = (e) => { if (e.target === $("review-modal")) closeReviewPanel(); };
 document.querySelectorAll("#review-modal .tab").forEach(t => t.onclick = () => selectReviewTab(t.dataset.rtab));
-$("ph-new").onclick = openProjectModal;
 $("ph-policy-save").onclick = saveProjectPolicy;
 $("proj-archive").onclick = toggleArchiveProject;
 $("proj-delete").onclick = deleteProject;
@@ -2657,6 +2848,12 @@ document.querySelectorAll("#project-tabs .ptab").forEach(b => b.onclick = () => 
 document.querySelectorAll("#know-tabs .ktab").forEach(b => b.onclick = () => showKnowledge(b.dataset.know));
 $("nav-activity").onclick = showActivity;
 $("nav-agents").onclick = showAgents;
+$("agents-refresh").onclick = () => { agentsLoaded = false; loadAgents(); };
+wireSeg("model-seg", "model");
+wireSeg("effort-seg", "effort");
+$("app-start").onclick = startApp;
+$("app-stop").onclick = stopApp;
+
 $("multi-open").onclick = toggleMultiBox;   // F3: cross-project fan-out composer
 $("new-project").onclick = openProjectModal;
 $("empty-new").onclick = openProjectModal;  // first-run empty state

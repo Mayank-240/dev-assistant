@@ -40,13 +40,13 @@
         <div class="sb-divider" aria-hidden="true"></div>
 
         <nav class="sb-global" aria-label="Global views">
+          <button type="button" id="nav-agents" class="sb-item">
+            <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="5.5" cy="5" r="2.4"/><path d="M1.5 13.5c0-2.2 1.8-4 4-4s4 1.8 4 4"/><circle cx="11.5" cy="5.5" r="1.9"/><path d="M11 9.6c1.9.2 3.5 1.9 3.5 3.9"/></svg>
+            Agents
+          </button>
           <button type="button" id="nav-activity" class="sb-item">
             <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 13h12"/><rect x="3" y="8" width="2.4" height="4"/><rect x="7" y="5" width="2.4" height="7"/><rect x="11" y="9" width="2.4" height="3"/></svg>
             All activity
-          </button>
-          <button type="button" id="nav-agents" class="sb-item">
-            <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="5" cy="5" r="2.2"/><circle cx="11" cy="5" r="2.2"/><circle cx="5" cy="11" r="2.2"/><circle cx="11" cy="11" r="2.2"/></svg>
-            Agents
           </button>
         </nav>
 
@@ -76,14 +76,12 @@
                   <code id="proj-root" class="proj-root hidden"></code>
                 </div>
               </div>
-              <div class="proj-actions">
-                <button id="ph-new" type="button" class="btn-secondary" title="Create a new project or import an existing repository">+ New / Import</button>
-              </div>
             </header>
 
             <div id="project-tabs" class="tabbar" role="tablist" aria-label="Project sections">
               <button type="button" id="tab-overview" class="ptab" role="tab" aria-selected="true" aria-controls="panel-overview" data-tab="overview">Overview</button>
               <button type="button" id="tab-tasks" class="ptab" role="tab" aria-selected="false" aria-controls="panel-tasks" data-tab="tasks">Tasks</button>
+              <button type="button" id="tab-run" class="ptab" role="tab" aria-selected="false" aria-controls="panel-run" data-tab="run">Run</button>
               <button type="button" id="tab-knowledge" class="ptab" role="tab" aria-selected="false" aria-controls="panel-knowledge" data-tab="knowledge">Knowledge</button>
               <button type="button" id="tab-settings" class="ptab" role="tab" aria-selected="false" aria-controls="panel-settings" data-tab="settings">Settings</button>
             </div>
@@ -100,26 +98,33 @@
                 <input id="task-title" class="title-input" type="text" maxlength="80"
                        placeholder="Title (optional) — auto-generated from the task if left blank" />
 
-                <details id="options-box" class="options">
+                <details id="options-box" class="options" open>
                   <summary>Options</summary>
                   <div class="options-body">
                     <div class="controls">
-                      <label class="ctl" title="Higher effort = deeper reasoning, more agent turns & review retries; lower = cheaper & faster (Sonnet)">Effort
-                        <select id="effort" class="select">
-                          <option value="max">Max · Opus</option>
-                          <option value="xhigh">X-High · Opus</option>
-                          <option value="high" selected>High · Opus</option>
-                          <option value="medium">Medium · Sonnet</option>
-                          <option value="low">Low · fast</option>
-                        </select>
-                      </label>
-                      <label class="ctl" title="Where new memories are written. Recall always reads project + global. The knowledge graph is always project-scoped.">Memory
+                      <div class="ctl" title="Which Claude model the agents run on">Model
+                        <div id="model-seg" class="seg" role="group" aria-label="Model">
+                          <button type="button" class="seg-opt" data-v="opus" aria-pressed="true">Opus</button>
+                          <button type="button" class="seg-opt" data-v="sonnet" aria-pressed="false">Sonnet</button>
+                          <button type="button" class="seg-opt" data-v="haiku" aria-pressed="false">Haiku</button>
+                        </div>
+                      </div>
+                      <div class="ctl" title="Higher effort = deeper reasoning, more agent turns & review retries; lower = cheaper & faster">Effort
+                        <div id="effort-seg" class="seg" role="group" aria-label="Effort">
+                          <button type="button" class="seg-opt" data-v="low" aria-pressed="false">Low</button>
+                          <button type="button" class="seg-opt" data-v="medium" aria-pressed="false">Med</button>
+                          <button type="button" class="seg-opt" data-v="high" aria-pressed="true">High</button>
+                          <button type="button" class="seg-opt" data-v="xhigh" aria-pressed="false">X-High</button>
+                          <button type="button" class="seg-opt" data-v="max" aria-pressed="false">Max</button>
+                        </div>
+                      </div>
+                      <label class="ctl ctl-grow" title="Where new memories are written. Recall always reads project + global. The knowledge graph is always project-scoped.">Memory
                         <select id="mem-scope" class="select">
                           <option value="project">Project</option>
                           <option value="global">Global</option>
                         </select>
                       </label>
-                      <label class="ctl" title="Stop scheduling new work once this run's cost exceeds the cap">Budget $
+                      <label class="ctl ctl-grow" title="Stop scheduling new work once this run's cost exceeds the cap">Budget $
                         <input id="budget" class="num" type="number" min="0" step="0.5" placeholder="none" />
                       </label>
                     </div>
@@ -173,6 +178,29 @@
                   <button id="tasks-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh task list">⟳</button>
                 </div>
                 <ul id="task-list" class="task-list"><li class="muted">none yet</li></ul>
+              </div>
+            </div>
+
+            <!-- ------------ Run: start/stop the project's app in its checkout ------------ -->
+            <div id="panel-run" class="panel hidden" role="tabpanel" aria-labelledby="tab-run">
+              <div class="card runp-card">
+                <div style="display:flex;align-items:center;gap:10px">
+                  <h3 class="section-label" style="border:0;padding:0;margin:0">Runnable</h3>
+                  <span id="run-detect-tag" class="chip hidden">auto-detected</span>
+                </div>
+                <p id="run-detect" class="runp-detect muted">Checking this project's checkout…</p>
+                <div id="run-info" class="runp-grid hidden">
+                  <span class="runp-k">command</span><code id="run-cmd"></code>
+                  <span class="runp-k">directory</span><code id="run-dir"></code>
+                  <span class="runp-k">sandbox</span><span class="muted" style="font-size:12.5px">scrubbed env · own process group · killed on stop</span>
+                </div>
+                <div class="runp-actions">
+                  <button id="app-start" class="btn-primary hidden">▶ Run project</button>
+                  <span id="app-status" class="runp-status hidden">running</span>
+                  <a id="run-url" class="runp-url hidden" target="_blank" rel="noopener"></a>
+                  <button id="app-stop" class="btn-danger hidden" style="margin-left:auto">■ Stop</button>
+                </div>
+                <pre id="app-logs" class="runp-logs hidden"></pre>
               </div>
             </div>
 
@@ -309,6 +337,14 @@
             </div>
 
             <div id="run-view" class="hidden" data-layout="focus">
+
+              <!-- needs-your-input: clarifying questions + permission requests from agents.
+                   Rendered by app.js when `ask` / `permission` events arrive on the run stream;
+                   answers are delivered through the steer endpoint. -->
+              <div id="attention-card" class="attn hidden" role="region" aria-label="Needs your input">
+                <div class="attn-head">Needs your input — run is paused on these subtasks<span id="attn-count" style="margin-left:auto"></span></div>
+                <div id="attention-list" class="attn-list"></div>
+              </div>
 
               <div class="rv-head">
                 <div class="run-head card">
@@ -453,15 +489,18 @@
             </div>
           </div>
 
-          <!-- ============ AGENTS — the specialist roster ============ -->
+          <!-- ============ AGENTS (global roster) ============ -->
           <div id="view-agents" class="view hidden">
             <div class="view-header">
               <div>
                 <h1>Agents</h1>
-                <p>The specialist team the orchestrator routes work to — what each one does, when to use it, and its tools.</p>
+                <p>The specialist roster the orchestrator routes work to — shared across every project.</p>
               </div>
+              <button id="agents-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh agent roster">⟳</button>
             </div>
-            <div id="agents-roster" class="agents-grid"></div>
+            <div class="card">
+              <div id="agents-roster" class="agents-grid"></div>
+            </div>
           </div>
 
           <!-- ============ FIRST-RUN EMPTY STATE (no projects yet) ============ -->
