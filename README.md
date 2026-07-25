@@ -50,6 +50,22 @@ task ─▶ Orchestrator ──decompose──▶ Plan (DAG of subtasks + accept
 - **Docs** — per task: `plan.md`, `report.md`, `brief.md`, plus `events.jsonl`, `trace.jsonl`,
   and `audit.jsonl`, and `docs/INDEX.md`.
 
+## Run in one line (Docker)
+
+No clone, no build — the image is published to GHCR on every commit:
+
+```sh
+docker run -d --name ada -p 8000:8000 -v ada-data:/data \
+  -e ANTHROPIC_API_KEY=sk-ant-... ghcr.io/mayank-240/dev-assistant:latest
+```
+
+Then open http://localhost:8000 and grab the auto-generated API token from
+`docker logs ada | grep "API token"` (or pin one with `-e ADA_API_TOKEN=...`).
+The container uses the `anthropic` backend (the Claude Code login backend needs
+an interactive host session) and is the supported isolation boundary — see
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the hardened compose setup
+(`docker compose up -d` from a clone works too).
+
 ## Quickstart
 
 Requires [`uv`](https://docs.astral.sh/uv/) (provisions Python 3.12 automatically) and a

@@ -29,6 +29,17 @@ subprocess does is confined to the container's filesystem (only `/data` and
 
 ## Quickstart
 
+**Prebuilt image (no clone needed)** — published to GHCR by CI on every commit
+to main (`.github/workflows/docker.yml`):
+
+```sh
+docker run -d --name ada -p 8000:8000 -v ada-data:/data \
+  -e ANTHROPIC_API_KEY=sk-ant-... ghcr.io/mayank-240/dev-assistant:latest
+```
+
+**From a clone** (hardened compose: read-only rootfs, dropped capabilities,
+named volumes):
+
 ```sh
 docker compose up -d --build
 ```
