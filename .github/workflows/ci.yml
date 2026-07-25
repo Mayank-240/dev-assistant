@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv (with Python 3.12)
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      # Web UI helper tests (pure functions in web/static/util.js) via Node's
+      # built-in runner. The glob form works on all Node versions (the bare
+      # directory form broke in newer Node releases).
+      - name: JS unit tests
+        run: node --test "tests/js/**/*.test.mjs"
+
+      # E4: offline, deterministic eval — replays the committed cassettes in
+      # src/ai_dev_assistant/evals/cassettes/ through ReplayProvider, driving the
+      # full plan → schedule → review → summarize pipeline with zero network and
+      # no API key. Regenerate cassettes (also offline) with:
+      #   uv run python -m ai_dev_assistant.evals.replay_eval --record
+      - name: Offline replay eval (committed cassettes)
+        run: uv run python -m ai_dev_assistant.evals.replay_eval
+
+      # NOTE: `uv run ai-dev-assistant eval` against the FULL golden suite (incl.
+      # the repo-fixture tasks in evals/fixtures/) still needs a live LLM backend
+      # (Claude Code login for claude_sdk, or ANTHROPIC_API_KEY) and is not run
+      # in CI; tune samples/timeouts with ADA_EVAL_REPEAT / ADA_EVAL_TASK_TIMEOUT.

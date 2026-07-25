@@ -7,6 +7,7 @@ the one objective signal the eval/learning loop can trust.
 from __future__ import annotations
 
 import ast
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,3 +45,26 @@ def tests_pass(workspace: Path, timeout: float = 120.0) -> GraderResult:
     if res is None:
         return GraderResult("tests_pass", False, "no runnable tests detected")
     return GraderResult("tests_pass", res.passed, f"exit={res.return_code} {res.command}")
+
+
+def heldout_tests_pass(workspace: Path, heldout_dir: Path, timeout: float = 120.0) -> GraderResult:
+    """Non-circular grading (E3): copy held-out tests — which the agent NEVER saw during
+    the run — into the finished workspace and run ONLY them. Defeats the 'model writes
+    both the code and the tests it is graded on' loophole of ``tests_pass``."""
+    heldout_dir = Path(heldout_dir)
+    if not heldout_dir.is_dir():
+        return GraderResult("heldout_tests_pass", False, f"no held-out dir: {heldout_dir}")
+    rels: list[str] = []
+    for p in sorted(heldout_dir.rglob("*.py")):
+        name = p.name
+        if not (name.startswith("test_") or name.endswith("_test.py")):
+            continue
+        shutil.copy2(p, workspace / name)
+        rels.append(name)
+    if not rels:
+        return GraderResult("heldout_tests_pass", False, "held-out dir has no test files")
+    res = run_workspace_tests_sync(workspace, timeout, paths=rels)
+    if res is None:
+        return GraderResult("heldout_tests_pass", False, "no runnable tests detected")
+    return GraderResult("heldout_tests_pass", res.passed,
+                        f"exit={res.return_code} {res.command}")

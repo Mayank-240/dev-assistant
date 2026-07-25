@@ -1,0 +1,1 @@
+{"schema": "RunLessons", "data": {"summary": "Offline replay smoke run completed cleanly.", "what_worked": ["parallel decomposition of independent subtasks"], "what_to_avoid": [], "routing_notes": []}}
