@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import shutil
 
+import pytest
+
 from ai_dev_assistant.config import Settings
 from ai_dev_assistant.evals import replay_eval
 from ai_dev_assistant.evals.graders import ast_defines, file_exists, heldout_tests_pass
@@ -86,25 +88,28 @@ def _offline_settings() -> Settings:
 
 
 class _RepoFixProvider:
-    """Scripted provider that actually fixes the calculator fixture via the toolbox."""
+    """Scripted provider that 'fixes' a repo fixture by writing ``content`` to ``path``
+    via the toolbox (defaults reproduce the calculator fix)."""
 
-    def __init__(self) -> None:
+    def __init__(self, path: str = "calculator.py", content: str = _FIXED_CALCULATOR) -> None:
+        self._path = path
+        self._content = content
         self.usage = replay_eval._Usage()
 
     async def structured(self, *, system, user, schema, model, effort=None, max_tokens=4000):
         if schema is Plan:
             return Plan(
-                title="Fix Subtract Bug",
-                summary="Correct the reversed operands in calculator.subtract.",
-                subtasks=[SubTask(id="s1", title="Fix the subtract bug",
-                                  description="Repair calculator.py so the suite passes.",
+                title="Fix the planted bug",
+                summary=f"Correct the buggy logic in {self._path}.",
+                subtasks=[SubTask(id="s1", title="Fix the bug",
+                                  description=f"Repair {self._path} so the suite passes.",
                                   agent="coder", rationale="a one-line code fix",
                                   depends_on=[], acceptance_criteria=["tests pass"])],
             )
         if schema is Verdict:
             return Verdict(passed=True, score=92, reasons=["bug fixed"], suggestions=[])
         if schema is BriefDoc:
-            return BriefDoc(tldr="Fixed subtract.", key_points=["operands reordered"],
+            return BriefDoc(tldr="Fixed the bug.", key_points=["logic corrected"],
                             status="completed")
         if schema is RunLessons:
             return RunLessons(summary="Small bugfixes route well to the coder.",
@@ -114,8 +119,8 @@ class _RepoFixProvider:
     async def run_agent(self, *, system_prompt, prompt, toolbox, allowed_tools, model,
                         effort=None, max_tokens=8000, max_iterations=None, workdir=None,
                         on_step=None):
-        toolbox.dispatch("write_file", {"path": "calculator.py", "content": _FIXED_CALCULATOR})
-        return "Fixed subtract(a, b) to return a - b; the suite now passes."
+        toolbox.dispatch("write_file", {"path": self._path, "content": self._content})
+        return f"Fixed {self._path}; the suite now passes."
 
     async def aclose(self):
         return None
@@ -140,6 +145,105 @@ async def test_repo_golden_task_offline():
     summary = report.tasks[0]
     assert summary.pass_rate == 1.0
     assert summary.routing_accuracy == 1.0
+
+
+_FIXED_PAGINATION = '''\
+"""Tiny pagination helpers (fixed)."""
+
+from __future__ import annotations
+
+
+def total_pages(total_items, page_size):
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+    if total_items <= 0:
+        return 0
+    return (total_items + page_size - 1) // page_size
+
+
+def page_items(items, page, page_size):
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+    if page < 1:
+        raise ValueError("page numbers start at 1")
+    start = (page - 1) * page_size
+    return list(items[start:start + page_size])
+'''
+
+
+async def test_pagination_repo_golden_task_offline():
+    """E2+E3 on the second Python fixture: the off-by-one pagination bug is fixed by a
+    scripted agent and graded, including on held-out tests."""
+    task = next(t for t in GOLDEN if t.id == "fix_pagination_total_pages")
+    report = await run_eval(
+        _offline_settings(), only=[task.id], repeat=1, task_timeout=120,
+        provider_factory=lambda: _RepoFixProvider("pagination.py", _FIXED_PAGINATION))
+    assert len(report.cards) == 1
+    card = report.cards[0]
+    assert card.error == ""
+    assert not card.skipped
+    assert "heldout_tests_pass" in [g.name for g in card.graders]
+    assert card.passed, [f"{g.name}: {g.detail}" for g in card.graders]
+    assert card.run_status == "completed"
+    assert report.tasks[0].pass_rate == 1.0
+
+
+async def test_missing_required_tool_skips_task(monkeypatch):
+    """Toolchain gating: a task whose required tool is absent is SKIPPED, not failed,
+    and skips are excluded from the pass/fail denominator."""
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: None)
+    task = GoldenTask(id="needs_go", prompt="unused", graders=[], required_tools=("go",))
+    report = await run_eval(_offline_settings(), tasks=[task], repeat=3, task_timeout=5)
+    assert len(report.cards) == 1  # one skip card regardless of repeat
+    card = report.cards[0]
+    assert card.skipped
+    assert not card.passed
+    assert "go" in card.error
+    assert card.to_dict()["skipped"] is True  # additive key, to_dict stays compatible
+    assert report.skipped == 1
+    assert report.attempted == 0
+    assert report.passed == len(report.cards)  # a skip never turns the suite red
+    assert "SKIPPED" in report.summary()
+    assert report.tasks[0].to_dict()["skipped"] == 1
+    assert report.tasks[0].pass_rate == 0.0  # no attempted runs -> neutral zero
+
+
+def test_golden_suite_shape():
+    """The suite spans ~10 tasks; every fixture task has a repo, cross-language tasks
+    declare their toolchain and ship held-out tests."""
+    ids = [t.id for t in GOLDEN]
+    assert len(ids) == len(set(ids))
+    assert len(GOLDEN) >= 10
+    for t in GOLDEN:
+        if t.repo_fixture:
+            assert (FIXTURES_DIR / t.repo_fixture / "repo").is_dir(), t.id
+            assert t.heldout_dir is not None, t.id
+    for tid in ("fix_js_clamp", "fix_go_leap_year", "fix_rust_temp_conversion",
+                "fix_ruby_titlecase"):
+        t = next(x for x in GOLDEN if x.id == tid)
+        assert t.required_tools, tid
+
+
+@pytest.mark.skipif(shutil.which("node") is None or shutil.which("npm") is None,
+                    reason="node/npm not installed")
+def test_heldout_merge_grading_js_fixture(tmp_path):
+    """Non-Python held-out grading: the held-out tree is merged into the workspace and
+    the project's own test command (npm test) runs over the merged result."""
+    fixture = FIXTURES_DIR / "bugfix_js_clamp"
+    ws = tmp_path / "ws"
+    shutil.copytree(fixture / "repo", ws)
+
+    res = heldout_tests_pass(ws, fixture / "heldout", timeout=120)
+    assert not res.passed  # planted swapped-bounds bug is visible to the held-out tests
+    assert "npm" in res.detail
+
+    fixed = (ws / "clamp.js").read_text()
+    fixed = fixed.replace("if (value < min) return max;", "if (value < min) return min;")
+    fixed = fixed.replace("if (value > max) return min;", "if (value > max) return max;")
+    (ws / "clamp.js").write_text(fixed)
+    res = heldout_tests_pass(ws, fixture / "heldout", timeout=120)
+    assert res.passed, res.detail
+    assert (ws / "heldout.test.js").is_file()  # merged in alongside the repo tests
 
 
 def test_replay_eval_offline_with_repeat():

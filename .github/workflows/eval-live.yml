@@ -1,0 +1,99 @@
+# Live golden-task eval: runs the FULL suite (incl. the cross-language repo fixtures in
+# src/ai_dev_assistant/evals/fixtures/) against the real Anthropic backend.
+#
+# Manually triggered ONLY (workflow_dispatch) — it spends API credits, so it never runs
+# on push/PR. It also no-ops gracefully when the ANTHROPIC_API_KEY secret is not
+# configured (e.g. on forks): the guard step below skips every later step.
+name: Live eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: "Samples per golden task (--repeat)"
+        required: false
+        default: "1"
+      only:
+        description: "Task ids to run, comma- or space-separated (empty = full suite)"
+        required: false
+        default: ""
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      # Secrets are not readable in step-level `if:` expressions, so probe via env.
+      - name: Check ANTHROPIC_API_KEY is configured
+        id: key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::ANTHROPIC_API_KEY secret is not set; skipping the live eval."
+          fi
+
+      - uses: actions/checkout@v5
+        if: steps.key.outputs.present == 'true'
+
+      - name: Install uv (with Python 3.12)
+        # exact pin: setup-uv publishes floating major tags only up to v7
+        if: steps.key.outputs.present == 'true'
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: "3.12"
+
+      # Toolchains for the cross-language golden fixtures. Tasks whose toolchain is
+      # missing are SKIPPED by the harness, so these installs are what makes the
+      # go/node fixtures actually run. Rust (cargo) and Ruby (rake) are preinstalled
+      # on the ubuntu-latest runner image.
+      - name: Install Go
+        if: steps.key.outputs.present == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: false
+
+      - name: Install Node
+        if: steps.key.outputs.present == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      # setup-uv with a python-version already provisions .venv — recreate with
+      # --clear so this works regardless of that behavior (mirrors ci.yml).
+      - name: Create venv
+        if: steps.key.outputs.present == 'true'
+        run: uv venv --clear --python 3.12
+
+      - name: Install project (editable + dev extras)
+        if: steps.key.outputs.present == 'true'
+        run: uv pip install -e ".[dev]"
+
+      - name: Run live golden-task eval
+        if: steps.key.outputs.present == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ADA_LLM_BACKEND: anthropic
+          REPEAT: ${{ inputs.repeat }}
+          ONLY: ${{ inputs.only }}
+        run: |
+          set -o pipefail
+          args=(--json --repeat "${REPEAT:-1}")
+          # --only is repeatable and takes one task id each; accept comma/space lists.
+          for id in $(printf '%s' "$ONLY" | tr ',' ' '); do
+            args+=(--only "$id")
+          done
+          uv run ai-dev-assistant eval "${args[@]}" | tee eval-scorecard.json
+
+      # Keep the scorecard even when the eval step exits non-zero (a red suite is
+      # exactly when you want the per-task JSON).
+      - name: Upload JSON scorecard
+        if: ${{ !cancelled() && steps.key.outputs.present == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-scorecard
+          path: eval-scorecard.json
+          if-no-files-found: warn

@@ -53,6 +53,9 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Run the offline replay eval over committed cassettes (no LLM needed)")
     evalp.add_argument("--record-cassettes", nargs="?", const="", default=None, metavar="DIR",
                        help="Regenerate the offline replay cassettes (deterministic, no LLM needed)")
+    evalp.add_argument("--ab", metavar="ADA_KNOB=V1,V2", default=None,
+                       help="A/B compare the suite under different values of one ADA_* knob "
+                            "(combine with --replay for an offline smoke)")
     return parser
 
 
@@ -108,6 +111,26 @@ def _eval(args: argparse.Namespace) -> int:
     from .evals.harness import run_eval_sync
 
     logging.basicConfig(level=logging.WARNING, format="%(message)s", stream=sys.stderr)
+
+    # A/B knob comparison: run the suite once per value and compare the arms.
+    if args.ab:
+        from .evals.ab import run_ab
+        knob, _, vals = args.ab.partition("=")
+        values = [v for v in vals.split(",") if v]
+        replay = args.replay is not None
+        settings = Settings.load()
+        if not replay and settings.requires_api_key and not settings.has_api_key:
+            print("ERROR: A/B eval needs a working LLM backend (or add --replay for an "
+                  "offline smoke).", file=sys.stderr)
+            return 2
+        try:
+            report = run_ab(settings, knob.strip(), values, only=args.only or None,
+                            repeat=args.repeat or 1, task_timeout=args.timeout, replay=replay)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        print(_json.dumps(report.to_dict(), indent=2) if args.json else report.summary())
+        return 0
 
     # Offline modes: replay committed cassettes / regenerate them — no LLM needed.
     if args.record_cassettes is not None or args.replay is not None:

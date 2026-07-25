@@ -1,0 +1,9 @@
+{
+  "name": "clamp-utils",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tiny numeric range helpers (golden-task eval fixture)",
+  "scripts": {
+    "test": "node --test"
+  }
+}

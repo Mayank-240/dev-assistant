@@ -18,6 +18,9 @@ What the harness measures beyond the toy tasks:
     (``ADA_EVAL_TASK_TIMEOUT``, default 600s).
   - E4  offline replay: see ``evals/replay_eval.py`` — the same harness run over
     committed cassettes in ``evals/cassettes/`` with a ReplayProvider.
+  - Cross-language fixtures (JS/npm, Go, Rust, Ruby) exercise non-pytest verification;
+    each declares ``required_tools`` and is SKIPPED (``Scorecard.skipped``) rather than
+    failed when its toolchain is absent, and skips never count against the pass rate.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -72,6 +76,9 @@ class GoldenTask:
     repo_fixture: str = ""
     # E5: agents the plan is expected to route to; grades routing accuracy when set.
     expected_agents: tuple[str, ...] = ()
+    # Executables the task's toolchain needs (e.g. ("go",), ("node", "npm")). When any
+    # is missing from PATH the task is SKIPPED (Scorecard.skipped) instead of failed.
+    required_tools: tuple[str, ...] = ()
 
     @property
     def fixture_repo(self) -> Path | None:
@@ -140,6 +147,67 @@ GOLDEN: list[GoldenTask] = [
         repo_fixture="refactor_shapes",
         expected_agents=("refactorer", "coder"),
     ),
+    GoldenTask(
+        id="fix_pagination_total_pages",
+        prompt=("The pagination helper has an off-by-one bug: total_pages(total_items, "
+                "page_size) drops the final partial page, so test_pagination.py currently "
+                "fails. Fix the bug in pagination.py so the existing pytest suite passes. "
+                "Do NOT change or delete the tests."),
+        graders=[lambda ws: file_exists(ws, "pagination.py"),
+                 lambda ws: tests_pass(ws)],
+        repo_fixture="bugfix_pagination",
+        expected_agents=("debugger", "coder"),
+    ),
+    # ---- Cross-language repo tasks: skipped (not failed) when the toolchain is absent.
+    # Their held-out grading merges fixtures/<task>/heldout into the workspace and runs
+    # the language's own test command (see graders.heldout_tests_pass).
+    GoldenTask(
+        id="fix_js_clamp",
+        prompt=("This is a Node.js package; `npm test` runs the node:test suite. "
+                "clamp(value, min, max) in clamp.js has a bug: the bounds are swapped, so "
+                "out-of-range values are pinned to the WRONG end and clamp.test.js fails. "
+                "Fix clamp.js so `npm test` passes. Do NOT change the tests or package.json."),
+        graders=[lambda ws: file_exists(ws, "clamp.js"),
+                 lambda ws: tests_pass(ws)],
+        repo_fixture="bugfix_js_clamp",
+        expected_agents=("debugger", "coder"),
+        required_tools=("node", "npm"),
+    ),
+    GoldenTask(
+        id="fix_go_leap_year",
+        prompt=("This is a Go module. IsLeapYear in leapyear.go ignores the Gregorian "
+                "century rules (1900 is NOT a leap year, 2000 is), so `go test` fails. "
+                "Fix leapyear.go so the existing tests pass. Do NOT change the tests."),
+        graders=[lambda ws: file_exists(ws, "leapyear.go"),
+                 lambda ws: tests_pass(ws)],
+        repo_fixture="bugfix_go_leapyear",
+        expected_agents=("debugger", "coder"),
+        required_tools=("go",),
+    ),
+    GoldenTask(
+        id="fix_rust_temp_conversion",
+        prompt=("This is a Rust crate. fahrenheit_to_celsius in src/lib.rs uses an "
+                "inverted conversion factor (it multiplies by 9/5 instead of 5/9), so "
+                "`cargo test` fails. Fix src/lib.rs so the tests pass. Do NOT change the "
+                "tests."),
+        graders=[lambda ws: file_exists(ws, "lib.rs"),
+                 lambda ws: tests_pass(ws)],
+        repo_fixture="bugfix_rust_tempconv",
+        expected_agents=("debugger", "coder"),
+        required_tools=("cargo",),
+    ),
+    GoldenTask(
+        id="fix_ruby_titlecase",
+        prompt=("This is a Ruby project tested with `rake test` (minitest). "
+                "StrUtils.titlecase in strutils.rb only capitalizes the FIRST word — every "
+                "word should be capitalized — so test_strutils.rb fails. Fix strutils.rb "
+                "so `rake test` passes. Do NOT change the tests or the Rakefile."),
+        graders=[lambda ws: file_exists(ws, "strutils.rb"),
+                 lambda ws: tests_pass(ws)],
+        repo_fixture="bugfix_ruby_titlecase",
+        expected_agents=("debugger", "coder"),
+        required_tools=("ruby", "rake"),
+    ),
 ]
 
 
@@ -157,6 +225,10 @@ class Scorecard:
     routing_accuracy: float | None = None  # share of subtasks routed to expected_agents
     run_status: str = ""          # engine rollup: completed | partial | failed | ...
     error: str = ""
+    # Toolchain gating: True when the task's required_tools are missing on this machine.
+    # Skipped cards never count as failures (excluded from the pass/fail denominator).
+    # to_dict stays backward compatible — the new key is purely additive.
+    skipped: bool = False
 
     def to_dict(self) -> dict:
         return {**dataclasses.asdict(self),
@@ -175,8 +247,13 @@ class TaskSummary:
     runs: list[Scorecard] = field(default_factory=list)
 
     @property
+    def skipped_runs(self) -> int:
+        return sum(1 for c in self.runs if c.skipped)
+
+    @property
     def pass_rate(self) -> float:
-        return _mean([1.0 if c.passed else 0.0 for c in self.runs])
+        # Skipped runs (missing toolchain) are excluded from the denominator.
+        return _mean([1.0 if c.passed else 0.0 for c in self.runs if not c.skipped])
 
     @property
     def mean_quality(self) -> float:
@@ -207,6 +284,7 @@ class TaskSummary:
         return {
             "task_id": self.task_id,
             "repeats": len(self.runs),
+            "skipped": self.skipped_runs,
             "pass_rate": round(self.pass_rate, 3),
             "mean_quality": round(self.mean_quality, 1),
             "min_quality": round(self.min_quality, 1),
@@ -225,14 +303,35 @@ class EvalReport:
     tasks: list[TaskSummary] = field(default_factory=list)  # one per task
 
     @property
+    def skipped(self) -> int:
+        return sum(1 for c in self.cards if c.skipped)
+
+    @property
+    def attempted(self) -> int:
+        return len(self.cards) - self.skipped
+
+    @property
     def passed(self) -> int:
-        return sum(1 for c in self.cards if c.passed)
+        """Count of runs that did not fail: passing runs plus skipped ones.
+
+        Skipped cards (missing toolchain) count here so the callers' green condition
+        ``report.passed == len(report.cards)`` still holds when every *attempted* run
+        passed — i.e. skips are excluded from the pass/fail denominator.
+        """
+        return sum(1 for c in self.cards if c.passed or c.skipped)
 
     def summary(self) -> str:
-        lines = [f"Eval: {self.passed}/{len(self.cards)} golden runs passed "
-                 f"({len(self.tasks)} tasks)", ""]
+        passed_runs = sum(1 for c in self.cards if c.passed)
+        head = (f"Eval: {passed_runs}/{self.attempted} golden runs passed "
+                f"({len(self.tasks)} tasks")
+        if self.skipped:
+            head += f", {self.skipped} run(s) skipped: toolchain missing"
+        lines = [head + ")", ""]
         for t in self.tasks:
-            mark = "✅" if t.pass_rate == 1.0 else ("❌" if t.pass_rate == 0.0 else "⚠️")
+            if t.skipped_runs == len(t.runs):
+                mark = "⏭️"
+            else:
+                mark = "✅" if t.pass_rate == 1.0 else ("❌" if t.pass_rate == 0.0 else "⚠️")
             routing = (f", routing {t.routing_accuracy:.0%}"
                        if t.routing_accuracy is not None else "")
             lines.append(
@@ -241,7 +340,8 @@ class EvalReport:
                 f"${t.mean_cost_usd:.3f}, {t.mean_wall_s:.1f}s, "
                 f"parallelism {t.parallelism}{routing})")
             for c in t.runs:
-                lines.append(f"   run: {'pass' if c.passed else 'FAIL'}  "
+                state = "SKIPPED" if c.skipped else ("pass" if c.passed else "FAIL")
+                lines.append(f"   run: {state}  "
                              f"{c.subtasks_passed}/{c.subtasks_total} subtasks, "
                              f"status {c.run_status or 'n/a'}")
                 for g in c.graders:
@@ -351,6 +451,16 @@ async def run_eval(
     report = EvalReport()
     for t in chosen:  # serial: keeps cost/observability simple and deterministic
         summary = TaskSummary(task_id=t.id)
+        missing = tuple(tool for tool in t.required_tools if shutil.which(tool) is None)
+        if missing:  # toolchain gating: skip (never fail) — one card regardless of repeat
+            card = Scorecard(
+                task_id=t.id, passed=False, graders=[], skipped=True,
+                run_status="skipped",
+                error=f"skipped: required tool(s) not installed: {', '.join(missing)}")
+            summary.runs.append(card)
+            report.cards.append(card)
+            report.tasks.append(summary)
+            continue
         for _ in range(n):
             card = await _run_one(base, t, task_timeout=timeout,
                                   provider_factory=provider_factory)

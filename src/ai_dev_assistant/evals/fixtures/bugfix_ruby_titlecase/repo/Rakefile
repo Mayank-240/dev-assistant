@@ -1,0 +1,10 @@
+# Golden-task eval fixture: `rake test` runs the minitest suite (test_*.rb at the root).
+require "rake/testtask"
+
+Rake::TestTask.new(:test) do |t|
+  t.libs << "."
+  t.pattern = "test_*.rb"
+  t.warning = false
+end
+
+task default: :test
