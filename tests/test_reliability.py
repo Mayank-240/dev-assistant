@@ -110,10 +110,27 @@ def test_objective_gate_hard_fails_on_failing_tests():
     assert out.passed is False and "tests failed" in " ".join(out.reasons).lower()
 
 
-def test_objective_gate_soft_passes_when_tests_green_but_llm_nitpicks():
+def test_objective_gate_soft_passes_when_scoped_tests_green_but_llm_nitpicks():
     ok = ExecutionResult("pytest", 0, "2 passed", "", 0.1)
-    out = apply_objective_gate(Verdict(passed=False, score=40), {"tests": ok})
-    assert out.passed is True and out.score >= 70
+    # The override requires tests scoped to the subtask's changes (V1/V2)…
+    out = apply_objective_gate(Verdict(passed=False, score=40), {"tests": ok, "scoped": True})
+    assert out.passed is True
+    assert 50 <= out.score <= 70  # capped, not floored
+
+
+def test_objective_gate_unscoped_green_tests_do_not_override_review():
+    ok = ExecutionResult("pytest", 0, "2 passed", "", 0.1)
+    out = apply_objective_gate(Verdict(passed=False, score=40), {"tests": ok, "scoped": False})
+    assert out.passed is False  # a random green test elsewhere proves nothing (V1)
+
+
+def test_objective_gate_ignores_pre_existing_failures():
+    failing = ExecutionResult("pytest", 1, "1 failed", "", 0.1)
+    baseline = {"tests": ExecutionResult("pytest", 1, "1 failed", "", 0.1)}
+    out = apply_objective_gate(Verdict(passed=True, score=90), {"tests": failing},
+                               baseline=baseline)
+    assert out.passed is True  # the suite was already red before the run (V3)
+    assert "pre-date" in (out.objective_note or "")
 
 
 # ---- vector dim guard + dedup (Tier 4) ----
