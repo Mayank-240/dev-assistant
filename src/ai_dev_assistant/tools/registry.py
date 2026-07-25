@@ -18,6 +18,7 @@ import asyncio
 import fnmatch
 import html
 import ipaddress
+import inspect
 import json
 import os
 import re
@@ -65,6 +66,9 @@ class ToolContext:
     protected_paths: tuple[str, ...] = ()
     # (agent_name, task) -> result. Wired by the engine with depth limiting; None disables delegate.
     spawn: Callable[[str, str], Awaitable[str]] | None = None
+    # async attention hook: (kind, text, options) -> operator answer | None on timeout.
+    # kind is "ask" or "permission"; wired by the engine when a UI is attached.
+    attention: Callable[[str, str, list[str]], Awaitable[str | None]] | None = None
 
 
 _MAX_FILE_CHARS = 8000
@@ -247,6 +251,8 @@ class ToolBox:
             "find_references": self._find_references,
             "delegate": self._delegate,
             "web_fetch": self._web_fetch,
+            "ask_operator": self._ask_operator,
+            "request_permission": self._request_permission,
         }
 
     # ---- schema exposed to the model ----
@@ -261,6 +267,9 @@ class ToolBox:
         handler = self._handlers.get(name)
         if handler is None:
             return f"ERROR: unknown tool '{name}'"
+        if inspect.iscoroutinefunction(handler):
+            return (f"ERROR: '{name}' needs the interactive session (async tool path) — "
+                    "it is unavailable here; proceed with your best judgment.")
         try:
             out = handler(tool_input or {})
         except Exception as exc:  # tools must never crash the agent loop
@@ -273,6 +282,59 @@ class ToolBox:
             self._ctx.audit.record(agent=self._ctx.agent_name, tool=name,
                                    args=tool_input or {}, outcome=out[:80])
         return out
+
+    async def dispatch_async(self, name: str, tool_input: dict[str, Any]) -> str:
+        """Await-capable dispatch: async handlers (attention tools) are awaited on the
+        caller's loop so the server stays responsive while an agent waits for the
+        operator; sync tools take the normal path."""
+        handler = self._handlers.get(name)
+        if handler is not None and inspect.iscoroutinefunction(handler):
+            try:
+                out = await handler(tool_input or {})
+            except Exception as exc:  # tools must never crash the agent loop
+                out = f"ERROR: tool '{name}' failed: {exc}"
+            if self._ctx.redact:
+                from ..security.redaction import redact
+
+                out = redact(out)
+            if self._ctx.audit is not None:
+                self._ctx.audit.record(agent=self._ctx.agent_name, tool=name,
+                                       args=tool_input or {}, outcome=out[:80])
+            return out
+        return self.dispatch(name, tool_input)
+
+    # ---- attention tools: block on the operator (ask / permission) ----
+    async def _ask_operator(self, args: dict[str, Any]) -> str:
+        question = str(args.get("question", "")).strip()[:1000]
+        options = [str(o)[:120] for o in (args.get("options") or [])][:6]
+        if not question:
+            return "ERROR: 'question' is required"
+        if self._ctx.attention is None:
+            return ("No operator is attached to this run — proceed with your best judgment "
+                    "and state the assumption you made.")
+        answer = await self._ctx.attention("ask", question, options)
+        if answer is None:
+            return ("The operator did not answer in time — proceed with your best judgment "
+                    "and state the assumption you made.")
+        return f"Operator answered: {answer}"
+
+    async def _request_permission(self, args: dict[str, Any]) -> str:
+        request = str(args.get("request", "")).strip()[:1000]
+        if not request:
+            return "ERROR: 'request' is required"
+        if self._ctx.attention is None:
+            return ("No operator is attached to this run — treat the permission as DENIED "
+                    "and plan around it.")
+        answer = await self._ctx.attention("permission", request, [])
+        if answer is None:
+            return "No decision in time — treat the permission as DENIED and plan around it."
+        up = answer.upper()
+        if up.startswith("DENIED"):
+            return "Operator DENIED the request — do not do this; plan around it."
+        if up.startswith("ALLOW FOR THIS RUN"):
+            return ("Operator GRANTED the permission for this entire run — proceed, and you "
+                    "need not ask again for the same action in this run.")
+        return "Operator GRANTED the permission (once) — proceed with exactly this action."
 
     # ---- path safety ----
     def _resolve(self, rel: str) -> Path | None:
@@ -1039,4 +1101,33 @@ _TOOL_DEFS: list[dict[str, Any]] = [
                                                            "(default and max 100000)"}},
                              ["url"]),
     },
+    {
+        "name": "ask_operator",
+        "description": "Ask the human operator ONE clarifying question and wait for the "
+                       "answer. Use when a requirement is genuinely ambiguous and guessing "
+                       "wrong would waste the run. Provide short options when they exist.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "The question, one sentence"},
+                "options": {"type": "array", "items": {"type": "string"},
+                             "description": "Optional quick-choice answers (max 6)"},
+            },
+            "required": ["question"],
+        },
+    },
+    {
+        "name": "request_permission",
+        "description": "Ask the human operator to approve a sensitive action (e.g. touching "
+                       "a protected path, an external call) and wait for the decision. State "
+                       "exactly what you want to do and why. Denied means plan around it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "request": {"type": "string",
+                             "description": "Exactly what you want to do, and why"},
+            },
+            "required": ["request"],
+        },
+    }
 ]

@@ -76,7 +76,12 @@ class AnthropicProvider:
                 results: list[dict[str, Any]] = []
                 for block in resp.content:
                     if getattr(block, "type", None) == "tool_use":
-                        output = toolbox.dispatch(block.name, dict(block.input or {}))
+                        # attention tools await the operator; dispatch_async keeps the
+                        # loop free so the answer can actually arrive.
+                        if hasattr(toolbox, "dispatch_async"):
+                            output = await toolbox.dispatch_async(block.name, dict(block.input or {}))
+                        else:
+                            output = toolbox.dispatch(block.name, dict(block.input or {}))
                         results.append(
                             {"type": "tool_result", "tool_use_id": block.id, "content": output}
                         )

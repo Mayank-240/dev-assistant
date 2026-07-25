@@ -360,7 +360,12 @@ class ClaudeSdkProvider:
 
             @sdk.tool(name, d["description"], d["input_schema"])
             async def _fn(args: dict[str, Any], _name: str = name) -> dict[str, Any]:
-                output = toolbox.dispatch(_name, args or {})
+                # dispatch_async lets attention tools (ask_operator/request_permission)
+                # await the operator without blocking the event loop.
+                if hasattr(toolbox, "dispatch_async"):
+                    output = await toolbox.dispatch_async(_name, args or {})
+                else:
+                    output = toolbox.dispatch(_name, args or {})
                 return {"content": [{"type": "text", "text": output}]}
 
             sdk_tools.append(_fn)

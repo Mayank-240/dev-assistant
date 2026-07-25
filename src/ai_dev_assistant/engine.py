@@ -790,7 +790,7 @@ class Engine:
             }))
 
     def _build_toolbox(self, agent_name: str, task_scope: str, run_ws: Path, *,
-                       spawn: Any = None) -> ToolBox:
+                       spawn: Any = None, attention: Any = None) -> ToolBox:
         """ToolContext construction resilient to optional fields (spawn/allow_web) landing."""
         kwargs: dict[str, Any] = dict(
             memory=self.memory, kb=self.kb, kg=self.kg, bus=self.bus,
@@ -801,6 +801,7 @@ class Engine:
             sandbox_cpu=self.settings.sandbox_cpu_seconds, sandbox_mem=self.settings.sandbox_mem_mb,
             spawn=spawn, allow_web=self.settings.allow_web,
             protected_paths=self.settings.protected_paths,
+            attention=attention,
         )
         fields = {f.name for f in dataclasses.fields(ToolContext)}
         return ToolBox(ToolContext(**{k: v for k, v in kwargs.items() if k in fields}))
@@ -872,7 +873,23 @@ class Engine:
                     finally:
                         await fresh.aclose()
 
-            toolbox = self._build_toolbox(state.agent, run.id, exec_ws, spawn=spawn)
+            async def attention(kind: str, text: str, options: list[str]) -> str | None:
+                """Attention screens (ask/permission): emit the event the UI renders and
+                await the operator's steer-delivered answer. None = no operator/timeout."""
+                if self.control is None:
+                    return None
+                rid = self.control.open_request(kind)
+                if kind == "ask":
+                    emit(Event("ask", f"[{state.agent}] {text[:140]}", {
+                        "id": rid, "agent": state.agent, "question": text,
+                        "options": list(options or [])}))
+                else:
+                    emit(Event("permission", f"[{state.agent}] {text[:140]}", {
+                        "id": rid, "agent": state.agent, "request": text}))
+                return await self.control.wait_answer(rid, self.settings.attention_timeout or None)
+
+            toolbox = self._build_toolbox(state.agent, run.id, exec_ws, spawn=spawn,
+                                          attention=attention)
             criteria = "\n".join(f"- {c}" for c in state.spec.acceptance_criteria) or "- (none)"
             task_text = (
                 f"{state.spec.title}\n\n{state.spec.description}\n\nAcceptance criteria:\n{criteria}"
