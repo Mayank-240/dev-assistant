@@ -7,9 +7,11 @@ run's changes as a branch + commit (and optionally a PR) at the end.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger("ada.vcs")
@@ -120,7 +122,10 @@ def worktree_add(workspace: Path, subtask_id: str) -> Path:
         _commit_all(workspace, "ada: pre-worktree snapshot")
 
     # Keep the worktree container invisible to the repo without touching .gitignore.
-    exclude = workspace / ".git" / "info" / "exclude"
+    # info/exclude lives in the COMMON git dir; inside a linked worktree ``.git`` is a
+    # file, so resolve the real location instead of assuming a ``.git`` directory.
+    common = _git(["rev-parse", "--git-common-dir"], workspace).stdout.strip()
+    exclude = (workspace / common).resolve() / "info" / "exclude"
     line = f"{_WORKTREES_DIR}/"
     try:
         existing = exclude.read_text() if exclude.exists() else ""
@@ -159,7 +164,10 @@ def worktree_merge(workspace: Path, subtask_id: str, *, message: str) -> dict:
             f for f in _git(["diff", "--name-only", "--diff-filter=U"], workspace).stdout.splitlines()
             if f.strip()
         ]
-        if (workspace / ".git" / "MERGE_HEAD").exists():
+        # MERGE_HEAD lives in the per-worktree git dir (a linked worktree's ``.git``
+        # is a file), so resolve it via --git-dir rather than assuming a directory.
+        git_dir = _git(["rev-parse", "--git-dir"], workspace).stdout.strip()
+        if git_dir and ((workspace / git_dir).resolve() / "MERGE_HEAD").exists():
             _git(["merge", "--abort"], workspace)
         else:  # merge died before recording MERGE_HEAD; restore the tree anyway
             _git(["reset", "--merge"], workspace)
@@ -179,6 +187,231 @@ def worktree_remove(workspace: Path, subtask_id: str) -> None:
         _git(["branch", "-D", _branch_for(subtask_id)], workspace)
     except Exception as exc:  # pragma: no cover - cleanup must never propagate
         logger.warning("worktree cleanup failed for %s: %s", subtask_id, exc)
+
+
+# ---------------------------------------------------------------------------
+# Task-level worktrees (a task runs in a worktree OUTSIDE the project checkout)
+# and review-flow merge primitives (merge / cherry-pick without touching any
+# existing checkout — the user's working tree and branch are never mutated).
+# ---------------------------------------------------------------------------
+
+
+def _task_branch(task_id: str) -> str:
+    return f"ada/{task_id}"
+
+
+def _worktree_entries(repo: Path) -> list[dict[str, str]]:
+    """Parse ``git worktree list --porcelain`` into [{"path": ..., "branch": ...}]."""
+    out = _git(["worktree", "list", "--porcelain"], repo).stdout
+    entries: list[dict[str, str]] = []
+    cur: dict[str, str] = {}
+    for line in out.splitlines():
+        if not line.strip():
+            if cur:
+                entries.append(cur)
+                cur = {}
+        elif line.startswith("worktree "):
+            cur = {"path": line[len("worktree "):]}
+        elif line.startswith("branch "):
+            cur["branch"] = line[len("branch "):].removeprefix("refs/heads/")
+    if cur:
+        entries.append(cur)
+    return entries
+
+
+def _checked_out_branches(repo: Path) -> set[str]:
+    """Branch names checked out in ANY worktree of ``repo`` (incl. its own tree)."""
+    return {e["branch"] for e in _worktree_entries(repo) if "branch" in e}
+
+
+def _branch_exists(repo: Path, name: str) -> bool:
+    return _git(["rev-parse", "--verify", "--quiet", f"refs/heads/{name}"], repo).returncode == 0
+
+
+def task_worktree_add(repo: Path, wt_path: Path, task_id: str, *, base: str = "") -> dict:
+    """Create (or reuse) the task worktree for ``task_id`` at ``wt_path``.
+
+    Branch ``ada/{task_id}`` is created at ``base`` (or the repo's HEAD) and checked
+    out into ``wt_path``, which lives OUTSIDE the repo (parents are auto-created).
+    Idempotent: if ``wt_path`` is already a registered worktree on that branch, it
+    is reused. The repo's own checked-out branch and working tree are NEVER touched
+    and nothing is ever committed in the repo — an empty repository (no commits)
+    raises ``ValueError("repository has no commits")`` so the caller can decide
+    (in-place user repos must never be committed to by the assistant).
+
+    Returns ``{"path": str, "branch": "ada/<task_id>", "created": bool}``.
+    """
+    repo = Path(repo)
+    if _git(["rev-parse", "--git-dir"], repo).returncode != 0:
+        raise ValueError(f"not a git repository: {repo}")
+    if _git(["rev-parse", "--verify", "--quiet", "HEAD"], repo).returncode != 0:
+        raise ValueError("repository has no commits")
+
+    branch = _task_branch(task_id)
+    wt_path = Path(wt_path).resolve()
+    for entry in _worktree_entries(repo):
+        if Path(entry["path"]).resolve() == wt_path and entry.get("branch") == branch:
+            return {"path": str(wt_path), "branch": branch, "created": False}
+
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    if _branch_exists(repo, branch):  # e.g. re-engaging a task whose worktree was removed
+        res = _git(["worktree", "add", str(wt_path), branch], repo)
+    else:
+        res = _git(["worktree", "add", "-b", branch, str(wt_path), base or "HEAD"], repo)
+    if res.returncode != 0:
+        raise RuntimeError(f"git worktree add failed: {(res.stderr or res.stdout).strip()[:300]}")
+    return {"path": str(wt_path), "branch": branch, "created": True}
+
+
+def task_worktree_remove(repo: Path, wt_path: Path, task_id: str, *, keep_branch: bool = True) -> None:
+    """Best-effort removal of a task worktree; never raises.
+
+    The ``ada/{task_id}`` branch survives unless ``keep_branch=False``.
+    """
+    try:
+        wt = Path(wt_path)
+        _git(["worktree", "remove", "--force", str(wt)], repo)
+        if wt.exists():  # leftover dir (e.g. worktree already pruned)
+            shutil.rmtree(wt, ignore_errors=True)
+        _git(["worktree", "prune"], repo)
+        if not keep_branch:
+            _git(["branch", "-D", _task_branch(task_id)], repo)
+    except Exception as exc:  # pragma: no cover - cleanup must never propagate
+        logger.warning("task worktree cleanup failed for %s: %s", task_id, exc)
+
+
+@contextlib.contextmanager
+def _temp_worktree(repo: Path, branch: str):
+    """Yield a throwaway worktree with ``branch`` checked out; always cleaned up."""
+    tmp = Path(tempfile.mkdtemp(prefix="ada-tmp-wt-"))
+    wt = tmp / "wt"
+    res = _git(["worktree", "add", str(wt), branch], repo)
+    if res.returncode != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(f"git worktree add failed: {(res.stderr or res.stdout).strip()[:300]}")
+    try:
+        yield wt
+    finally:
+        _git(["worktree", "remove", "--force", str(wt)], repo)
+        _git(["worktree", "prune"], repo)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _ensure_branch_at_head(repo: Path, name: str) -> str:
+    """Create ``name`` at HEAD if missing. Returns "" on success, error text otherwise."""
+    if _branch_exists(repo, name):
+        return ""
+    res = _git(["branch", name], repo)
+    return "" if res.returncode == 0 else (res.stderr or res.stdout).strip()[:300]
+
+
+def _unmerged_files(wt: Path) -> list[str]:
+    out = _git(["diff", "--name-only", "--diff-filter=U"], wt).stdout
+    return [f for f in out.splitlines() if f.strip()]
+
+
+def _op_in_progress(wt: Path, state_file: str) -> bool:
+    """True when ``state_file`` (MERGE_HEAD / CHERRY_PICK_HEAD) exists in wt's git dir."""
+    git_dir = _git(["rev-parse", "--git-dir"], wt).stdout.strip()
+    return bool(git_dir) and ((wt / git_dir).resolve() / state_file).exists()
+
+
+def merge_branch(repo: Path, src: str, into: str, *, message: str = "") -> dict:
+    """Merge ``src`` into ``into`` without touching any existing checkout.
+
+    If ``into`` is checked out anywhere (including the repo's own working tree)
+    the merge is refused: ``{"merged": False, "conflict": False, "error":
+    "target branch is checked out"}`` — callers route in-place projects to an
+    integration branch instead. Otherwise the merge happens with ``--no-ff`` in a
+    temporary worktree (creating ``into`` at HEAD if it doesn't exist yet).
+    Conflicts are aborted and reported as ``{"merged": False, "conflict": True,
+    "files": [...]}``; success returns ``{"merged": True, "conflict": False,
+    "commit": sha}``.
+    """
+    repo = Path(repo)
+    if into in _checked_out_branches(repo):
+        return {"merged": False, "conflict": False, "error": "target branch is checked out"}
+    err = _ensure_branch_at_head(repo, into)
+    if err:
+        return {"merged": False, "conflict": False, "error": f"cannot create branch {into}: {err}"}
+    try:
+        with _temp_worktree(repo, into) as wt:
+            msg = message or f"ada: merge {src} into {into}"
+            res = _git([*_IDENT, "merge", "--no-ff", "-m", msg, src], wt)
+            if res.returncode != 0:
+                files = _unmerged_files(wt)
+                if _op_in_progress(wt, "MERGE_HEAD"):
+                    _git(["merge", "--abort"], wt)
+                else:
+                    _git(["reset", "--merge"], wt)
+                if files:
+                    return {"merged": False, "conflict": True, "files": files}
+                return {"merged": False, "conflict": False,
+                        "error": (res.stderr or res.stdout).strip()[:300]}
+            commit = _git(["rev-parse", "HEAD"], wt).stdout.strip()
+            return {"merged": True, "conflict": False, "commit": commit}
+    except RuntimeError as exc:
+        return {"merged": False, "conflict": False, "error": str(exc)[:300]}
+
+
+def cherry_pick_merge(repo: Path, sha: str, into: str) -> dict:
+    """Apply ONE commit onto ``into`` (per-subtask acceptance in the review flow).
+
+    Uses ``cherry-pick -m 1`` when ``sha`` is a merge commit (a subtask's merge
+    into its task branch) and a plain cherry-pick otherwise. Same refusal (target
+    checked out anywhere), temp-worktree, conflict-abort semantics and return
+    shape as :func:`merge_branch` (plus ``"files"`` on conflict).
+    """
+    repo = Path(repo)
+    if into in _checked_out_branches(repo):
+        return {"merged": False, "conflict": False, "error": "target branch is checked out"}
+    parents = _git(["rev-list", "--parents", "-n", "1", sha], repo)
+    if parents.returncode != 0:
+        return {"merged": False, "conflict": False,
+                "error": f"cannot resolve commit {sha}: {(parents.stderr or parents.stdout).strip()[:200]}"}
+    is_merge_commit = len(parents.stdout.split()) > 2
+    err = _ensure_branch_at_head(repo, into)
+    if err:
+        return {"merged": False, "conflict": False, "error": f"cannot create branch {into}: {err}"}
+    try:
+        with _temp_worktree(repo, into) as wt:
+            args = ["cherry-pick", *(["-m", "1"] if is_merge_commit else []), sha]
+            res = _git([*_IDENT, *args], wt)
+            if res.returncode != 0:
+                files = _unmerged_files(wt)
+                if _op_in_progress(wt, "CHERRY_PICK_HEAD"):
+                    _git(["cherry-pick", "--abort"], wt)
+                else:
+                    _git(["reset", "--merge"], wt)
+                if files:
+                    return {"merged": False, "conflict": True, "files": files}
+                return {"merged": False, "conflict": False,
+                        "error": (res.stderr or res.stdout).strip()[:300]}
+            commit = _git(["rev-parse", "HEAD"], wt).stdout.strip()
+            return {"merged": True, "conflict": False, "commit": commit}
+    except RuntimeError as exc:
+        return {"merged": False, "conflict": False, "error": str(exc)[:300]}
+
+
+def cherry_pick_in_checkout(repo: Path, sha: str) -> dict:
+    """Apply one commit directly in ``repo``'s working tree (must be clean).
+
+    For checkouts the assistant OWNS (greenfield/clone projects): acceptance advances
+    the checked-out branch and its working tree together. Same return shape as
+    ``cherry_pick_merge``. Never used on in-place user repos.
+    """
+    if _git(["status", "--porcelain"], repo).stdout.strip():
+        return {"merged": False, "conflict": False, "error": "checkout has uncommitted changes"}
+    parents = _git(["rev-list", "--parents", "-n", "1", sha], repo).stdout.split()
+    args = ["cherry-pick"] + (["-m", "1"] if len(parents) > 2 else []) + [sha]
+    res = _git([*_IDENT, *args], repo)
+    if res.returncode != 0:
+        files = [f for f in _git(["diff", "--name-only", "--diff-filter=U"], repo)
+                 .stdout.splitlines() if f.strip()]
+        _git(["cherry-pick", "--abort"], repo)
+        return {"merged": False, "conflict": True, "files": files}
+    return {"merged": True, "conflict": False,
+            "commit": _git(["rev-parse", "HEAD"], repo).stdout.strip()}
 
 
 def finalize(dest: Path, *, branch: str, message: str) -> dict[str, str]:
