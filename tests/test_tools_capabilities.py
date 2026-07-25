@@ -68,8 +68,8 @@ def test_symbols_respects_workspace_boundary_and_denylist(tmp_path):
     (tmp_path / "outside.py").write_text("def secret_fn():\n    pass\n")
     (ws / ".env").write_text("API_KEY=hunter2hunter2")
     box = make_box(ws)
-    assert box.dispatch("symbols", {"path": "../outside.py"}).startswith("ERROR")
-    assert box.dispatch("symbols", {"path": ".env"}).startswith("ERROR")
+    assert box.dispatch("symbols", {"path": "../outside.py"}).startswith("DENIED")
+    assert box.dispatch("symbols", {"path": ".env"}).startswith("DENIED")
 
 
 # ---- find_references (T3) ----

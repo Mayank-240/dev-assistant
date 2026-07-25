@@ -20,7 +20,7 @@ def test_read_file_rejects_dotdot_escape(tmp_path):
     ws.mkdir()
     (tmp_path / "outside.txt").write_text("secret stuff")
     out = make_box(ws).dispatch("read_file", {"path": "../outside.txt"})
-    assert out.startswith("ERROR")
+    assert out.startswith("DENIED: ")
     assert "secret stuff" not in out
 
 
@@ -28,7 +28,7 @@ def test_read_file_rejects_absolute_path(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
     out = make_box(ws).dispatch("read_file", {"path": "/etc/passwd"})
-    assert out.startswith("ERROR")
+    assert out.startswith("DENIED: ")
     assert "root:" not in out
 
 
@@ -38,7 +38,7 @@ def test_read_file_rejects_symlink_out_of_workspace(tmp_path):
     (tmp_path / "outside.txt").write_text("secret stuff")
     (ws / "link.txt").symlink_to(tmp_path / "outside.txt")
     out = make_box(ws).dispatch("read_file", {"path": "link.txt"})
-    assert out.startswith("ERROR")
+    assert out.startswith("DENIED: ")
     assert "secret stuff" not in out
 
 
@@ -46,7 +46,7 @@ def test_write_file_rejects_escape(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
     out = make_box(ws).dispatch("write_file", {"path": "../evil.txt", "content": "x"})
-    assert out.startswith("ERROR")
+    assert out.startswith("DENIED: ")
     assert not (tmp_path / "evil.txt").exists()
 
 
@@ -58,7 +58,7 @@ def test_secret_denylist_blocks_env_reads(tmp_path):
     box = make_box(ws)
     for name in (".env", "id_rsa"):
         out = box.dispatch("read_file", {"path": name})
-        assert out.startswith("ERROR"), name
+        assert out.startswith("DENIED: "), name
         assert "hunter2" not in out
 
 
@@ -169,3 +169,106 @@ def test_install_packages_rejects_dangerous_args(tmp_path):
         out = box.dispatch("install_packages", {"packages": [bad]})
         assert out.startswith("ERROR"), bad
         assert "refusing" in out
+
+
+# ---- protected paths (F7 project policy) ----
+
+class _AuditStub:
+    def __init__(self):
+        self.lines = []
+
+    def record(self, agent, tool, args, outcome):
+        self.lines.append(f"{agent} {tool} {outcome}")
+
+
+def test_write_file_blocked_by_protected_globs(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    box = make_box(ws, protected_paths=("infra/**", "*.lock"))
+    out = box.dispatch("write_file", {"path": "infra/main.tf", "content": "x"})
+    assert out.startswith("DENIED: protected path")
+    assert not (ws / "infra").exists()
+    out = box.dispatch("write_file", {"path": "poetry.lock", "content": "x"})
+    assert out.startswith("DENIED: protected path")
+    assert not (ws / "poetry.lock").exists()
+
+
+def test_protected_paths_match_nested_dirs(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    for patterns in (("infra/**",), ("infra",)):  # bare dir name and glob both block
+        out = make_box(ws, protected_paths=patterns).dispatch(
+            "write_file", {"path": "infra/x/y.tf", "content": "x"})
+        assert out.startswith("DENIED: protected path"), patterns
+    assert not (ws / "infra").exists()
+
+
+def test_edit_file_blocked_by_protected_glob(tmp_path):
+    ws = tmp_path / "ws"
+    (ws / "infra").mkdir(parents=True)
+    (ws / "infra" / "main.tf").write_text("old\n")
+    box = make_box(ws, protected_paths=("infra/**",))
+    out = box.dispatch("edit_file", {"path": "infra/main.tf", "old": "old", "new": "new"})
+    assert out.startswith("DENIED: protected path")
+    assert (ws / "infra" / "main.tf").read_text() == "old\n"  # unchanged
+
+
+def test_apply_patch_refused_when_diff_touches_protected_file(tmp_path):
+    ws = tmp_path / "ws"
+    (ws / "infra").mkdir(parents=True)
+    (ws / "infra" / "main.tf").write_text("old\n")
+    patch = ("--- a/infra/main.tf\n"
+             "+++ b/infra/main.tf\n"
+             "@@ -1 +1 @@\n"
+             "-old\n"
+             "+new\n")
+    out = make_box(ws, protected_paths=("infra/**",)).dispatch("apply_patch", {"patch": patch})
+    assert out.startswith("DENIED: protected path")
+    assert (ws / "infra" / "main.tf").read_text() == "old\n"  # refused BEFORE applying
+
+
+def test_apply_patch_unprotected_paths_not_denied(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    patch = ("--- /dev/null\n"
+             "+++ b/new.txt\n"
+             "@@ -0,0 +1 @@\n"
+             "+hello\n")
+    out = make_box(ws, protected_paths=("infra/**",)).dispatch("apply_patch", {"patch": patch})
+    assert not out.startswith("DENIED")
+
+
+def test_unprotected_writes_unaffected_by_policy(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    box = make_box(ws, protected_paths=("infra/**", "*.lock"))
+    out = box.dispatch("write_file", {"path": "src/app.py", "content": "print(1)\n"})
+    assert not out.startswith("DENIED") and not out.startswith("ERROR")
+    assert (ws / "src" / "app.py").read_text() == "print(1)\n"
+
+
+def test_empty_protected_paths_is_a_noop(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    out = make_box(ws).dispatch("write_file", {"path": "infra/main.tf", "content": "x"})
+    assert not out.startswith("DENIED")
+    assert (ws / "infra" / "main.tf").read_text() == "x"
+
+
+def test_protected_path_denial_is_audited(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    audit = _AuditStub()
+    box = make_box(ws, protected_paths=("infra/**",), audit=audit)
+    box.dispatch("write_file", {"path": "infra/main.tf", "content": "x"})
+    assert any("DENIED: protected path" in line for line in audit.lines)
+
+
+def test_escape_and_secret_denials_use_denied_prefix(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / ".env").write_text("API_KEY=x")
+    box = make_box(ws)
+    assert box.dispatch("write_file", {"path": "../out.txt", "content": "x"}).startswith("DENIED: ")
+    assert box.dispatch("read_file", {"path": ".env"}).startswith("DENIED: ")
+    assert box.dispatch("edit_file", {"path": "../out.txt", "old": "a", "new": "b"}).startswith("DENIED: ")

@@ -60,6 +60,9 @@ class ToolContext:
     sandbox_cpu: int = 60
     sandbox_mem: int = 1024
     allow_web: bool = False              # gates web_fetch (env ADA_ALLOW_WEB=true is the fallback)
+    # Project-policy globs (workspace-relative, e.g. "infra/**", "*.lock") that the
+    # mutating file tools (write_file/edit_file/apply_patch) refuse to touch (F7).
+    protected_paths: tuple[str, ...] = ()
     # (agent_name, task) -> result. Wired by the engine with depth limiting; None disables delegate.
     spawn: Callable[[str, str], Awaitable[str]] | None = None
 
@@ -97,6 +100,41 @@ def _is_secret(rel: str) -> bool:
         return True
     name = Path(rel).name
     return any(fnmatch.fnmatch(name, g) for g in _SECRET_GLOBS)
+
+
+def _matches_protected(rel: str, patterns: tuple[str, ...]) -> str | None:
+    """The first protected-path pattern matching this workspace-relative path, or None.
+
+    Patterns are fnmatch globs against the POSIX-style relative path. Directory
+    prefixes match too, so both "infra" and "infra/**" block "infra/x/y.tf".
+    """
+    parts = [p for p in Path(rel).as_posix().split("/") if p not in ("", ".")]
+    posix = "/".join(parts)
+    prefixes = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+    for pat in patterns:
+        p = str(pat).strip().strip("/")
+        if not p:
+            continue
+        base = p[:-3] if p.endswith("/**") else p
+        if fnmatch.fnmatch(posix, p) or any(fnmatch.fnmatch(pre, base) for pre in prefixes):
+            return pat
+    return None
+
+
+def _patch_paths(patch: str) -> list[str]:
+    """Target paths named by a unified diff's `--- a/<path>` / `+++ b/<path>` lines."""
+    paths: list[str] = []
+    for line in patch.splitlines():
+        if not (line.startswith("--- ") or line.startswith("+++ ")):
+            continue
+        p = line[4:].split("\t", 1)[0].strip().strip('"')
+        if not p or p == "/dev/null":
+            continue
+        if p.startswith(("a/", "b/")):
+            p = p[2:]
+        if p not in paths:
+            paths.append(p)
+    return paths
 
 
 def _valid_requirement(spec: str) -> bool:
@@ -246,6 +284,16 @@ class ToolBox:
             return None
         return target
 
+    def _deny_protected(self, rel: str, action: str = "write") -> str | None:
+        """A DENIED refusal when the workspace-relative path hits a protected-path
+        policy glob, else None. The exact "DENIED: protected path" prefix is load-
+        bearing: the web Permissions panel greps audit lines for "DENIED:"."""
+        pat = _matches_protected(rel, self._ctx.protected_paths)
+        if pat is None:
+            return None
+        return (f"DENIED: protected path '{Path(rel).as_posix()}' matches project "
+                f"policy pattern '{pat}' — {action} refused.")
+
     @contextmanager
     def _deps_env(self):
         """Expose <workspace>/.ada_deps on PYTHONPATH while a child process runs, so
@@ -323,7 +371,7 @@ class ToolBox:
             return "ERROR: 'path' is required."
         target = self._resolve(rel)
         if target is None:
-            return "ERROR: path escapes the workspace or is a protected/secret file."
+            return "DENIED: path escapes the workspace or is a protected/secret file."
         if target.is_symlink():
             return "ERROR: refusing to read a symlink."
         if not target.is_file():
@@ -358,7 +406,10 @@ class ToolBox:
             return "ERROR: 'path' is required."
         target = self._resolve(rel)
         if target is None:
-            return "ERROR: path escapes the workspace or is a protected/secret file."
+            return "DENIED: path escapes the workspace or is a protected/secret file."
+        denied = self._deny_protected(str(target.relative_to(self._ctx.base_dir.resolve())))
+        if denied is not None:
+            return denied
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content if isinstance(content, str) else str(content))
         return f"Wrote {len(content)} chars to {rel}."
@@ -367,7 +418,13 @@ class ToolBox:
         rel = str(args.get("path", "")).strip()
         old, new = str(args.get("old", "")), str(args.get("new", ""))
         target = self._resolve(rel)
-        if target is None or not target.is_file():
+        if target is None:
+            return f"DENIED: cannot edit {rel} (protected, or escapes workspace)."
+        denied = self._deny_protected(str(target.relative_to(self._ctx.base_dir.resolve())),
+                                      action="edit")
+        if denied is not None:
+            return denied
+        if not target.is_file():
             return f"ERROR: cannot edit {rel} (missing, protected, or escapes workspace)."
         text = target.read_text(errors="replace")
         if not old:
@@ -389,6 +446,11 @@ class ToolBox:
             return "ERROR: 'patch' is required (unified diff)."
         if self._ctx.workspace is None:
             return "ERROR: no workspace configured."
+        # Refuse BEFORE applying anything if the diff touches any protected path.
+        for path in _patch_paths(patch):
+            denied = self._deny_protected(path, action="patch")
+            if denied is not None:
+                return denied
         from ..execution import run_command_sync
 
         pfile = self._ctx.workspace / ".ada_patch.diff"
@@ -584,7 +646,7 @@ class ToolBox:
             paths = [str(p) for p in paths] if isinstance(paths, list) else shlex.split(str(paths))
             for p in paths:
                 if self._resolve(p) is None:
-                    return f"ERROR: test path escapes the workspace: {p}"
+                    return f"DENIED: test path escapes the workspace: {p}"
         cmd = detect_test_command(self._ctx.workspace, paths)
         if cmd is None:
             return "No runnable tests detected in the workspace yet."
@@ -611,7 +673,7 @@ class ToolBox:
             return untrusted(self._symbols_index(), source="symbols:workspace")
         target = self._resolve(rel)
         if target is None:
-            return "ERROR: path escapes the workspace or is a protected/secret file."
+            return "DENIED: path escapes the workspace or is a protected/secret file."
         if target.is_symlink():
             return "ERROR: refusing to read a symlink."
         if not target.is_file():
