@@ -111,6 +111,32 @@ def check_builtin_tool_use(
     return True, ""
 
 
+def budget_gate(cost_usd: float, max_cost_usd: float | None) -> tuple[bool, str]:
+    """Decide whether the run may spend another tool call: (allowed, deny_reason).
+
+    Denies once the recorded spend reaches ``max_cost_usd`` (no cap: always allow).
+    The reason tells the model to wrap up, so the turn ends with a summary of the work
+    done instead of burning further tool turns.
+    """
+    if max_cost_usd is None or cost_usd < max_cost_usd:
+        return True, ""
+    return False, (
+        f"budget exhausted (${cost_usd:.4f} spent >= ${max_cost_usd:.4f} cap): "
+        "finish now with a summary of what you completed."
+    )
+
+
+def _deny(reason: str) -> dict[str, Any]:
+    """PreToolUse hook output that vetoes the pending tool call."""
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
 def _clip(s: Any, n: int = 240) -> str:
     s = str(s or "")
     return s if len(s) <= n else s[:n] + "…"
@@ -170,12 +196,17 @@ class ClaudeSdkProvider:
     def _effort_kw(self, effort: str | None) -> dict[str, Any]:
         return {"effort": effort} if effort in self._VALID_EFFORT else {}
 
-    def _confinement_hooks(self, workspace: str) -> dict[str, list[Any]]:
-        """PreToolUse hook that vetoes built-in file-tool calls escaping the workspace.
+    def _confinement_hooks(
+        self, workspace: str, max_cost_usd: float | None = None
+    ) -> dict[str, list[Any]]:
+        """PreToolUse hooks: workspace confinement plus (optionally) the budget gate.
 
         Per the SDK's semantics, a PreToolUse hook gates every matching tool call
         regardless of allowed_tools / permission_mode — unlike can_use_tool, which only
-        fires for calls that would prompt (and requires a streaming prompt).
+        fires for calls that would prompt (and requires a streaming prompt). The
+        confinement matcher targets the built-in file tools; the budget matcher uses
+        ``matcher=None``, which the hooks protocol treats as "match every tool", so it
+        also covers Bash/web and our MCP toolbox tools.
         """
         ws = Path(workspace)
 
@@ -183,18 +214,20 @@ class ClaudeSdkProvider:
             ok, reason = check_builtin_tool_use(
                 hook_input.get("tool_name", ""), hook_input.get("tool_input") or {}, ws
             )
-            if ok:
-                return {}
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": reason,
-                }
-            }
+            return {} if ok else _deny(reason)
 
-        matcher = self._sdk.HookMatcher(matcher="|".join(sorted(_TOOL_PATH_ARGS)), hooks=[_gate])
-        return {"PreToolUse": [matcher]}
+        matchers = [self._sdk.HookMatcher(matcher="|".join(sorted(_TOOL_PATH_ARGS)), hooks=[_gate])]
+        if max_cost_usd is not None:
+
+            async def _budget(hook_input: dict[str, Any], _tool_use_id: Any, _ctx: Any) -> dict[str, Any]:
+                ok, reason = budget_gate(self.usage.cost_usd, max_cost_usd)
+                if not ok:
+                    logger.warning("Budget gate denied %s: %s",
+                                   hook_input.get("tool_name", "?"), reason)
+                return {} if ok else _deny(reason)
+
+            matchers.append(self._sdk.HookMatcher(matcher=None, hooks=[_budget]))
+        return {"PreToolUse": matchers}
 
     async def _collect(
         self, *, prompt: str, options: Any, on_step=None, soft_cap: bool = False,
@@ -278,10 +311,14 @@ class ClaudeSdkProvider:
     ) -> str:
         """Run the SDK-driven agent loop.
 
-        Budget limitation: the loop runs inside the Claude Agent SDK, so per-turn cost
-        checks (R3) can't be enforced mid-flight — usage arrives only with the final
-        ResultMessage. The best we can do is refuse to *start* when the accumulated cost
-        already exceeds ``max_cost_usd``; a single SDK run can still overshoot the budget.
+        Budget enforcement (R3), even though the SDK owns the loop: (1) refuse to start
+        when the accumulated cost already meets ``max_cost_usd``; (2) mid-run, a
+        catch-all PreToolUse hook (see _confinement_hooks) consults the live usage
+        totals and denies every further tool call — built-ins and MCP toolbox alike —
+        once the recorded spend reaches the cap. The model can still generate text to
+        finish its current turn, so an over-budget run ends with a summary instead of
+        burning more tool turns. Spend is recorded as result messages arrive
+        (_record_usage), so the tail of one uncharged stretch can still overshoot.
         """
         if max_cost_usd is not None and self.usage.cost_usd >= max_cost_usd:
             logger.warning(
@@ -306,7 +343,7 @@ class ClaudeSdkProvider:
             allowed_tools=mcp_allowed + list(self._allowed_builtins),
             disallowed_tools=self._disallowed_builtins(),
             permission_mode=_PERMISSION,
-            hooks=self._confinement_hooks(cwd),
+            hooks=self._confinement_hooks(cwd, max_cost_usd=max_cost_usd),
             max_turns=max_iterations or self._max_turns,
             cwd=cwd,  # working directory only — confinement is enforced by the hook above
             **self._model_kw(model),
