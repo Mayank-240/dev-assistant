@@ -8,13 +8,19 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
+import ipaddress
 import json
+import os
+import secrets
 import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -32,6 +38,37 @@ from ..orchestration.run_store import RunStore, derive_title
 from ..orchestration.task import new_task_id
 
 _STATIC = Path(__file__).parent / "static"
+
+# Run statuses that mean "this run is over" (mirrors the run store's terminal set) and
+# the subset a user may retry/resume from (W5).
+_TERMINAL_STATUSES = {"completed", "partial", "failed", "cancelled", "over_budget", "interrupted"}
+_RESUMABLE_STATUSES = {"interrupted", "failed", "over_budget", "cancelled", "partial"}
+
+
+def _engine_supports_resume() -> bool:
+    """True once Engine.run has grown a ``resume`` kwarg (R1 lands separately).
+    Guarded with try/except TypeError so this module works against either signature."""
+    try:
+        inspect.signature(Engine.run).bind_partial(None, "prompt", resume=True)
+        return True
+    except TypeError:
+        return False
+
+
+def _is_loopback(host: str) -> bool:
+    if host in ("", "localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name) or default)
+    except ValueError:
+        return default
 
 
 class Broker:
@@ -79,7 +116,8 @@ _EFFORT: dict[str, dict[str, Any]] = {
 
 
 def _settings_for(base: Settings, effort: str | None, budget: float | None,
-                  project: str | None = None, memory_scope: str | None = None) -> Settings:
+                  project: str | None = None, memory_scope: str | None = None,
+                  repo: dict[str, Any] | None = None) -> Settings:
     overrides: dict[str, Any] = {}
     cfg = _EFFORT.get(effort or "")
     if cfg:
@@ -96,6 +134,12 @@ def _settings_for(base: Settings, effort: str | None, budget: float | None,
         overrides["project"] = projects.resolve(base, project)
     if memory_scope in ("project", "global"):
         overrides["memory_scope"] = memory_scope
+    # W2: per-run repo binding — request fields beat the server's env defaults.
+    for key in ("repo_path", "repo_url", "repo_ref"):
+        if repo and repo.get(key):
+            overrides[key] = str(repo[key])
+    if repo and repo.get("git_finalize") is not None:
+        overrides["git_finalize"] = bool(repo["git_finalize"])
     return dataclasses.replace(base, **overrides) if overrides else base
 
 
@@ -128,6 +172,11 @@ class RunRequest(BaseModel):
     project: str | None = None
     memory_scope: str | None = None  # "project" | "global"
     continue_from: str | None = None  # re-engage: continue this completed task's workspace + context
+    # W2: per-run repo binding (optional; overrides the server's env defaults for this run)
+    repo_path: str | None = None    # local repo to copy into the workspace
+    repo_url: str | None = None     # git URL to clone into the workspace
+    repo_ref: str | None = None     # branch/tag/sha to check out
+    git_finalize: bool | None = None  # commit the workspace to a new branch at the end
 
 
 class ProjectRequest(BaseModel):
@@ -152,11 +201,48 @@ class FeedbackRequest(BaseModel):
     comment: str | None = None
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, host: str | None = None,
+               api_token: str | None = None) -> FastAPI:
     settings = settings or Settings.load()
     app = FastAPI(title="AI Dev Assistant")
     app.state.settings = settings
     app.state.brokers = {}
+
+    # ---- S8: bearer-token auth. Token from ADA_API_TOKEN; when binding a non-loopback
+    # host with no token configured, auto-generate one so a 0.0.0.0 bind (e.g. Docker)
+    # is never open by default. Loopback with no token keeps auth off, as before.
+    bind_host = (host or os.getenv("ADA_BIND_HOST") or "127.0.0.1").strip()
+    token = api_token if api_token is not None else os.getenv("ADA_API_TOKEN", "").strip()
+    if not token and not _is_loopback(bind_host):
+        token = secrets.token_urlsafe(32)
+        print(f"[ai-dev-assistant] Binding {bind_host} with no ADA_API_TOKEN set — "
+              "auto-generated an API token (send it as 'Authorization: Bearer <token>', "
+              "or '?token=<token>' on WebSockets/downloads):", flush=True)
+        print(f"[ai-dev-assistant] API token: {token}", flush=True)
+    app.state.api_token = token
+    broker_grace = _env_float("ADA_BROKER_GRACE_SECONDS", 60.0)
+
+    def _authorized(request) -> bool:
+        if not app.state.api_token:
+            return True
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:].strip(), app.state.api_token):
+            return True
+        supplied = request.query_params.get("token", "")
+        return bool(supplied) and secrets.compare_digest(supplied, app.state.api_token)
+
+    @app.middleware("http")
+    async def require_token(request, call_next):
+        # /healthz, /readyz, / and /static stay open; every /api/* route needs the token.
+        if request.url.path.startswith("/api/") and not _authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return await call_next(request)
+
+    # Explicit CORS policy: same-origin by default (no cross-origin allowed);
+    # widen with a comma-separated ADA_CORS_ORIGINS.
+    cors_origins = [o.strip() for o in os.getenv("ADA_CORS_ORIGINS", "").split(",") if o.strip()]
+    app.add_middleware(CORSMiddleware, allow_origins=cors_origins,
+                       allow_methods=["*"], allow_headers=["*"])
     app.state.tasks = {}  # task_id -> asyncio.Task (for cancellation)
     app.state.runs = RunStore(settings.data_dir / "runs.db")
     app.state.runs.interrupt_orphans()  # clean up runs orphaned by a restart
@@ -188,7 +274,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.tasks[task_id] = asyncio.create_task(_run_task(
             task_id, payload.get("prompt", ""), payload.get("plan"),
             payload.get("effort"), payload.get("budget"), payload.get("title"),
-            payload.get("project"), payload.get("memory_scope"), payload.get("continue_from")))
+            payload.get("project"), payload.get("memory_scope"), payload.get("continue_from"),
+            payload.get("repo"), bool(payload.get("resume"))))
+
+    def _evict_broker_later(task_id: str, broker: Broker) -> None:
+        """W4: drop a finished task's broker after a grace period so RAM doesn't hold
+        every event forever — late joiners then replay history from events.jsonl."""
+        def _evict() -> None:
+            if app.state.brokers.get(task_id) is broker:
+                app.state.brokers.pop(task_id, None)
+        try:
+            asyncio.get_running_loop().call_later(broker_grace, _evict)
+        except RuntimeError:  # no running loop (shouldn't happen in-server)
+            pass
 
     def _pump() -> None:
         """Start queued tasks while slots are free (auto-run); respects Pause."""
@@ -196,26 +294,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             entry = app.state.runs.queue_next()
             if entry is None:
                 break
+            if entry["task_id"] in app.state.running:
+                # R5: over-subscription guard — never start a second copy of a running task
+                # (e.g. a stale queue entry surviving a restart while the run is live again).
+                print(f"[ai-dev-assistant] queue: skipping {entry['task_id']} — already running",
+                      flush=True)
+                continue
             _start(entry["task_id"], entry["payload"])
         _publish_queue_positions()
+
+    def _sanitize_queue() -> None:
+        """R5 startup sanity: a restart rebuilds state from disk — drop queue entries whose
+        run row already reached a terminal status, so finished work is never re-run."""
+        for p in app.state.runs.queue_pending():
+            status = (app.state.runs.get(p["task_id"]) or {}).get("status")
+            if status in _TERMINAL_STATUSES:
+                print(f"[ai-dev-assistant] queue: dropping {p['task_id']} — "
+                      f"run already {status}", flush=True)
+                app.state.runs.queue_remove(p["task_id"])
 
     async def _run_task(task_id: str, prompt: str, plan_dict: dict[str, Any] | None,
                         effort: str | None, budget: float | None, title: str | None = None,
                         project: str | None = None, memory_scope: str | None = None,
-                        continue_from: str | None = None) -> None:
+                        continue_from: str | None = None,
+                        repo: dict[str, Any] | None = None, resume: bool = False) -> None:
         broker: Broker = app.state.brokers[task_id]
         # record up front so cancels-during-planning persist (title auto-derived if blank)
         app.state.runs.start(task_id, prompt, title=(title or None))
         if continue_from:
             app.state.runs.set_parent(task_id, continue_from)
-        engine = Engine(_settings_for(settings, effort, budget, project, memory_scope))
+        engine = Engine(_settings_for(settings, effort, budget, project, memory_scope, repo))
         control = RunControl()
         engine.control = control  # enables pause/resume/steer endpoints to reach this run
         app.state.controls[task_id] = control
+        # W5/R1: resume rides through **kwargs so this compiles against Engine.run whether
+        # or not the checkpoint-resume kwarg has landed; the TypeError guard below fails soft.
+        extra: dict[str, Any] = {"resume": True} if resume else {}
         try:
             plan = Plan.model_validate(plan_dict) if plan_dict else None
             await engine.run(prompt, plan=plan, task_id=task_id, title=(title or None),
-                             continue_from=continue_from, on_event=broker.publish)
+                             continue_from=continue_from, on_event=broker.publish, **extra)
+        except TypeError as exc:
+            msg = "resume not available yet" if resume else str(exc)
+            broker.publish(Event("error", f"Run failed: {msg}", {"message": msg}))
+            app.state.runs.set_status(task_id, "failed")
         except asyncio.CancelledError:
             broker.publish(Event("error", "Run cancelled by user.", {"message": "cancelled"}))
             app.state.runs.set_status(task_id, "cancelled")
@@ -232,6 +354,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.controls.pop(task_id, None)
             if not broker.done:
                 broker.publish(Event("done", "Run ended.", {}))
+            _evict_broker_later(task_id, broker)
             _pump()  # a slot just freed — start the next queued task
 
     @app.post("/api/plan")
@@ -274,8 +397,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "warning": warning,
         })
 
+    def _validate_repo_path(raw: str) -> tuple[Path | None, str]:
+        """W2: a per-run repo_path must be a real directory outside the server's own data."""
+        try:
+            p = Path(raw).expanduser().resolve()
+        except OSError as exc:
+            return None, f"repo_path could not be resolved: {exc}"
+        if not p.is_dir():
+            return None, f"repo_path does not exist or is not a directory: {raw}"
+        for guarded in (settings.data_dir, settings.workspace_dir, settings.docs_dir):
+            g = guarded.resolve()
+            if p == g or p.is_relative_to(g):
+                return None, "repo_path may not point inside the server's data directories"
+        return p, ""
+
     @app.post("/api/run")
-    async def start_run(req: RunRequest) -> dict[str, Any]:
+    async def start_run(req: RunRequest):
+        repo: dict[str, Any] = {"repo_url": req.repo_url, "repo_ref": req.repo_ref,
+                                "git_finalize": req.git_finalize}
+        if req.repo_path and req.repo_path.strip():
+            p, err = _validate_repo_path(req.repo_path.strip())
+            if p is None:
+                return JSONResponse({"error": err}, status_code=400)
+            repo["repo_path"] = str(p)
         task_id = req.task_id or new_task_id()
         app.state.brokers[task_id] = Broker()
         app.state.brokers[task_id].publish(Event("status", "Backend: " + settings.llm_backend,
@@ -283,7 +427,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload = {
             "prompt": req.prompt, "plan": req.plan, "effort": req.effort, "budget": req.budget,
             "title": req.title, "project": req.project, "memory_scope": req.memory_scope,
-            "continue_from": req.continue_from,
+            "continue_from": req.continue_from, "repo": repo,
         }
         plan_title = (req.plan or {}).get("title") if req.plan else None
         app.state.runs.enqueue(task_id, req.prompt, req.title or plan_title, payload)
@@ -299,6 +443,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return JSONResponse({"ok": False, "error": "no running task"}, status_code=404)
         t.cancel()
         return JSONResponse({"ok": True})
+
+    # ---- W5: retry/resume a stopped run ----
+    @app.post("/api/tasks/{task_id}/resume")
+    async def resume_task(task_id: str) -> JSONResponse:
+        row = app.state.runs.get(task_id)
+        if row is None:
+            return JSONResponse({"error": "unknown task"}, status_code=404)
+        status = row.get("status") or ""
+        if task_id in app.state.running or status in ("running", "queued"):
+            return JSONResponse({"error": f"task is already {status or 'active'}"},
+                                status_code=409)
+        if status not in _RESUMABLE_STATUSES:
+            return JSONResponse(
+                {"error": f"cannot resume a run with status '{status}'"}, status_code=409)
+        if not _engine_supports_resume():
+            return JSONResponse({"error": "resume not available yet"}, status_code=501)
+        if task_id not in app.state.brokers:
+            app.state.brokers[task_id] = Broker()
+        app.state.brokers[task_id].publish(Event("status", "Backend: " + settings.llm_backend,
+                                                 {"backend": settings.llm_backend}))
+        payload = {
+            "prompt": row.get("prompt") or "", "plan": None, "effort": None, "budget": None,
+            "title": row.get("title"), "project": None, "memory_scope": None,
+            "continue_from": None, "repo": None, "resume": True,
+        }
+        app.state.runs.enqueue(task_id, payload["prompt"], row.get("title"), payload)
+        _pump()
+        now = "running" if task_id in app.state.running else "queued"
+        return JSONResponse({"task_id": task_id, "status": now,
+                             "position": app.state.runs.queue_positions().get(task_id)})
 
     # ---- in-run control (Tier 5): pause / resume / steer ----
     @app.post("/api/run/{task_id}/pause")
@@ -353,6 +527,69 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/tasks/{task_id}/trace")
     async def get_trace(task_id: str) -> JSONResponse:
         return JSONResponse(_read_jsonl(settings.docs_dir / task_id / "trace.jsonl"))
+
+    # ---- W5: diff viewer — what the run actually changed in its workspace ----
+    @app.get("/api/tasks/{task_id}/diff")
+    async def get_diff(task_id: str) -> JSONResponse:
+        empty = {"is_git": False, "status": "", "diff": "", "truncated": False}
+        ws_root = settings.workspace_dir.resolve()
+        ws = (ws_root / task_id).resolve()
+        if not ws.is_relative_to(ws_root) or not (ws / ".git").exists():
+            return JSONResponse(empty)
+
+        def _git(*args: str) -> tuple[int, str]:
+            try:
+                r = subprocess.run(["git", "-C", str(ws), *args],
+                                   capture_output=True, text=True, timeout=30)
+                return r.returncode, (r.stdout if r.returncode == 0 else (r.stdout or r.stderr))
+            except (OSError, subprocess.SubprocessError) as exc:
+                return 1, f"(git failed: {exc})"
+
+        _, status_out = await asyncio.to_thread(_git, "status", "--porcelain")
+        head_rc, _out = await asyncio.to_thread(_git, "rev-parse", "--verify", "HEAD")
+        if head_rc == 0:
+            _, diff_out = await asyncio.to_thread(_git, "diff", "HEAD")
+        else:
+            diff_out = ""  # no commits yet — status still shows what exists
+        truncated = len(diff_out) > 200_000
+        return JSONResponse({"is_git": True, "status": status_out[:20_000],
+                             "diff": diff_out[:200_000], "truncated": truncated})
+
+    # ---- W5: run comparison — two runs' stored metrics, side by side ----
+    def _compare_fields(r: dict[str, Any]) -> dict[str, Any]:
+        duration = None
+        if r.get("created_at") and r.get("ended_at"):
+            duration = round(float(r["ended_at"]) - float(r["created_at"]), 1)
+        return {
+            "id": r.get("id"), "title": r.get("title"), "status": r.get("status"),
+            "run_status": r.get("run_status"), "quality_score": r.get("quality_score"),
+            "subtasks_passed": r.get("subtasks_passed"), "subtasks_total": r.get("subtasks_total"),
+            "tests": r.get("tests"), "cost_usd": r.get("cost_usd"),
+            "input_tokens": r.get("input_tokens"), "output_tokens": r.get("output_tokens"),
+            "duration_s": duration,
+            "sessions_spawned": r.get("sessions_spawned"),
+            "sessions_reaped": r.get("sessions_reaped"),
+        }
+
+    @app.get("/api/runs/compare")
+    async def compare_runs(a: str, b: str) -> JSONResponse:
+        ra, rb = app.state.runs.get(a), app.state.runs.get(b)
+        missing = [rid for rid, row in ((a, ra), (b, rb)) if row is None]
+        if missing:
+            return JSONResponse({"error": "unknown run(s): " + ", ".join(missing)},
+                                status_code=404)
+        return JSONResponse({"a": _compare_fields(ra), "b": _compare_fields(rb)})
+
+    # ---- W5: safe, non-secret config for the UI (feeds the cost-vs-budget meter) ----
+    @app.get("/api/config")
+    async def get_config() -> JSONResponse:
+        # Whitelisted fields only — never API keys, tokens, or paths.
+        return JSONResponse({
+            "budget_usd": settings.budget_usd,
+            "llm_backend": settings.llm_backend,
+            "max_concurrent_runs": settings.max_concurrent_runs,
+            "sdk_model": settings.sdk_model,
+        })
 
     @app.get("/api/quality")
     async def get_quality() -> JSONResponse:
@@ -460,14 +697,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.on_event("startup")
     async def _resume_queue() -> None:
-        # persisted queue survives restarts — start pumping once the loop is up
+        # persisted queue survives restarts — sanity-check it, then start pumping
+        _sanitize_queue()
         _pump()
 
     @app.websocket("/ws/{task_id}")
     async def ws(websocket: WebSocket, task_id: str) -> None:
+        # S8: WebSockets can't send an Authorization header from the browser — accept
+        # the token as a query param instead. Reject before the handshake completes.
+        if app.state.api_token:
+            supplied = websocket.query_params.get("token", "")
+            if not (supplied and secrets.compare_digest(supplied, app.state.api_token)):
+                await websocket.close(code=4401)
+                return
         await websocket.accept()
         broker: Broker | None = app.state.brokers.get(task_id)
         if broker is None:
+            # W4: the broker may have been evicted after the run finished — replay the
+            # durable event log instead of holding history in RAM forever.
+            backlog = _read_jsonl(settings.docs_dir / task_id / "events.jsonl")
+            if backlog:
+                try:
+                    for past in backlog:
+                        await websocket.send_json(past)
+                except WebSocketDisconnect:
+                    pass
+                await websocket.close()
+                return
             await websocket.send_json({"type": "error", "message": "unknown task", "data": {}})
             await websocket.close()
             return
@@ -673,4 +929,6 @@ def _first_tldr(brief: Path) -> str:
     return ""
 
 
-app = create_app()
+# W6: no module-level `app = create_app()` — importing this module must not run
+# Settings.load() or open SQLite. Serve via the factory instead, e.g.:
+#   uvicorn ai_dev_assistant.web.server:create_app --factory

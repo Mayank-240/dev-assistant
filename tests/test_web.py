@@ -16,7 +16,9 @@ def _client(tmp_path):
         llm_backend="anthropic", anthropic_api_key="", embeddings_backend="hash",
         data_dir=tmp_path / "data", docs_dir=tmp_path / "docs", workspace_dir=tmp_path / "ws",
     )
-    return TestClient(create_app(settings))
+    # api_token="" forces auth off regardless of a developer's ADA_API_TOKEN env
+    # (auth behavior itself is covered in test_web_auth.py)
+    return TestClient(create_app(settings, api_token=""))
 
 
 def test_health_and_ready(tmp_path):

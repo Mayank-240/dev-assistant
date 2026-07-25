@@ -87,6 +87,16 @@
                 <input id="budget" class="num" type="number" min="0" step="0.5" placeholder="none" />
               </label>
             </div>
+            <details class="repo-opts" title="Bind this run to a real repository (optional)">
+              <summary>Repository (optional)</summary>
+              <input id="repo-path" class="title-input" type="text"
+                     placeholder="Local repo path — e.g. ~/projects/myrepo" />
+              <input id="repo-url" class="title-input" type="text"
+                     placeholder="Git URL to clone — e.g. https://github.com/me/repo.git" />
+              <input id="repo-ref" class="title-input" type="text"
+                     placeholder="Branch / tag / SHA (optional)" />
+              <label class="check"><input type="checkbox" id="git-finalize" /> Commit results to a new branch</label>
+            </details>
             <button id="run-btn">Run task →</button>
             <label class="check"><input type="checkbox" id="review-plan" /> Review plan before running</label>
             <p class="hint">Runs via your Claude Code login — no API key needed.</p>
@@ -214,6 +224,11 @@
                   <div class="metric" title="Did the generated tests pass when actually run?"><span class="m-val" id="m-tests">—</span><span class="m-label">tests</span></div>
                   <div class="metric" title="Total LLM cost for this run (USD)"><span class="m-val" id="m-cost">—</span><span class="m-label">cost</span></div>
                 </div>
+                <div id="budget-meter" class="budget-meter hidden" title="Live LLM cost vs. this run's budget cap">
+                  <span class="bm-label">budget</span>
+                  <div class="bm-track"><div id="bm-fill" class="bm-fill"></div></div>
+                  <span id="bm-text" class="bm-text"></span>
+                </div>
                 <div id="usage-line" class="usage-line"></div>
               </div>
 
@@ -289,6 +304,16 @@
               <span class="kicker">Agent track record — learned from review outcomes</span>
               <div id="ds-agents" class="ds-agents"><p class="muted">No data yet — run a few tasks.</p></div>
             </div>
+            <div class="card">
+              <span class="kicker">Compare two runs — status, quality, tests, cost &amp; time, side by side</span>
+              <div class="cmp-controls">
+                <select id="cmp-a" class="select" title="First run"></select>
+                <span class="cmp-vs">vs</span>
+                <select id="cmp-b" class="select" title="Second run"></select>
+                <button id="cmp-btn" class="ghost-btn">Compare</button>
+              </div>
+              <div id="cmp-result" class="cmp-result muted">Pick two runs from history and press Compare.</div>
+            </div>
           </div>
 
           <!-- ============ AGENTS ============ -->
@@ -362,6 +387,7 @@
           <button class="tab active" data-doc="brief">Brief</button>
           <button class="tab" data-doc="plan">Plan</button>
           <button class="tab" data-doc="report">Report</button>
+          <button class="tab" data-doc="diff">Diff</button>
         </div>
         <div class="modal-head-actions">
           <button id="modal-reengage" class="ghost-btn" title="Continue this task with a follow-up instruction">↻ Re-engage</button>
@@ -422,9 +448,17 @@
     </div>
   </div>
 
+  <!-- Bearer-token prompt (shown when the server requires auth and a call 401s) -->
+  <div id="token-bar" class="token-bar hidden">
+    <span>This server requires an API token — it was printed at server startup.</span>
+    <input id="token-input" type="password" placeholder="Paste API token" autocomplete="off" />
+    <button id="token-save">Save</button>
+  </div>
+
   <div id="toasts" class="toasts"></div>
 
   <script src="/static/ui.js"></script>
+  <script src="/static/util.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

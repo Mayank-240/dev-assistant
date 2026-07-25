@@ -535,3 +535,54 @@ body.resizing .sidebar { transition:none; }
 .continue-banner button:hover { opacity:1; }
 .brief-actions { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:4px; }
 .modal-head-actions { display:flex; align-items:center; gap:8px; }
+
+/* ===== W2: per-run repository binding (composer) ===== */
+.repo-opts { margin-top:10px; }
+.repo-opts summary { cursor:pointer; font-size:10.5px; font-family:var(--mono); letter-spacing:.08em;
+  text-transform:uppercase; color:var(--muted); user-select:none; }
+.repo-opts[open] summary { margin-bottom:6px; }
+.repo-opts .title-input { margin-top:6px; }
+.repo-opts .check { margin-top:8px; }
+
+/* ===== W5: diff viewer (doc modal) ===== */
+.d-add { color:var(--green); }
+.d-del { color:var(--red); }
+.d-hunk { color:var(--accent-text); font-weight:600; }
+.d-file { color:var(--text-2); font-weight:600; }
+
+/* ===== S8: bearer-token prompt ===== */
+.token-bar { position:fixed; left:50%; bottom:18px; transform:translateX(-50%); z-index:60;
+  display:flex; align-items:center; gap:10px; max-width:min(640px, calc(100vw - 32px));
+  padding:10px 14px; border-radius:10px; background:var(--elev); border:1px solid var(--border-2);
+  box-shadow:var(--shadow); font-size:12.5px; color:var(--text-2); }
+.token-bar input { flex:1; min-width:180px; padding:6px 8px; border-radius:7px;
+  border:1px solid var(--border-2); background:var(--surface); color:var(--text);
+  font-family:var(--mono); font-size:12px; }
+.token-bar button { padding:6px 12px; border-radius:7px; border:1px solid var(--border-2);
+  background:var(--accent); color:#fff; cursor:pointer; font-size:12.5px; }
+
+/* ===== W5: live cost-vs-budget meter ===== */
+.budget-meter { display:flex; align-items:center; gap:10px; margin-top:8px; }
+.bm-label { font-size:10.5px; font-family:var(--mono); letter-spacing:.08em;
+  text-transform:uppercase; color:var(--muted); }
+.bm-track { flex:1; height:8px; background:var(--accent-soft); border-radius:5px; overflow:hidden; }
+.bm-fill { display:block; height:100%; width:0; background:var(--accent);
+  border-radius:5px; transition:width .3s ease; }
+.bm-fill.warn { background:var(--warn); }
+.bm-fill.over { background:var(--danger); }
+.bm-text { font-size:12px; font-family:var(--mono); color:var(--text-2); white-space:nowrap; }
+
+/* ===== W5: run comparison (Dashboard) ===== */
+.cmp-controls { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:8px 0 10px; }
+.cmp-controls .select { max-width:260px; }
+.cmp-vs { font-size:11px; font-family:var(--mono); color:var(--muted); text-transform:uppercase; }
+.cmp-result { overflow-x:auto; }
+.cmp-table { width:100%; border-collapse:collapse; font-size:13px; }
+.cmp-table th, .cmp-table td { text-align:left; padding:6px 10px;
+  border-bottom:1px solid var(--border); }
+.cmp-table th { font-size:11px; font-family:var(--mono); letter-spacing:.05em;
+  text-transform:uppercase; color:var(--muted); }
+.cmp-table td:first-child { color:var(--text-2); white-space:nowrap; }
+
+/* ===== W5: retry/resume affordance (recent list) ===== */
+.r-resume:hover { color:var(--accent-text); text-decoration:underline; }

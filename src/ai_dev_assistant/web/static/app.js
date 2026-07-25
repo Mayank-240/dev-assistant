@@ -1,5 +1,40 @@
 const $ = (id) => document.getElementById(id);
 
+// Pure helpers live in util.js (loaded first; also unit-tested under Node).
+const { escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine } = window.AdaUtil;
+
+// ---- bearer-token auth (S8) ----
+// When the server has a token configured, attach it to every API call and to the
+// WebSocket as a query param. A 401 pops a small prompt; the token persists in
+// localStorage. With no token configured (the localhost default) this is inert.
+function apiToken() { return localStorage.getItem("ada-token") || ""; }
+function tokenQuery(prefix) { const t = apiToken(); return t ? prefix + "token=" + encodeURIComponent(t) : ""; }
+let _tokenPromptShown = false;
+function showTokenBar() {
+  if (_tokenPromptShown) return;
+  _tokenPromptShown = true;
+  const bar = $("token-bar");
+  if (!bar) return;
+  bar.classList.remove("hidden");
+  $("token-input").focus();
+}
+function saveToken() {
+  const v = $("token-input").value.trim();
+  if (!v) return;
+  localStorage.setItem("ada-token", v);
+  location.reload();
+}
+const _fetch = window.fetch.bind(window);
+window.fetch = async (url, opts = {}) => {
+  const t = apiToken();
+  if (t && typeof url === "string" && url.startsWith("/api/")) {
+    opts = { ...opts, headers: { ...(opts.headers || {}), Authorization: "Bearer " + t } };
+  }
+  const res = await _fetch(url, opts);
+  if (res.status === 401 && typeof url === "string" && url.startsWith("/api/")) showTokenBar();
+  return res;
+};
+
 // Editorial colored-dot palette (no emoji) — one stable hue per specialist.
 const AGENT_STYLE = {
   architect:        { color: "#7b86c9" },
@@ -27,7 +62,30 @@ const state = {
   startedAt: 0,
   docsId: null,      // run.id used for the docs folder
   continueFrom: null, // task id being re-engaged (continuation), or null for a fresh task
+  budgetUsd: 0,      // budget cap for the run on screen (0 = none -> meter hidden)
+  wasQueued: false,  // this task was seen queued -> toast when it actually starts
 };
+
+// ---- W5: safe server config (feeds the cost-vs-budget meter's default cap) ----
+let serverConfig = { budget_usd: 0 };
+async function loadConfig() {
+  try { serverConfig = await (await fetch("/api/config")).json(); } catch (e) { /* keep defaults */ }
+}
+
+// ---- W5: live cost-vs-budget meter (hidden when no budget is set) ----
+function updateBudgetMeter(cost) {
+  const el = $("budget-meter");
+  if (!el) return;
+  const budget = Number(state.budgetUsd || 0);
+  if (!budget || budget <= 0) { el.classList.add("hidden"); return; }
+  el.classList.remove("hidden");
+  const c = Number(cost || 0);
+  const pct = Math.min(100, Math.round((c / budget) * 100));
+  const fill = $("bm-fill");
+  fill.style.width = pct + "%";
+  fill.className = "bm-fill" + (pct >= 100 ? " over" : pct >= 80 ? " warn" : "");
+  $("bm-text").textContent = fmtCost(c) + " / $" + budget.toFixed(2);
+}
 
 function setConn(text, cls) {
   const el = $("conn");
@@ -41,8 +99,6 @@ function feed(text, cls = "") {
   li.textContent = text;
   $("feed").prepend(li);
 }
-
-function fmtTok(n) { n = n || 0; return n < 1000 ? String(n) : (n / 1000).toFixed(1) + "k"; }
 
 function setMetricsFrom(data) {
   if ("kg_nodes" in data) $("m-kg").textContent = data.kg_nodes;
@@ -92,6 +148,8 @@ function resetRunView(prompt) {
   $("progress-bar").style.width = "0%"; $("progress-label").textContent = "";
   state.agents = {};
   state.docsId = null;
+  state.wasQueued = false;
+  updateBudgetMeter(0);
   startTimer();
 }
 
@@ -110,9 +168,9 @@ function makeAgentCard(st) {
   card.id = "agent-" + st.id;
   const deps = (st.depends_on && st.depends_on.length) ? ("depends on " + st.depends_on.join(", ")) : "no dependencies";
   card.innerHTML = `
-    <div class="ac-top"><span class="chip">${st.id}</span><span class="ac-agent"><span class="ac-dot" style="background:${agentStyle(st.agent).color}"></span>${st.agent}</span></div>
+    <div class="ac-top"><span class="chip">${escapeHtml(st.id)}</span><span class="ac-agent"><span class="ac-dot" style="background:${agentStyle(st.agent).color}"></span>${escapeHtml(st.agent)}</span></div>
     <div class="ac-title">${escapeHtml(st.title)}</div>
-    <div class="ac-deps">${deps}</div>
+    <div class="ac-deps">${escapeHtml(deps)}</div>
     <div class="ac-state"><span class="dot"></span><span class="ac-statetext">queued</span><span class="ac-score"></span></div>
     <div class="ac-stream"></div>
   `;
@@ -261,7 +319,7 @@ function renderAgentModal(a) {
   pill.className = "pill " + (status === "passed" ? "pill-done" : status === "failed" ? "pill-err" : status === "running" ? "pill-running" : "");
   pill.textContent = status;
 
-  const dur = (a.start != null && a.end != null) ? (a.end - a.start).toFixed(1) + "s"
+  const dur = (a.start != null && a.end != null) ? fmtDuration(a.end - a.start)
             : (status === "running" ? "running…" : "—");
   const deps = (a.depends_on && a.depends_on.length) ? a.depends_on.join(", ") : "none";
   $("am-meta").innerHTML =
@@ -309,10 +367,15 @@ function renderAgentModal(a) {
 function getControls() {
   const b = parseFloat($("budget").value);
   const t = $("task-title").value.trim();
+  // W2: optional per-run repo binding (blank fields fall back to the server's env defaults)
+  const repoPath = $("repo-path").value.trim(), repoUrl = $("repo-url").value.trim(),
+        repoRef = $("repo-ref").value.trim();
   return {
     effort: $("effort").value, budget: (b && b > 0) ? b : null, title: t || null,
     project: selectedProject(), memory_scope: $("mem-scope").value,
     continue_from: state.continueFrom || null,
+    repo_path: repoPath || null, repo_url: repoUrl || null, repo_ref: repoRef || null,
+    git_finalize: $("git-finalize").checked ? true : null,
   };
 }
 
@@ -344,7 +407,7 @@ async function loadProjects() {
   if (!list.length) list = [{ slug: "default", name: "Default" }];
   const sel = $("project");
   const saved = localStorage.getItem("ada-project") || sel.value || "default";
-  sel.innerHTML = list.map(p => `<option value="${p.slug}">${escapeHtml(p.name)}</option>`).join("");
+  sel.innerHTML = list.map(p => `<option value="${escapeAttr(p.slug)}">${escapeHtml(p.name)}</option>`).join("");
   sel.value = list.some(p => p.slug === saved) ? saved : list[0].slug;
 }
 
@@ -488,23 +551,32 @@ function renderTimeline() {
     const width = (((v.end || v.start) - v.start) / span) * 100;
     const dur = (v.end || v.start) - v.start;
     const row = document.createElement("div"); row.className = "tl-row";
-    row.innerHTML = `<span class="tl-label"><span class="tl-dot" style="background:${st.color}"></span>${id} · ${v.agent}</span>` +
+    row.innerHTML = `<span class="tl-label"><span class="tl-dot" style="background:${st.color}"></span>${escapeHtml(id)} · ${escapeHtml(v.agent)}</span>` +
       `<div class="tl-track"><div class="tl-bar" style="left:${left}%;width:${Math.max(width, 1)}%;background:${st.color}"></div></div>` +
       `<span class="tl-dur">${dur.toFixed(1)}s</span>`;
     el.appendChild(row);
   });
 }
 
+// Toast once when a task we saw queued emits its first live event (it left the queue).
+function noteQueuedStart() {
+  if (!state.wasQueued) return;
+  state.wasQueued = false;
+  showToast("Queued task started", "success");
+}
+
 function handleEvent(ev) {
   const d = ev.data || {};
   switch (ev.type) {
     case "status":
+      noteQueuedStart();
       if (d.backend) $("backend-badge").textContent = "backend: " + d.backend;
       if (ev.message && /Documenting/i.test(ev.message)) setPhase("document");
       feed(ev.message);
       break;
     case "queued":
       // task is waiting its turn in the queue
+      state.wasQueued = true;
       $("status-pill").className = "pill";
       $("status-pill").textContent = d.position ? `queued · #${d.position}` : "queued";
       setConn("queued", "badge-idle");
@@ -513,6 +585,7 @@ function handleEvent(ev) {
       loadQueue();
       break;
     case "plan":
+      noteQueuedStart();
       // task left the queue and is now running — restore the live UI
       if ($("status-pill").textContent.startsWith("queued")) {
         $("status-pill").className = "pill pill-running";
@@ -590,6 +663,7 @@ function handleEvent(ev) {
       if (state.openAgentId === d.id) renderAgentModal(state.agentData[d.id]);
       updateProgress();
       setMetricsFrom(d);
+      if ("cost_usd" in d) updateBudgetMeter(d.cost_usd);
       feed((d.passed ? "✓ " : "✗ ") + ev.message + (d.objective_note ? "  ·  " + d.objective_note : ""));
       break;
     }
@@ -603,6 +677,7 @@ function handleEvent(ev) {
       feed(ev.message);
       break;
     case "budget":
+      if (d.budget) { state.budgetUsd = d.budget; updateBudgetMeter(d.cost); }
       showToast("⚠ " + (ev.message || "Budget exceeded"), "warn", 7000);
       feed("⚠ " + ev.message);
       break;
@@ -648,7 +723,10 @@ function handleEvent(ev) {
       $("progress-bar").style.width = "100%";
       if ("passed" in d) $("progress-label").textContent = `${d.passed}/${d.total} subtasks`;
       setMetricsFrom(d);
-      if (d.cost_usd !== undefined) $("m-cost").textContent = "$" + Number(d.cost_usd).toFixed(4);
+      if (d.cost_usd !== undefined) {
+        $("m-cost").textContent = fmtCost(d.cost_usd);
+        updateBudgetMeter(d.cost_usd);
+      }
       $("cancel-btn").classList.add("hidden");
       $("pause-btn").classList.add("hidden"); $("steer-btn").classList.add("hidden");
       if (d.tests && d.tests !== "n/a") {
@@ -750,8 +828,8 @@ async function renderPlanEditor(plan) {
   (plan.subtasks || []).forEach(st => {
     const row = document.createElement("div");
     row.className = "pe-row";
-    const opts = names.map(n => `<option value="${n}"${n === st.agent ? " selected" : ""}>${n}</option>`).join("");
-    row.innerHTML = `<span class="chip">${st.id}</span>` +
+    const opts = names.map(n => `<option value="${escapeAttr(n)}"${n === st.agent ? " selected" : ""}>${escapeHtml(n)}</option>`).join("");
+    row.innerHTML = `<span class="chip">${escapeHtml(st.id)}</span>` +
       `<input class="pe-title" value="${escapeAttr(st.title)}" />` +
       `<span class="pe-agent-wrap"><span class="pe-dot" style="background:${agentStyle(st.agent).color}"></span><select class="pe-agent">${opts}</select></span>` +
       `<button class="pe-remove" title="Remove step">✕</button>`;
@@ -829,13 +907,24 @@ function discardPlan() {
 async function launchRun(body, prompt) {
   switchView("run");
   $("run-btn").disabled = true;
+  // per-run budget wins; otherwise fall back to the server's ADA_BUDGET_USD default
+  state.budgetUsd = (body && body.budget) || serverConfig.budget_usd || 0;
   resetRunView(prompt);
   setConn("connecting…", "badge-idle");
   let taskId;
   try {
-    taskId = (await (await fetch("/api/run", {
+    const resp = await fetch("/api/run", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-    })).json()).task_id;
+    });
+    const data = await resp.json();
+    if (!resp.ok || data.error) {  // e.g. an invalid repo_path (400)
+      const msg = data.error || ("HTTP " + resp.status);
+      feed("✗ could not start run: " + msg);
+      showToast("Could not start run: " + msg, "error", 6000);
+      $("run-btn").disabled = false;
+      return;
+    }
+    taskId = data.task_id;
   } catch (e) { feed("✗ could not start run: " + e); $("run-btn").disabled = false; return; }
   clearContinue();  // the continuation context was captured in `body`; reset for the next task
   connectWS(taskId);
@@ -844,7 +933,7 @@ async function launchRun(body, prompt) {
 function connectWS(taskId) {
   state.taskId = taskId;
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/${taskId}`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws/${taskId}` + tokenQuery("?"));
   ws.onopen = () => setConn("live", "badge-live");
   ws.onmessage = (m) => handleEvent(JSON.parse(m.data));
   ws.onclose = () => { if ($("status-pill").textContent === "running") setConn("disconnected", "badge-err"); };
@@ -856,6 +945,8 @@ function connectWS(taskId) {
 function attachToRun(id, prompt) {
   $("run-btn").disabled = true;
   switchView("run");
+  // reattaching we no longer know the run's own cap — use the server default (may be 0)
+  state.budgetUsd = serverConfig.budget_usd || 0;
   resetRunView(prompt || id);
   setConn("connecting…", "badge-idle");
   connectWS(id);
@@ -877,8 +968,6 @@ async function cancelRun() {
   try { await fetch(`/api/run/${state.taskId}/cancel`, { method: "POST" }); } catch (e) { /* ignore */ }
 }
 
-function escapeAttr(s) { return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;"); }
-
 // ---- recent tasks + doc viewer ----
 async function loadRecent() {
   try {
@@ -899,10 +988,13 @@ async function loadRecent() {
       const titleText = it.title || it.tldr || it.id;
       const cancelBtn = it.status === "running"
         ? `<button class="r-act r-cancel" title="Cancel this run">Cancel</button>` : "";
+      // W5: retry/resume affordance on runs that stopped short of completion
+      const resumeBtn = RESUMABLE_STATUSES.has(it.status)
+        ? `<button class="r-act r-resume" title="Retry / resume this run">Resume</button>` : "";
       li.innerHTML = `<div class="r-title">${escapeHtml(titleText)}</div>` +
         (it.tldr ? `<div class="r-tldr">${escapeHtml(it.tldr)}</div>` : "") +
         `${meta}<div class="r-actions"><span class="r-files">Files →</span>` +
-        `${cancelBtn}<button class="r-act r-delete" title="Delete this task">Delete</button></div>`;
+        `${cancelBtn}${resumeBtn}<button class="r-act r-delete" title="Delete this task">Delete</button></div>`;
       li.onclick = () => { if (it.status === "running") attachToRun(it.id, it.prompt); else openTask(it.id, it); };
       li.querySelector(".r-files").onclick = (e) => {
         e.stopPropagation();
@@ -911,10 +1003,29 @@ async function loadRecent() {
       };
       const cb = li.querySelector(".r-cancel");
       if (cb) cb.onclick = (e) => { e.stopPropagation(); cancelTask(it.id); };
+      const rb = li.querySelector(".r-resume");
+      if (rb) rb.onclick = (e) => { e.stopPropagation(); resumeTask(it.id, titleText); };
       li.querySelector(".r-delete").onclick = (e) => { e.stopPropagation(); deleteTask(it.id, titleText); };
       ul.appendChild(li);
     });
   } catch (e) { /* ignore */ }
+}
+
+// W5: statuses a stopped run may be retried/resumed from (mirrors the server's gate)
+const RESUMABLE_STATUSES = new Set(["interrupted", "failed", "over_budget", "cancelled", "partial"]);
+
+async function resumeTask(id, title) {
+  let resp;
+  try { resp = await fetch(`/api/tasks/${encodeURIComponent(id)}/resume`, { method: "POST" }); }
+  catch (e) { showToast("Resume failed: " + e, "error"); return; }
+  if (resp.status === 501) { showToast("Resume is not available yet on this server", "warn", 6000); return; }
+  let data = {};
+  try { data = await resp.json(); } catch (e) { /* ignore */ }
+  if (!resp.ok) { showToast("Resume failed: " + (data.error || ("HTTP " + resp.status)), "error", 6000); return; }
+  showToast(data.status === "queued" ? "Resume queued" : "Resuming task", "success");
+  attachToRun(id, title || id);
+  loadQueue();
+  loadRecent();
 }
 
 async function cancelTask(id) {
@@ -981,10 +1092,27 @@ async function openDocs(id) {
 }
 function selectTab(which) {
   document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.doc === which));
+  if (which === "diff") { renderDiffTab(); return; }
   $("modal-content").textContent = (currentDocs && currentDocs[which]) || "(empty)";
 }
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// ---- W5: diff viewer — unified `git diff HEAD` of the task's workspace ----
+async function renderDiffTab() {
+  const el = $("modal-content");
+  el.textContent = "Loading diff…";
+  let d;
+  try { d = await (await fetch("/api/tasks/" + encodeURIComponent(currentDocsId) + "/diff")).json(); }
+  catch (e) { el.textContent = "Could not load the diff."; return; }
+  if (!d.is_git) { el.textContent = "Not a git workspace — no diff available."; return; }
+  if (!d.diff && !d.status) { el.textContent = "No changes — the workspace is clean."; return; }
+  const lines = (d.diff || "").split("\n").map(l => {
+    const esc = escapeHtml(l);
+    const kind = classifyDiffLine(l);
+    return kind === "ctx" ? esc : `<span class="d-${kind}">${esc}</span>`;
+  }).join("\n");
+  const status = d.status
+    ? `<span class="d-hunk">git status --porcelain</span>\n${escapeHtml(d.status)}\n` : "";
+  el.innerHTML = status + lines + (d.truncated ? "\n\n…[diff truncated at 200 KB]" : "");
 }
 
 // ---- full historical task view (reconstructed from plan.md + report.md + brief.md) ----
@@ -1141,8 +1269,60 @@ function switchView(name) {
   if (name === "dashboard") loadDashboard();
 }
 
+// ---- W5: run comparison (Dashboard) ----
+async function populateCompareOptions() {
+  let tasks = [];
+  try { tasks = await (await fetch("/api/tasks")).json(); } catch (e) { /* ignore */ }
+  tasks = tasks.filter(t => t.status);  // only rows the run store knows (metrics live there)
+  const selA = $("cmp-a"), selB = $("cmp-b");
+  if (!selA || !selB) return;
+  const prevA = selA.value, prevB = selB.value;
+  const opts = tasks.map(t =>
+    `<option value="${escapeAttr(t.id)}">${escapeHtml((t.title || t.tldr || t.id).slice(0, 60))}</option>`).join("");
+  selA.innerHTML = opts; selB.innerHTML = opts;
+  if (tasks.some(t => t.id === prevA)) selA.value = prevA;
+  if (tasks.some(t => t.id === prevB)) selB.value = prevB;
+  else if (tasks.length > 1 && selB.value === selA.value) selB.value = tasks[1].id;
+  $("cmp-btn").disabled = tasks.length < 2;
+}
+
+async function compareRuns() {
+  const a = $("cmp-a").value, b = $("cmp-b").value;
+  const el = $("cmp-result");
+  if (!a || !b) return;
+  el.classList.remove("muted");
+  el.textContent = "Comparing…";
+  let data;
+  try {
+    const resp = await fetch(`/api/runs/compare?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`);
+    data = await resp.json();
+    if (!resp.ok || data.error) { el.textContent = "Compare failed: " + (data.error || ("HTTP " + resp.status)); return; }
+  } catch (e) { el.textContent = "Compare failed: " + e; return; }
+  const rows = [
+    ["Status", r => (r.status || "—") + (r.run_status && r.run_status !== r.status ? " · " + r.run_status : "")],
+    ["Quality", r => r.quality_score != null ? r.quality_score + "/100" : "—"],
+    ["Subtasks passed", r => (r.subtasks_passed != null && r.subtasks_total != null)
+      ? r.subtasks_passed + "/" + r.subtasks_total : "—"],
+    ["Tests", r => r.tests || "—"],
+    ["Cost", r => r.cost_usd != null ? fmtCost(r.cost_usd) : "—"],
+    ["Tokens", r => (r.input_tokens != null || r.output_tokens != null)
+      ? fmtTok(r.input_tokens || 0) + " in + " + fmtTok(r.output_tokens || 0) + " out" : "—"],
+    ["Duration", r => fmtDuration(r.duration_s)],
+    ["Sessions", r => r.sessions_spawned != null
+      ? r.sessions_spawned + " spawned · " + (r.sessions_reaped || 0) + " reaped" : "—"],
+  ];
+  el.innerHTML =
+    `<table class="cmp-table"><thead><tr><th></th>` +
+    `<th>${escapeHtml(data.a.title || data.a.id)}</th>` +
+    `<th>${escapeHtml(data.b.title || data.b.id)}</th></tr></thead><tbody>` +
+    rows.map(([label, f]) =>
+      `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(f(data.a))}</td><td>${escapeHtml(f(data.b))}</td></tr>`).join("") +
+    `</tbody></table>`;
+}
+
 // ---- Dashboard (Tier 5) ----
 async function loadDashboard() {
+  populateCompareOptions();
   let s;
   try { s = await (await fetch("/api/stats")).json(); } catch (e) { return; }
   $("ds-runs").textContent = s.runs ?? 0;
@@ -1162,7 +1342,7 @@ async function loadDashboard() {
     const row = document.createElement("div");
     row.className = "ds-agent-row";
     const pct = Math.round((a.pass_rate || 0) * 100);
-    row.innerHTML = `<span class="ds-agent-name">${n}</span>`
+    row.innerHTML = `<span class="ds-agent-name">${escapeHtml(n)}</span>`
       + `<span class="ds-bar"><span class="ds-bar-fill" style="width:${pct}%"></span></span>`
       + `<span class="ds-agent-num">${pct}% · ${a.passed}/${a.n}${a.n < 5 ? " (low data)" : ""}</span>`;
     wrap.appendChild(row);
@@ -1230,10 +1410,10 @@ async function loadAgents() {
       card.className = "agent-card";
       card.title = "Click for full details";
       card.innerHTML = `
-        <div class="ac-top"><span class="ac-dot" style="background:${agentStyle(a.name).color}"></span><span class="ac-agent ac-name">${a.name}</span><span class="chip chip-tools">${a.tools.length} tools</span></div>
+        <div class="ac-top"><span class="ac-dot" style="background:${agentStyle(a.name).color}"></span><span class="ac-agent ac-name">${escapeHtml(a.name)}</span><span class="chip chip-tools">${a.tools.length} tools</span></div>
         <div class="ac-desc">${escapeHtml(a.description)}</div>
         <div class="ac-when">${escapeHtml(a.when_to_use)}</div>
-        <div class="tool-chips">${a.tools.map(t => `<span class="tool-chip">${t}</span>`).join("")}</div>`;
+        <div class="tool-chips">${a.tools.map(t => `<span class="tool-chip">${escapeHtml(t)}</span>`).join("")}</div>`;
       card.addEventListener("click", () => openRosterModal(a.name));
       wrap.appendChild(card);
     });
@@ -1409,7 +1589,7 @@ async function populateTaskOptions() {
   try { tasks = await (await fetch("/api/tasks")).json(); } catch (e) { /* ignore */ }
   const sel = $("files-task");
   sel.innerHTML = '<option value="">All tasks</option>' +
-    tasks.map(t => `<option value="${t.id}">${t.id}</option>`).join("");
+    tasks.map(t => `<option value="${escapeAttr(t.id)}">${escapeHtml(t.id)}</option>`).join("");
   sel.value = filesTask;
 }
 
@@ -1450,7 +1630,7 @@ async function selectFile(path, li) {
   const taskQ = filesTask ? "&task=" + encodeURIComponent(filesTask) : "";
   $("file-name").textContent = path; $("file-name").classList.remove("muted");
   const dl = $("file-download");
-  dl.href = "/api/workspace/download?path=" + encodeURIComponent(path) + taskQ;
+  dl.href = "/api/workspace/download?path=" + encodeURIComponent(path) + taskQ + tokenQuery("&");
   dl.classList.remove("hidden");
   const pre = $("file-content");
   pre.classList.remove("muted");
@@ -1461,7 +1641,6 @@ async function selectFile(path, li) {
     pre.textContent = (data.content || "(empty)") + (data.truncated ? "\n\n…[truncated]" : "");
   } catch (e) { pre.textContent = "Could not load file."; }
 }
-function fmtSize(n) { return n < 1024 ? n + " B" : (n / 1024).toFixed(1) + " KB"; }
 
 // ---- wire up ----
 $("run-btn").onclick = runTask;
@@ -1503,6 +1682,10 @@ $("q-concurrency").onchange = setConcurrency;
 $("pause-btn").onclick = pauseResume;
 $("steer-btn").onclick = steerRun;
 $("dash-refresh").onclick = loadDashboard;
+$("cmp-btn").onclick = compareRuns;
+// bearer-token prompt (shown on 401 when the server requires auth)
+$("token-save").onclick = saveToken;
+$("token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") saveToken(); });
 $("fb-accept").onclick = () => sendFeedback({ accepted: true });
 $("fb-reject").onclick = () => sendFeedback({ accepted: false });
 document.querySelectorAll("#fb-stars button").forEach(b => b.onclick = () => {
@@ -1510,6 +1693,7 @@ document.querySelectorAll("#fb-stars button").forEach(b => b.onclick = () => {
   document.querySelectorAll("#fb-stars button").forEach(x => x.classList.toggle("on", parseInt(x.dataset.r) <= _fbRating));
   sendFeedback({});
 });
+loadConfig();
 loadProjects();
 loadRecent();
 loadQueue();
