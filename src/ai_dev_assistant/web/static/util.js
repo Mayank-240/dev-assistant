@@ -60,7 +60,64 @@
       messages: 0,            // inter-agent messages seen
       costUsd: null,          // latest cumulative run cost reported
       phase: "plan",          // plan | execute | verify | document | done
+      children: null,         // F3: fan-out children (makeChildRecord[]), null = not a fan-out
     };
+  }
+
+  // ===========================================================
+  // F3 — cross-project fan-out: children of a parent task.
+  // ===========================================================
+
+  // One child task of a cross-project parent (drives a card in the children grid).
+  function makeChildRecord(c) {
+    c = c || {};
+    return {
+      slug: String(c.slug || ""), task_id: String(c.task_id || ""),
+      status: c.status || "queued", quality: c.quality != null ? c.quality : null,
+      cost_usd: c.cost_usd != null ? c.cost_usd : null, branch: String(c.branch || ""),
+    };
+  }
+
+  // Find a child by task_id (preferred) or slug in the state's children array.
+  function _childOf(state, d) {
+    if (!state.children) return null;
+    return state.children.find(c =>
+      (d.task_id && c.task_id === d.task_id) || (d.slug && c.slug === d.slug)) || null;
+  }
+
+  // /api/tasks/{id}/children rows -> child records (for the historical parent view).
+  function childrenFromRows(rows) {
+    return (rows || []).map(r => makeChildRecord({
+      slug: r.slug || r.project, task_id: r.id,
+      status: r.status || "queued", quality: r.quality_score,
+      cost_usd: r.cost_usd, branch: r.task_branch,
+    }));
+  }
+
+  // Child records -> render models for the children grid. Text fields are plain —
+  // the caller escapes before injecting into HTML.
+  function childrenGridModel(children) {
+    return (children || []).map(c => {
+      const status = c.status || "queued";
+      const bad = status === "failed" || status === "cancelled"
+        || status === "over_budget" || status === "interrupted" || status === "error";
+      const cls = status === "running" ? "running"
+        : status === "completed" ? "passed"
+        : status === "partial" ? "partial"
+        : bad ? "failed" : "queued";
+      const pill = status === "running" ? "pill-running"
+        : status === "completed" ? "pill-done"
+        : status === "partial" ? "pill-warn"
+        : bad ? "pill-err" : "";
+      return {
+        slug: c.slug, taskId: c.task_id, status, cls, pill,
+        statusLabel: status,
+        qualityLabel: c.quality != null ? "quality " + c.quality + "/100" : "quality —",
+        costLabel: c.cost_usd != null ? fmtCost(c.cost_usd) : "$—",
+        branch: c.branch || "",
+        open: status === "running" || status === "queued" ? "live" : "docs",
+      };
+    });
   }
 
   // Fold one websocket event into the aggregates (mutates + returns state).
@@ -73,11 +130,38 @@
         if (ev.message && /Documenting/i.test(ev.message)) state.phase = "document";
         break;
       case "plan": {
+        if (d.children && d.children.length) {  // F3: fan-out parent plan
+          state.children = d.children.map(makeChildRecord);
+          state.total = state.children.length;
+          state.reviewed = new Set();
+          state.phase = "execute";
+          break;
+        }
         const subs = d.subtasks || [];
         state.total = subs.length;
         state.reviewed = new Set();
         subs.forEach(st => { state.agentData[st.id] = makeAgentRecord(st); });
         state.phase = "execute";
+        break;
+      }
+      case "child_start": {
+        if (!state.children) state.children = [];
+        let c = _childOf(state, d);
+        if (!c) { c = makeChildRecord(d); state.children.push(c); }
+        c.status = "running";
+        if (d.task_id) c.task_id = d.task_id;
+        break;
+      }
+      case "child_done": {
+        if (!state.children) state.children = [];
+        let c = _childOf(state, d);
+        if (!c) { c = makeChildRecord(d); state.children.push(c); }
+        c.status = d.status || "completed";
+        if (d.quality != null) c.quality = d.quality;
+        if (d.cost_usd != null) c.cost_usd = d.cost_usd;
+        if (d.branch) c.branch = d.branch;
+        if (d.task_id) c.task_id = d.task_id;
+        state.reviewed.add(c.task_id || c.slug);
         break;
       }
       case "subtask_start": {
@@ -134,10 +218,11 @@
   function runProgress(state) {
     const total = (state && state.total) || 0;
     const done = (state && state.reviewed) ? state.reviewed.size : 0;
+    const unit = (state && state.children) ? "projects" : "subtasks";  // F3 fan-out
     return {
       done, total,
       pct: total ? Math.round((done / total) * 100) : 0,
-      label: total ? done + "/" + total + " subtasks" : "",
+      label: total ? done + "/" + total + " " + unit : "",
     };
   }
 
@@ -374,6 +459,7 @@
     projectStatusLine, activityStripModel,
     renderDiffHtml, reviewCardModel, permissionsModel, policyFormModel, parsePolicyForm,
     sparklinePoints,
+    makeChildRecord, childrenFromRows, childrenGridModel,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = AdaUtil;

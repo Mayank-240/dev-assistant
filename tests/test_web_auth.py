@@ -127,6 +127,19 @@ def test_review_and_permissions_endpoints_require_token(tmp_path, monkeypatch):
     assert c.get("/api/projects/default/runs", headers=hdr).status_code == 200
 
 
+# ---- F3: cross-project children endpoint stays behind the auth middleware ----
+
+def test_children_endpoint_requires_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    assert c.get("/api/tasks/t1/children").status_code == 401
+    # with the token, the request reaches the handler (200 with children, or 501
+    # while the fan-out core lands separately — never 401)
+    hdr = {"Authorization": f"Bearer {TOKEN}"}
+    r = c.get("/api/tasks/t1/children", headers=hdr)
+    assert r.status_code in (200, 501)
+
+
 # ---- W5: diff endpoint ----
 
 def _git(cwd, *args):

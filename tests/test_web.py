@@ -439,6 +439,182 @@ def test_project_runs_unknown_project_is_404(tmp_path):
     assert c.get("/api/projects/nope/runs").status_code == 404
 
 
+# ---- F3/F6: cross-project fan-out (composer + children endpoint) ----
+# orchestration/fanout.py lands concurrently; the launch path is pinned by injecting a
+# fake module, and the raw endpoints tolerate 501 while the core is missing.
+
+def _has_fanout() -> bool:
+    try:
+        from ai_dev_assistant.orchestration.fanout import run_cross_project  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def test_run_request_has_projects_and_stagger_fields():
+    assert "projects" in RunRequest.model_fields
+    assert "stagger" in RunRequest.model_fields
+    assert "project" in RunRequest.model_fields  # the single-project field survives
+
+
+def test_run_with_unknown_project_slug_is_400(tmp_path):
+    c = _client(tmp_path)
+    r = c.post("/api/run", json={"prompt": "x", "projects": ["default", "nope"]})
+    assert r.status_code == 400
+    assert "nope" in r.json()["error"] and "default" not in r.json()["error"]
+
+
+def test_run_with_single_projects_entry_behaves_as_project(tmp_path):
+    c = _client(tmp_path)
+    c.app.state.paused = True  # keep the pump from launching a real engine
+    slug = c.post("/api/projects", json={"name": "Solo"}).json()["slug"]
+    r = c.post("/api/run", json={"prompt": "x", "projects": [slug]})
+    assert r.status_code == 200 and r.json()["status"] == "queued"
+    payload = c.app.state.runs.queue_pending()[0]["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    assert payload.get("project") == slug
+    assert not payload.get("projects")  # not routed through the fan-out path
+
+
+def test_run_fanout_without_core_is_501_else_accepted(tmp_path):
+    c = _client(tmp_path)
+    c.app.state.paused = True
+    a = c.post("/api/projects", json={"name": "Fan A"}).json()["slug"]
+    b = c.post("/api/projects", json={"name": "Fan B"}).json()["slug"]
+    r = c.post("/api/run", json={"prompt": "x", "projects": [a, b]})
+    if _has_fanout():
+        assert r.status_code == 200
+    else:
+        assert r.status_code == 501
+        assert "not available" in r.json()["error"]
+
+
+def test_fanout_launch_reaches_run_cross_project(tmp_path, monkeypatch):
+    """POST /api/run with 2+ projects routes the background task through
+    run_cross_project, streaming its events via the parent task's broker."""
+    import sys
+    import threading
+    import types
+
+    from ai_dev_assistant.orchestration.events import Event
+    from ai_dev_assistant.web.server import create_app as _create_app
+
+    called: dict = {}
+    hit = threading.Event()
+
+    async def fake_run_cross_project(settings, prompt, slugs, *, title=None,
+                                     stagger=False, task_id=None, on_event=None,
+                                     engine_factory=None):
+        called.update(prompt=prompt, slugs=list(slugs), title=title,
+                      stagger=stagger, task_id=task_id)
+        if on_event:
+            on_event(Event("done", "Rollup ready.", {"task_id": task_id}))
+        hit.set()
+        return {"parent_id": task_id, "status": "completed", "children": [],
+                "docs_dir": ""}
+
+    mod = types.ModuleType("ai_dev_assistant.orchestration.fanout")
+    mod.run_cross_project = fake_run_cross_project
+    monkeypatch.setitem(sys.modules, "ai_dev_assistant.orchestration.fanout", mod)
+
+    settings = Settings(
+        llm_backend="anthropic", anthropic_api_key="", embeddings_backend="hash",
+        data_dir=tmp_path / "data", docs_dir=tmp_path / "docs", workspace_dir=tmp_path / "ws",
+    )
+    app = _create_app(settings, api_token="")
+    with TestClient(app) as c:  # context manager keeps the loop alive for the bg task
+        a = c.post("/api/projects", json={"name": "Fan A"}).json()["slug"]
+        b = c.post("/api/projects", json={"name": "Fan B"}).json()["slug"]
+        r = c.post("/api/run", json={"prompt": "fan out", "projects": [a, b],
+                                     "stagger": True, "title": "Fan run"})
+        assert r.status_code == 200, r.text
+        tid = r.json()["task_id"]
+        assert hit.wait(timeout=10), "run_cross_project was never reached"
+        assert called["slugs"] == [a, b]
+        assert called["stagger"] is True
+        assert called["task_id"] == tid
+        assert called["prompt"] == "fan out" and called["title"] == "Fan run"
+        # its events landed on the parent broker (same streaming as normal runs)
+        broker = app.state.brokers.get(tid)
+        assert broker is not None
+        assert any(e["type"] == "done" for e in broker.events)
+
+
+def test_children_endpoint_501_or_shape(tmp_path):
+    c = _client(tmp_path)
+    r = c.get("/api/tasks/parent-x/children")
+    if hasattr(c.app.state.runs, "children_of"):
+        assert r.status_code == 200
+        assert r.json()["children"] == []  # unknown parent -> empty, never an error
+    else:
+        assert r.status_code == 501
+        assert "not available" in r.json()["error"]
+
+
+def test_children_endpoint_joins_run_rows(tmp_path, monkeypatch):
+    c = _client(tmp_path)
+    rows = [{"id": "child-1", "project": "proj-a", "title": "Child A", "prompt": "p",
+             "status": "completed", "run_status": "completed", "quality_score": 90,
+             "cost_usd": 0.4, "task_branch": "ada/child-1", "review_target": "main"}]
+    monkeypatch.setattr(c.app.state.runs, "children_of",
+                        lambda pid: rows if pid == "parent-x" else [], raising=False)
+    body = c.get("/api/tasks/parent-x/children").json()
+    assert len(body["children"]) == 1
+    kid = body["children"][0]
+    assert kid["id"] == "child-1"
+    assert kid["slug"] == "proj-a" and kid["project"] == "proj-a"
+    assert kid["status"] == "completed" and kid["run_status"] == "completed"
+    assert kid["quality_score"] == 90 and kid["cost_usd"] == 0.4
+    assert kid["task_branch"] == "ada/child-1" and kid["review_target"] == "main"
+
+
+def test_children_of_real_store_via_parent_links(tmp_path):
+    """The run store's children_of (landed with the fan-out core) feeds the endpoint."""
+    c = _client(tmp_path)
+    st = c.app.state.runs
+    if not hasattr(st, "children_of"):
+        pytest.skip("run store without children_of (landing separately)")
+    st.start("fan-parent", "fan out", title="Fan", project="multi")
+    st.start("fan-c1", "child one", project="proj-a")
+    st.set_parent("fan-c1", "fan-parent")
+    st.finish("fan-c1", status="completed", quality_score=88, cost_usd=0.2)
+    body = c.get("/api/tasks/fan-parent/children").json()
+    ids = [k["id"] for k in body["children"]]
+    assert ids == ["fan-c1"]
+    assert body["children"][0]["slug"] == "proj-a"
+    assert body["children"][0]["quality_score"] == 88
+
+
+def test_multi_pseudo_project_activity(tmp_path):
+    """The 'multi' pseudo-project aggregates fan-out parents for the activity table."""
+    c = _client(tmp_path)
+    st = c.app.state.runs
+    st.start("fan-parent", "fan out", title="Fan run", project="multi")
+    c.app.state.running.add("fan-parent")
+    st.enqueue("fan-queued", "another fan-out", "Queued fan",
+               {"prompt": "another fan-out", "projects": ["a", "b"], "stagger": False})
+    r = c.get("/api/projects/multi/activity")
+    assert r.status_code == 200
+    body = r.json()
+    assert [x["id"] for x in body["running"]] == ["fan-parent"]
+    assert body["running"][0]["title"] == "Fan run"
+    assert [q["id"] for q in body["queued"]] == ["fan-queued"]
+    # fan-out queue entries don't leak into an ordinary project's activity
+    default = c.get("/api/projects/default/activity").json()
+    assert "fan-queued" not in [q["id"] for q in default["queued"]]
+
+
+def test_resume_multi_parent_is_501(tmp_path):
+    c = _client(tmp_path)
+    st = c.app.state.runs
+    st.start("fan-parent", "fan out", project="multi")
+    st.set_status("fan-parent", "failed")
+    r = c.post("/api/tasks/fan-parent/resume")
+    assert r.status_code == 501
+    assert "cross-project" in r.json()["error"]
+
+
 def test_effort_tiers_including_xhigh_and_max():
     from ai_dev_assistant.web.server import _EFFORT, _settings_for
 

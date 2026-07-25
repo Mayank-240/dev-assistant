@@ -67,6 +67,11 @@
             </label>
             <div id="project-status" class="proj-status hidden" title="Repository state of the selected project"></div>
             <div id="project-activity" class="proj-activity hidden" role="status" aria-live="polite" title="What is going on in this project right now"></div>
+            <label class="check" title="Fan this task out across several projects — one child task per project, plus one rolled-up report"><input type="checkbox" id="multi-toggle" /> Multiple projects</label>
+            <div id="multi-box" class="multi-box hidden">
+              <div id="multi-projects" class="multi-projects" role="group" aria-label="Projects to fan this task out across"></div>
+              <label class="check" title="run the first project alone so its lessons inform the rest"><input type="checkbox" id="stagger" /> Stagger</label>
+            </div>
             <div class="controls">
               <label class="ctl" title="Higher effort = deeper reasoning, more agent turns & review retries; lower = cheaper & faster (Sonnet)">Effort
                 <select id="effort" class="select">
@@ -239,6 +244,12 @@
               <div class="rv-agents">
                 <h2 class="section-title hidden" id="agents-title">Agents · this run</h2>
                 <div id="agents" class="agents-grid"></div>
+              </div>
+
+              <!-- F3: cross-project fan-out — one card per child project (replaces agent cards) -->
+              <div class="rv-children">
+                <h2 class="section-title hidden" id="children-title">Projects · this fan-out</h2>
+                <div id="children-grid" class="agents-grid hidden"></div>
               </div>
 
               <div class="card brief-card hidden" id="brief-card">

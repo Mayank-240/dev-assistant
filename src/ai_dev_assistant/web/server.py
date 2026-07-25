@@ -55,6 +55,20 @@ def _engine_supports_resume() -> bool:
         return False
 
 
+def _fanout_runner():
+    """orchestration.fanout.run_cross_project once it lands (F3, concurrent change);
+    None until then so the fan-out paths answer 501 instead of crashing."""
+    try:
+        from ..orchestration.fanout import run_cross_project
+    except ImportError:
+        return None
+    return run_cross_project
+
+
+# Pseudo-project slug carried by cross-project parent run rows (fanout contract).
+_MULTI_PROJECT = "multi"
+
+
 def _is_loopback(host: str) -> bool:
     if host in ("", "localhost"):
         return True
@@ -168,6 +182,10 @@ class RunRequest(BaseModel):
     budget: float | None = None
     title: str | None = None  # optional; auto-derived from the prompt when blank
     project: str | None = None
+    # F3: cross-project fan-out — 2+ slugs launch one child task per project with a
+    # rolled-up parent; a single entry behaves exactly like `project`.
+    projects: list[str] | None = None
+    stagger: bool = False  # run the first child alone so its lessons inform the rest
     memory_scope: str | None = None  # "project" | "global"
     continue_from: str | None = None  # re-engage: continue this completed task's workspace + context
     # Clean break: repo_path/repo_url/repo_ref are gone — the run's *project* owns the repo.
@@ -281,6 +299,13 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         if task_id not in app.state.brokers:  # e.g. resumed from disk after a restart
             app.state.brokers[task_id] = Broker()
         app.state.running.add(task_id)
+        slugs = payload.get("projects") or []
+        if len(slugs) >= 2:  # F3: cross-project fan-out parent
+            app.state.tasks[task_id] = asyncio.create_task(_run_fanout(
+                task_id, payload.get("prompt", ""), list(slugs),
+                payload.get("effort"), payload.get("budget"), payload.get("title"),
+                bool(payload.get("stagger"))))
+            return
         app.state.tasks[task_id] = asyncio.create_task(_run_task(
             task_id, payload.get("prompt", ""), payload.get("plan"),
             payload.get("effort"), payload.get("budget"), payload.get("title"),
@@ -372,6 +397,40 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             _evict_broker_later(task_id, broker)
             _pump()  # a slot just freed — start the next queued task
 
+    async def _run_fanout(task_id: str, prompt: str, slugs: list[str],
+                          effort: str | None, budget: float | None,
+                          title: str | None = None, stagger: bool = False) -> None:
+        """F3: cross-project fan-out parent. run_cross_project owns the run rows
+        (parent project='multi', children with parent_id) and emits plan/child_start/
+        child_done/brief/done on the parent stream — we just wire it into the Broker."""
+        broker: Broker = app.state.brokers[task_id]
+        fn = _fanout_runner()
+        try:
+            if fn is None:  # queued before the fan-out core landed (e.g. across a restart)
+                msg = "cross-project fan-out is not available yet"
+                broker.publish(Event("error", msg, {"message": msg}))
+                app.state.runs.set_status(task_id, "failed")
+                return
+            await fn(_settings_for(settings, effort, budget), prompt, slugs,
+                     title=(title or None), stagger=bool(stagger), task_id=task_id,
+                     on_event=broker.publish)
+        except asyncio.CancelledError:
+            broker.publish(Event("error", "Run cancelled by user.", {"message": "cancelled"}))
+            app.state.runs.set_status(task_id, "cancelled")
+        except LLMError as exc:
+            broker.publish(Event("error", f"Run failed: {exc}", {"message": str(exc)}))
+            app.state.runs.set_status(task_id, "failed")
+        except Exception as exc:  # don't leave the socket hanging on unexpected failures
+            broker.publish(Event("error", f"Unexpected error: {exc}", {"message": str(exc)}))
+            app.state.runs.set_status(task_id, "failed")
+        finally:
+            app.state.tasks.pop(task_id, None)
+            app.state.running.discard(task_id)
+            if not broker.done:
+                broker.publish(Event("done", "Run ended.", {}))
+            _evict_broker_later(task_id, broker)
+            _pump()  # a slot just freed — start the next queued task
+
     @app.post("/api/plan")
     async def make_plan(req: PlanRequest) -> JSONResponse:
         engine = Engine(_settings_for(settings, req.effort, req.budget, req.project, req.memory_scope))
@@ -414,15 +473,39 @@ def create_app(settings: Settings | None = None, host: str | None = None,
 
     @app.post("/api/run")
     async def start_run(req: RunRequest):
+        # F3: `projects` with 2+ entries fans the task out; 1 entry behaves as `project`.
+        slugs: list[str] = []
+        for s in (req.projects or []):
+            s = (s or "").strip()
+            if s and s not in slugs:  # dedupe, keep order
+                slugs.append(s)
+        project = req.project
+        if slugs:
+            unknown = [s for s in slugs if not _project_known(s)]
+            if unknown:
+                return JSONResponse({"error": "unknown project(s): " + ", ".join(unknown)},
+                                    status_code=400)
+            if len(slugs) == 1:
+                project, slugs = slugs[0], []
+        if slugs and _fanout_runner() is None:
+            return JSONResponse({"error": "cross-project fan-out is not available yet"},
+                                status_code=501)
         task_id = req.task_id or new_task_id()
         app.state.brokers[task_id] = Broker()
         app.state.brokers[task_id].publish(Event("status", "Backend: " + settings.llm_backend,
                                                   {"backend": settings.llm_backend}))
-        payload = {
-            "prompt": req.prompt, "plan": req.plan, "effort": req.effort, "budget": req.budget,
-            "title": req.title, "project": req.project, "memory_scope": req.memory_scope,
-            "continue_from": req.continue_from, "git_finalize": req.git_finalize,
-        }
+        if slugs:
+            payload: dict[str, Any] = {
+                "prompt": req.prompt, "projects": slugs, "stagger": bool(req.stagger),
+                "effort": req.effort, "budget": req.budget, "title": req.title,
+            }
+        else:
+            payload = {
+                "prompt": req.prompt, "plan": req.plan, "effort": req.effort,
+                "budget": req.budget, "title": req.title, "project": project,
+                "memory_scope": req.memory_scope, "continue_from": req.continue_from,
+                "git_finalize": req.git_finalize,
+            }
         plan_title = (req.plan or {}).get("title") if req.plan else None
         app.state.runs.enqueue(task_id, req.prompt, req.title or plan_title, payload)
         _pump()  # auto-run if a slot is free
@@ -451,6 +534,10 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         if status not in _RESUMABLE_STATUSES:
             return JSONResponse(
                 {"error": f"cannot resume a run with status '{status}'"}, status_code=409)
+        if (row.get("project") or "") == _MULTI_PROJECT:
+            return JSONResponse(
+                {"error": "resuming a cross-project task is not supported yet"},
+                status_code=501)
         if not _engine_supports_resume():
             return JSONResponse({"error": "resume not available yet"}, status_code=501)
         if task_id not in app.state.brokers:
@@ -777,6 +864,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             "memories": r.get("memories"), "messages": r.get("messages"),
             "quality_score": r.get("quality_score"), "run_status": r.get("run_status"),
             "parent_id": r.get("parent_id"),
+            "project": r.get("project"),  # "multi" marks a cross-project parent (F3)
         }
         return JSONResponse({
             "plan": _read(d / "plan.md"),
@@ -786,6 +874,22 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             "meta": meta,
             "feedback": app.state.runs.get_feedback(task_id) or {},
         })
+
+    # ---- F3/F6: children of a cross-project parent (feeds the UI's children grid) ----
+    @app.get("/api/tasks/{task_id}/children")
+    async def get_children(task_id: str) -> JSONResponse:
+        if not hasattr(app.state.runs, "children_of"):  # store variant landing separately
+            return JSONResponse({"error": "cross-project children are not available yet"},
+                                status_code=501)
+        rows = app.state.runs.children_of(task_id) or []
+        return JSONResponse({"children": [{
+            "id": r.get("id"),
+            "slug": r.get("project"), "project": r.get("project"),
+            "title": r.get("title") or derive_title(r.get("prompt") or ""),
+            "status": r.get("status"), "run_status": r.get("run_status"),
+            "quality_score": r.get("quality_score"), "cost_usd": r.get("cost_usd"),
+            "task_branch": r.get("task_branch"), "review_target": r.get("review_target"),
+        } for r in rows]})
 
     @app.get("/api/agents")
     async def list_agents() -> JSONResponse:
@@ -857,8 +961,9 @@ def create_app(settings: Settings | None = None, host: str | None = None,
 
     @app.get("/api/projects/{slug}/activity")
     async def get_project_activity(slug: str) -> JSONResponse:
-        """Live view of one project: running tasks + queued tasks + last 5 run rows."""
-        if not _project_known(slug):
+        """Live view of one project: running tasks + queued tasks + last 5 run rows.
+        The pseudo-slug 'multi' aggregates cross-project fan-out parents (F3)."""
+        if slug != _MULTI_PROJECT and not _project_known(slug):
             return JSONResponse({"error": "unknown project"}, status_code=404)
         running = []
         for tid in _running_ids_for(slug):
@@ -873,7 +978,11 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                     payload = json.loads(payload)
                 except json.JSONDecodeError:
                     payload = {}
-            if projects.resolve(settings, payload.get("project")) != slug:
+            if len(payload.get("projects") or []) >= 2:  # queued fan-out parent
+                p_slug = _MULTI_PROJECT
+            else:
+                p_slug = projects.resolve(settings, payload.get("project"))
+            if p_slug != slug:
                 continue
             queued.append({"id": p["task_id"], "title": _title_of(p),
                            "position": positions.get(p["task_id"])})

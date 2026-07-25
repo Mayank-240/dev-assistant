@@ -7,7 +7,7 @@ const {
   computeBudgetMeter, timelineRows, compareRowModel, isResumable,
   projectStatusLine, activityStripModel,
   renderDiffHtml, reviewCardModel, permissionsModel, policyFormModel, parsePolicyForm,
-  sparklinePoints,
+  sparklinePoints, childrenFromRows, childrenGridModel,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -134,6 +134,9 @@ function resetRunView(prompt) {
   $("feed").innerHTML = "";
   $("plan-card").classList.add("hidden");
   $("agents-title").classList.add("hidden");
+  $("children-title").classList.add("hidden");
+  $("children-grid").classList.add("hidden");
+  $("children-grid").innerHTML = "";
   $("brief-card").classList.add("hidden");
   $("brief-points").innerHTML = "";
   ["m-agents", "m-sessions", "m-reaped", "m-kg", "m-edges", "m-mem", "m-msgs"].forEach(id => $(id).textContent = "0");
@@ -210,6 +213,37 @@ function setAgentState(id, cls, text, score) {
   const t = card.querySelector(".ac-statetext");
   if (t) t.textContent = text;
   if (score !== undefined) card.querySelector(".ac-score").textContent = "score " + score;
+}
+
+// ---- F3: children grid (cross-project fan-out parent view) ----
+// One card per child project — replaces the agent cards on a fan-out parent.
+function renderChildrenGrid() {
+  const models = childrenGridModel(state.children);
+  const wrap = $("children-grid"), title = $("children-title");
+  if (!models.length) { wrap.classList.add("hidden"); title.classList.add("hidden"); wrap.innerHTML = ""; return; }
+  title.classList.remove("hidden");
+  wrap.classList.remove("hidden");
+  wrap.innerHTML = "";
+  models.forEach(m => {
+    const card = document.createElement("div");
+    card.className = "agent-card child-card " + m.cls;
+    card.innerHTML =
+      `<div class="ac-top"><span class="chip">⋔ ${escapeHtml(m.slug)}</span>` +
+      `<span class="pill ${escapeAttr(m.pill)}">${escapeHtml(m.statusLabel)}</span></div>` +
+      `<div class="cc-meta"><span title="Review quality score">${escapeHtml(m.qualityLabel)}</span>` +
+      `<span title="Child run cost">${escapeHtml(m.costLabel)}</span></div>` +
+      (m.branch ? `<div class="cc-branch" title="Branch left for review">⎇ <code>${escapeHtml(m.branch)}</code></div>` : "");
+    card.title = "Click to open this project's child task";
+    makeActivatable(card, () => openChildTask(m), `Open child task for project ${m.slug}`);
+    wrap.appendChild(card);
+  });
+}
+
+function openChildTask(m) {
+  if (!m.taskId) return;
+  // children are ordinary tasks — live ones attach to their stream, finished ones open docs
+  if (m.open === "live") attachToRun(m.taskId, m.slug);
+  else openTask(m.taskId, null);
 }
 
 // ---- phase stepper + progress ----
@@ -418,12 +452,16 @@ function renderAgentModal(a) {
 function getControls() {
   const b = parseFloat($("budget").value);
   const t = $("task-title").value.trim();
+  // F3: "Multiple projects" checked -> send projects+stagger (2+ slugs fan out;
+  // a single slug behaves exactly like `project` server-side).
+  const multi = $("multi-toggle").checked ? selectedMultiProjects() : [];
   // Per-run repo binding is gone — the selected *project* owns the repository.
   return {
     effort: $("effort").value, budget: (b && b > 0) ? b : null, title: t || null,
     project: selectedProject(), memory_scope: $("mem-scope").value,
     continue_from: state.continueFrom || null,
     git_finalize: $("git-finalize").checked ? true : null,
+    ...(multi.length ? { projects: multi, stagger: $("stagger").checked } : {}),
   };
 }
 
@@ -449,14 +487,40 @@ function clearContinue() {
 // ---- projects (scope memory + knowledge graph) ----
 function selectedProject() { return $("project").value || "default"; }
 
+let projectList = [];   // last-fetched /api/projects list (feeds the multi-select too)
+
 async function loadProjects() {
   let list = [];
   try { list = await (await fetch("/api/projects")).json(); } catch (e) { list = []; }
   if (!list.length) list = [{ slug: "default", name: "Default" }];
+  projectList = list;
   const sel = $("project");
   const saved = localStorage.getItem("ada-project") || sel.value || "default";
   sel.innerHTML = list.map(p => `<option value="${escapeAttr(p.slug)}">${escapeHtml(p.name)}</option>`).join("");
   sel.value = list.some(p => p.slug === saved) ? saved : list[0].slug;
+  renderMultiProjects();
+}
+
+// ---- F3: cross-project fan-out composer (multi-select + stagger) ----
+function renderMultiProjects() {
+  const box = $("multi-projects");
+  if (!box) return;
+  const checked = new Set(selectedMultiProjects());
+  const items = projectList.filter(p => !p.archived);  // archived projects can't be targets
+  if (!items.length) { box.innerHTML = '<p class="muted">No projects yet.</p>'; return; }
+  box.innerHTML = items.map(p =>
+    `<label class="check mp-item"><input type="checkbox" class="mp-check" value="${escapeAttr(p.slug)}"` +
+    `${checked.has(p.slug) ? " checked" : ""} /> ${escapeHtml(p.name || p.slug)}</label>`).join("");
+}
+
+function selectedMultiProjects() {
+  return [...document.querySelectorAll("#multi-projects .mp-check:checked")].map(cb => cb.value);
+}
+
+function toggleMultiBox() {
+  const on = $("multi-toggle").checked;
+  $("multi-box").classList.toggle("hidden", !on);
+  if (on) renderMultiProjects();
 }
 
 // ---- F1: New / Import project dialog ----
@@ -723,6 +787,15 @@ function handleEvent(ev) {
       updateRunControls();
       $("plan-card").classList.remove("hidden");
       $("plan-summary").textContent = d.summary || "";
+      if (d.children && d.children.length) {
+        // F3: fan-out parent — a children grid replaces the agent cards
+        renderChildrenGrid();
+        $("m-agents").textContent = state.total;
+        setPhase("execute");
+        updateProgress();
+        feed(ev.message);
+        break;
+      }
       $("agents-title").classList.remove("hidden");
       (d.subtasks || []).forEach(st => {
         $("agents").appendChild(makeAgentCard(st));
@@ -733,6 +806,15 @@ function handleEvent(ev) {
       setPhase("execute");
       updateProgress();
       feed(ev.message);
+      break;
+    case "child_start":
+      renderChildrenGrid();
+      feed("▶ " + ev.message);
+      break;
+    case "child_done":
+      renderChildrenGrid();
+      updateProgress();
+      feed((d.status === "completed" ? "✓ " : "✗ ") + ev.message);
       break;
     case "subtask_start":
       setAgentState(d.id, "running", "running");
@@ -882,6 +964,10 @@ function handleEvent(ev) {
 function runTask() {
   const prompt = $("prompt").value.trim();
   if (!prompt) { $("prompt").focus(); return; }
+  if ($("multi-toggle").checked && !selectedMultiProjects().length) {
+    showToast("Pick at least one project to fan out across (2+ run in parallel)", "warn");
+    return;
+  }
   if ($("review-plan").checked) requestPlan(prompt);
   else launchRun({ prompt, ...getControls() }, prompt);
 }
@@ -1257,10 +1343,56 @@ function parseBrief(md) {
   return { tldr, points };
 }
 
+// F3: a task's children (cross-project fan-out) — null when it has none / endpoint 501s.
+async function fetchChildren(id) {
+  try {
+    const resp = await fetch("/api/tasks/" + encodeURIComponent(id) + "/children");
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return (data.children && data.children.length) ? data.children : null;
+  } catch (e) { return null; }
+}
+
+// F3: historical view of a fan-out parent — children grid + brief instead of agent cards.
+function openParentTask(id, docs, kids, meta) {
+  const mm = (docs.meta && Object.keys(docs.meta).length) ? docs.meta : (meta || {});
+  const prompt = mm.prompt || (meta && (meta.prompt || meta.title)) || id;
+  resetRunView(prompt);
+  stopTimer();
+  $("timer").textContent = "";
+  $("cancel-btn").classList.add("hidden");
+  state.children = childrenFromRows(kids);
+  state.total = state.children.length;
+  renderChildrenGrid();
+  $("m-agents").textContent = state.children.length;
+  if (mm.cost_usd != null) $("m-cost").textContent = mm.cost_usd > 0 ? fmtCost(mm.cost_usd) : "—";
+  const b = parseBrief(docs.brief || "");
+  if (b.tldr) {
+    $("brief-card").classList.remove("hidden");
+    $("brief-tldr").textContent = b.tldr;
+    $("brief-points").innerHTML = "";
+    b.points.forEach(p => { const li = document.createElement("li"); li.textContent = p; $("brief-points").appendChild(li); });
+  }
+  const status = mm.status || "";
+  const bad = status === "failed" || status === "interrupted" || status === "cancelled" || status === "over_budget";
+  const okKids = state.children.filter(c => c.status === "completed").length;
+  $("status-pill").className = "pill " + (bad ? "pill-err" : "pill-done");
+  $("status-pill").textContent = bad ? status : `${okKids}/${state.children.length} projects`;
+  setPhase("done");
+  $("progress-bar").style.width = "100%";
+  $("progress-label").textContent = `${okKids}/${state.children.length} projects`;
+  state.docsId = id;
+}
+
 async function openTask(id, meta) {
   switchView("run");
   let docs;
   try { docs = await (await fetch("/api/tasks/" + id)).json(); } catch (e) { docs = null; }
+  // Only a cross-project parent (project "multi") gets the children grid —
+  // re-engaged tasks also have child rows but stay ordinary tasks.
+  const isMulti = docs && docs.meta && docs.meta.project === "multi";
+  const kids = isMulti ? await fetchChildren(id) : null;
+  if (kids) { openParentTask(id, docs || {}, kids, meta); return; }  // fan-out parent
   if (!docs || !docs.plan) { openDocs(id); return; }   // older task without parseable docs
   const subtasks = parsePlan(docs.plan);
   const rep = parseReport(docs.report || "");
@@ -1408,16 +1540,25 @@ async function loadProjectsActivity() {
   let list = [];
   try { list = await (await fetch("/api/projects")).json(); } catch (e) { list = []; }
   if (!list.length) { wrap.innerHTML = '<p class="muted">No projects yet.</p>'; return; }
-  const acts = await Promise.all(list.slice(0, 20).map(async p => {
+  const fetchAct = async (slug) => {
     try {
-      const resp = await fetch("/api/projects/" + encodeURIComponent(p.slug) + "/activity");
+      const resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/activity");
       return resp.ok ? await resp.json() : null;
     } catch (e) { return null; }
-  }));
-  const rows = list.slice(0, 20).map((p, i) => {
-    const m = activityStripModel(acts[i]);
-    const runningTitle = (acts[i] && acts[i].running && acts[i].running[0])
-      ? (acts[i].running[0].title || acts[i].running[0].id) : "—";
+  };
+  const shown = list.slice(0, 20);
+  const acts = await Promise.all([...shown.map(p => fetchAct(p.slug)), fetchAct("multi")]);
+  const multiAct = acts.pop();
+  const entries = shown.map((p, i) => ({ p, act: acts[i] }));
+  // F3: "multi" pseudo-project row — cross-project fan-out parents, shown while active
+  const multiModel = activityStripModel(multiAct);
+  if (multiAct && (multiModel.running || multiModel.queued)) {
+    entries.unshift({ p: { slug: "multi", name: "⋔ multi" }, act: multiAct });
+  }
+  const rows = entries.map(({ p, act }) => {
+    const m = activityStripModel(act);
+    const runningTitle = (act && act.running && act.running[0])
+      ? (act.running[0].title || act.running[0].id) : "—";
     return `<tr>` +
       `<td class="dsa-name">${escapeHtml(p.name || p.slug)}` +
       (p.archived ? ' <span class="ps-archived">archived</span>' : "") + `</td>` +
@@ -2095,6 +2236,7 @@ document.addEventListener("keydown", (e) => {
   $(id).addEventListener("keydown", (e) => _trapModalTab($(id), e)));
 document.querySelectorAll("#modal .tab").forEach(t => t.onclick = () => selectTab(t.dataset.doc));
 $("project").onchange = onProjectChange;
+$("multi-toggle").onchange = toggleMultiBox;   // F3: cross-project fan-out composer
 $("new-project").onclick = openProjectModal;
 $("project-modal-close").onclick = closeProjectModal;
 $("pm-cancel").onclick = closeProjectModal;
