@@ -23,8 +23,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
     runp = sub.add_parser("run", help="Run a task end-to-end")
     runp.add_argument("prompt", help="The task to perform, in quotes")
-    runp.add_argument("-p", "--project", default=None, metavar="SLUG",
-                      help="Run inside this project (memory, knowledge, and repo checkout)")
+    runp.add_argument("-p", "--project", action="append", default=None, metavar="SLUG",
+                      help="Run inside this project; repeat for a cross-project fan-out")
+    runp.add_argument("--stagger", action="store_true",
+                      help="Fan-out only: run the first project alone so its lessons inform the rest")
     runp.add_argument("--ingest", action="append", default=[], metavar="FILE",
                       help="Ingest a file into the knowledge base first (repeatable)")
     runp.add_argument("-i", "--interactive", action="store_true",
@@ -91,6 +93,35 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "eval":
         return _eval(args)
     return 1
+
+
+def _run_multi(args: argparse.Namespace, settings: Settings, slugs: list[str]) -> int:
+    """Cross-project fan-out (F3): one child task per project, one rollup."""
+    from .orchestration.fanout import run_cross_project
+
+    if settings.requires_api_key and not settings.has_api_key:
+        print("ERROR: ANTHROPIC_API_KEY is not set (required for the 'anthropic' backend).",
+              file=sys.stderr)
+        return 2
+    print(f"Cross-project run across: {', '.join(slugs)}"
+          + (" (staggered)" if args.stagger else ""))
+
+    def on_event(event: Event) -> None:
+        if event.type in ("child_start", "child_done", "status", "brief"):
+            print(f"  {event.message}")
+
+    result = asyncio.run(run_cross_project(
+        settings, args.prompt, slugs, stagger=args.stagger, on_event=on_event))
+    print(f"\n=== ROLLUP ({result['status']}) ===")
+    for c in result["children"]:
+        line = f"  {c['slug']:<24} {c['status']:<10}"
+        if c.get("branch"):
+            line += f" branch {c['branch']}"
+        if c.get("error"):
+            line += f"  ({c['error'][:60]})"
+        print(line)
+    print(f"Docs: {result['docs_dir']}/rollup.md")
+    return 0 if result["status"] == "completed" else 1
 
 
 def _project(args: argparse.Namespace) -> int:
@@ -314,11 +345,14 @@ def _run(args: argparse.Namespace) -> int:
         stream=sys.stderr,
     )
     settings = Settings.load()
-    if getattr(args, "project", None):
+    plist = getattr(args, "project", None) or []
+    if len(plist) > 1:
+        return _run_multi(args, settings, plist)
+    if plist:
         import dataclasses
 
         from . import projects
-        settings = dataclasses.replace(settings, project=projects.resolve(settings, args.project))
+        settings = dataclasses.replace(settings, project=projects.resolve(settings, plist[0]))
         print(f"Project: {settings.project}")
     try:  # apply the active project's policy (F7): task override → policy → defaults
         from . import projects

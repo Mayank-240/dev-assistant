@@ -145,9 +145,16 @@ class RunStore:
         self._conn.commit()
 
     def set_parent(self, run_id: str, parent_id: str) -> None:
-        """Link a run to the task it continues (re-engagement chain)."""
+        """Link a run to the task it continues (re-engagement / fan-out lineage)."""
         self._conn.execute("UPDATE runs SET parent_id = ? WHERE id = ?", (parent_id, run_id))
         self._conn.commit()
+
+    def children_of(self, parent_id: str) -> list[dict[str, Any]]:
+        """Child runs of a cross-project parent (or re-engagement descendants)."""
+        rows = self._conn.execute(
+            "SELECT * FROM runs WHERE parent_id = ? ORDER BY created_at ASC",
+            (parent_id,)).fetchall()
+        return [dict(r) for r in rows]
 
     def set_status(self, run_id: str, status: str) -> None:
         ended = time.time() if status in _TERMINAL else None
