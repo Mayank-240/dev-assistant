@@ -1,7 +1,15 @@
 const $ = (id) => document.getElementById(id);
 
 // Pure helpers live in util.js (loaded first; also unit-tested under Node).
-const { escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine } = window.AdaUtil;
+const {
+  escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine,
+  makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
+  computeBudgetMeter, timelineRows, compareRowModel, isResumable,
+} = window.AdaUtil;
+
+// Respect the user's reduced-motion preference for programmatic scrolling.
+const _reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)");
+const scrollBehavior = () => (_reduceMotion && _reduceMotion.matches ? "auto" : "smooth");
 
 // ---- bearer-token auth (S8) ----
 // When the server has a token configured, attach it to every API call and to the
@@ -54,9 +62,8 @@ const AGENT_STYLE = {
 const agentStyle = (n) => AGENT_STYLE[n] || { color: "#8a8374" };
 const PHASES = ["plan", "execute", "verify", "document", "done"];
 
-const state = {
+const state = Object.assign({
   agents: {},        // subtask id -> card element
-  agentData: {},     // subtask id -> full per-agent record (for the detail popup)
   openAgentId: null, // id of the agent whose detail popup is open (for live updates)
   timer: null,
   startedAt: 0,
@@ -64,7 +71,7 @@ const state = {
   continueFrom: null, // task id being re-engaged (continuation), or null for a fresh task
   budgetUsd: 0,      // budget cap for the run on screen (0 = none -> meter hidden)
   wasQueued: false,  // this task was seen queued -> toast when it actually starts
-};
+}, initialRunAggregates());  // + agentData / timeline / total / reviewed / messages / costUsd / phase
 
 // ---- W5: safe server config (feeds the cost-vs-budget meter's default cap) ----
 let serverConfig = { budget_usd: 0 };
@@ -76,15 +83,15 @@ async function loadConfig() {
 function updateBudgetMeter(cost) {
   const el = $("budget-meter");
   if (!el) return;
-  const budget = Number(state.budgetUsd || 0);
-  if (!budget || budget <= 0) { el.classList.add("hidden"); return; }
+  const m = computeBudgetMeter(cost, state.budgetUsd);
+  if (!m.visible) { el.classList.add("hidden"); return; }
   el.classList.remove("hidden");
-  const c = Number(cost || 0);
-  const pct = Math.min(100, Math.round((c / budget) * 100));
   const fill = $("bm-fill");
-  fill.style.width = pct + "%";
-  fill.className = "bm-fill" + (pct >= 100 ? " over" : pct >= 80 ? " warn" : "");
-  $("bm-text").textContent = fmtCost(c) + " / $" + budget.toFixed(2);
+  fill.style.width = m.pct + "%";
+  fill.className = "bm-fill" + (m.severity ? " " + m.severity : "");
+  const track = el.querySelector(".bm-track");
+  if (track) track.setAttribute("aria-valuenow", String(m.pct));
+  $("bm-text").textContent = m.text;
 }
 
 function setConn(text, cls) {
@@ -103,7 +110,7 @@ function feed(text, cls = "") {
 function setMetricsFrom(data) {
   if ("kg_nodes" in data) $("m-kg").textContent = data.kg_nodes;
   if ("kg_edges" in data) $("m-edges").textContent = data.kg_edges;
-  if ("messages" in data) $("m-msgs").textContent = data.messages;
+  if ("messages" in data) { $("m-msgs").textContent = data.messages; state.messages = Number(data.messages) || 0; }
   if ("memory" in data) $("m-mem").textContent = data.memory;
   if ("cost_usd" in data) $("m-cost").textContent = "$" + Number(data.cost_usd).toFixed(4);
   if ("input_tokens" in data || "output_tokens" in data) {
@@ -141,9 +148,8 @@ function resetRunView(prompt) {
   $("plan-dag").innerHTML = "";
   $("timeline-card").classList.add("hidden");
   $("timeline").innerHTML = "";
-  state.timeline = {};
-  state.agentData = {}; state.openAgentId = null;
-  state.total = 0; state.reviewed = new Set();
+  Object.assign(state, initialRunAggregates());   // timeline / agentData / total / reviewed / messages / costUsd / phase
+  state.openAgentId = null;
   setPhase("plan");
   $("progress-bar").style.width = "0%"; $("progress-label").textContent = "";
   state.agents = {};
@@ -175,8 +181,22 @@ function makeAgentCard(st) {
     <div class="ac-stream"></div>
   `;
   card.title = "Click to see this agent's full activity";
-  card.addEventListener("click", () => openAgentModal(st.id));
+  makeActivatable(card, () => openAgentModal(st.id), `Open activity for subtask ${st.id} · ${st.agent}`);
   return card;
+}
+
+// a11y: let a non-button element behave like a button (focus + Enter/Space).
+function makeActivatable(el, onActivate, label) {
+  el.setAttribute("role", "button");
+  el.tabIndex = 0;
+  if (label) el.setAttribute("aria-label", label);
+  el.addEventListener("click", onActivate);
+  el.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    if (e.target !== el) return;              // don't hijack inner buttons/inputs
+    e.preventDefault();
+    onActivate(e);
+  });
 }
 
 function setAgentState(id, cls, text, score) {
@@ -201,10 +221,11 @@ function setPhase(phase) {
   });
 }
 function updateProgress() {
-  const total = state.total || 0;
-  const done = state.reviewed ? state.reviewed.size : 0;
-  $("progress-bar").style.width = (total ? Math.round((done / total) * 100) : 0) + "%";
-  $("progress-label").textContent = total ? `${done}/${total} subtasks` : "";
+  const p = runProgress(state);
+  $("progress-bar").style.width = p.pct + "%";
+  const track = document.querySelector(".progress-track");
+  if (track) track.setAttribute("aria-valuenow", String(p.pct));
+  $("progress-label").textContent = p.label;
 }
 
 // ---- plan DAG ----
@@ -290,9 +311,42 @@ function setPlanNodeState(id, cls) {
 function flashAgentCard(id) {
   const card = $("agent-" + id);
   if (!card) return;
-  card.scrollIntoView({ behavior: "smooth", block: "center" });
+  card.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
   card.classList.add("flash");
   setTimeout(() => card.classList.remove("flash"), 1000);
+}
+
+// ---- a11y: modal open/close with focus trap, Escape close and focus restore ----
+const _modalReturnFocus = {};   // modal id -> element that had focus before opening
+function _modalFocusables(box) {
+  return [...box.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+    .filter(el => !el.disabled && el.offsetParent !== null);
+}
+function openModalEl(id) {
+  const m = $(id);
+  if (!m) return;
+  if (m.classList.contains("hidden")) _modalReturnFocus[id] = document.activeElement;
+  m.classList.remove("hidden");
+  const box = m.querySelector(".modal-box") || m;
+  const f = _modalFocusables(box);
+  (f.length ? f[0] : box).focus();
+}
+function closeModalEl(id) {
+  const m = $(id);
+  if (!m || m.classList.contains("hidden")) return;
+  m.classList.add("hidden");
+  const back = _modalReturnFocus[id];
+  delete _modalReturnFocus[id];
+  if (back && document.contains(back) && typeof back.focus === "function") back.focus();
+}
+function _trapModalTab(m, e) {
+  if (e.key !== "Tab") return;
+  const box = m.querySelector(".modal-box") || m;
+  const f = _modalFocusables(box);
+  if (!f.length) { e.preventDefault(); box.focus(); return; }
+  const first = f[0], last = f[f.length - 1], active = document.activeElement;
+  if (e.shiftKey && (active === first || !box.contains(active))) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && (active === last || !box.contains(active))) { e.preventDefault(); first.focus(); }
 }
 
 // ---- per-agent detail popup ----
@@ -301,10 +355,10 @@ function openAgentModal(id) {
   if (!a) return;
   state.openAgentId = id;
   renderAgentModal(a);
-  $("agent-modal").classList.remove("hidden");
+  openModalEl("agent-modal");
 }
 function closeAgentModal() {
-  $("agent-modal").classList.add("hidden");
+  closeModalEl("agent-modal");
   state.openAgentId = null;
 }
 function renderAgentModal(a) {
@@ -351,14 +405,8 @@ function renderAgentModal(a) {
       stream.innerHTML = `<div class="muted">No activity recorded yet${status === "queued" ? " — not started." : "."}</div>`;
     }
   } else {
-    stream.innerHTML = a.steps.map(s => {
-      const cls = "as-" + (s.kind || "text");
-      let txt;
-      if (s.kind === "tool") txt = "→ " + (s.tool || "") + (s.input ? " " + s.input : "");
-      else if (s.kind === "thinking") txt = "… " + (s.text || "");
-      else txt = s.text || "";
-      return `<div class="${cls}">${escapeHtml(txt)}</div>`;
-    }).join("");
+    stream.innerHTML = a.steps.map(s =>
+      `<div class="as-${escapeAttr(s.kind || "text")}">${escapeHtml(formatStepLine(s))}</div>`).join("");
     stream.scrollTop = stream.scrollHeight;
   }
 }
@@ -385,11 +433,11 @@ function setContinue(taskId, label) {
   state.continueFrom = taskId;
   $("continue-ref").textContent = label || taskId;
   $("continue-banner").classList.remove("hidden");
-  if (!$("modal").classList.contains("hidden")) $("modal").classList.add("hidden");
+  closeModalEl("modal");
   const p = $("prompt");
   p.placeholder = "What should the assistant do next on this task? e.g. “add error handling and tests”";
   p.focus();
-  p.scrollIntoView({ behavior: "smooth", block: "center" });
+  p.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
 }
 
 function clearContinue() {
@@ -460,6 +508,7 @@ function renderQueue() {
   $("q-concurrency").value = String(queueState.concurrency || 1);
   $("q-pause").textContent = queueState.paused ? "▶" : "⏸";
   $("q-pause").title = queueState.paused ? "Resume queue" : "Pause queue";
+  $("q-pause").setAttribute("aria-label", queueState.paused ? "Resume queue" : "Pause queue");
 
   const sec = $("queue-section"), list = $("queue-list");
   if (!total) { sec.classList.add("hidden"); list.innerHTML = ""; return; }
@@ -469,10 +518,11 @@ function renderQueue() {
   running.forEach(r => {
     const li = document.createElement("li");
     li.className = "q-item q-running";
-    li.innerHTML = `<span class="q-pos">●</span><span class="q-title">${escapeHtml(r.title || r.id)}</span>` +
-      `<span class="q-acts"><button class="q-act q-cancel" title="Cancel run">Cancel</button></span>`;
+    li.innerHTML = `<span class="q-pos" aria-hidden="true">●</span><span class="q-title">${escapeHtml(r.title || r.id)}</span>` +
+      `<span class="q-acts"><button type="button" class="q-act q-cancel" title="Cancel run">Cancel</button></span>`;
     li.querySelector(".q-cancel").onclick = (e) => { e.stopPropagation(); cancelTask(r.id); };
-    li.onclick = (e) => { if (!e.target.closest("button")) attachToRun(r.id, r.title); };
+    makeActivatable(li, (e) => { if (!e.target.closest("button")) attachToRun(r.id, r.title); },
+      `Watch running task ${r.title || r.id}`);
     list.appendChild(li);
   });
 
@@ -483,10 +533,10 @@ function renderQueue() {
     const downDis = i === pending.length - 1 ? "disabled" : "";
     li.innerHTML = `<span class="q-pos">${p.position}</span><span class="q-title">${escapeHtml(p.title || p.id)}</span>` +
       `<span class="q-acts">` +
-      `<button class="q-act q-up" ${upDis} title="Move up">↑</button>` +
-      `<button class="q-act q-down" ${downDis} title="Move down">↓</button>` +
-      `<button class="q-act q-now" title="Run next">Run next</button>` +
-      `<button class="q-act q-remove" title="Remove from queue">✕</button></span>`;
+      `<button type="button" class="q-act q-up" ${upDis} title="Move up" aria-label="Move up in queue">↑</button>` +
+      `<button type="button" class="q-act q-down" ${downDis} title="Move down" aria-label="Move down in queue">↓</button>` +
+      `<button type="button" class="q-act q-now" title="Run next">Run next</button>` +
+      `<button type="button" class="q-act q-remove" title="Remove from queue" aria-label="Remove from queue">✕</button></span>`;
     li.querySelector(".q-now").onclick = () => promoteTask(p.id);
     li.querySelector(".q-remove").onclick = () => removeQueued(p.id);
     const up = li.querySelector(".q-up"), down = li.querySelector(".q-down");
@@ -540,20 +590,15 @@ function showToast(msg, type = "", ms = 4000) {
   setTimeout(() => { el.style.transition = "opacity .3s"; el.style.opacity = "0"; setTimeout(() => el.remove(), 300); }, ms);
 }
 function renderTimeline() {
-  const rows = Object.entries(state.timeline || {});
+  const rows = timelineRows(state.timeline);
   if (!rows.length) return;
-  const starts = rows.map(([, v]) => v.start), ends = rows.map(([, v]) => v.end || v.start);
-  const t0 = Math.min(...starts), t1 = Math.max(...ends), span = Math.max(0.001, t1 - t0);
   const el = $("timeline"); el.innerHTML = "";
-  rows.sort((a, b) => a[1].start - b[1].start).forEach(([id, v]) => {
-    const st = agentStyle(v.agent);
-    const left = ((v.start - t0) / span) * 100;
-    const width = (((v.end || v.start) - v.start) / span) * 100;
-    const dur = (v.end || v.start) - v.start;
+  rows.forEach(r => {
+    const st = agentStyle(r.agent);
     const row = document.createElement("div"); row.className = "tl-row";
-    row.innerHTML = `<span class="tl-label"><span class="tl-dot" style="background:${st.color}"></span>${escapeHtml(id)} · ${escapeHtml(v.agent)}</span>` +
-      `<div class="tl-track"><div class="tl-bar" style="left:${left}%;width:${Math.max(width, 1)}%;background:${st.color}"></div></div>` +
-      `<span class="tl-dur">${dur.toFixed(1)}s</span>`;
+    row.innerHTML = `<span class="tl-label"><span class="tl-dot" style="background:${st.color}" aria-hidden="true"></span>${escapeHtml(r.id)} · ${escapeHtml(r.agent)}</span>` +
+      `<div class="tl-track" aria-hidden="true"><div class="tl-bar" style="left:${r.leftPct}%;width:${r.widthPct}%;background:${st.color}"></div></div>` +
+      `<span class="tl-dur">${escapeHtml(r.durLabel)}</span>`;
     el.appendChild(row);
   });
 }
@@ -567,6 +612,7 @@ function noteQueuedStart() {
 
 function handleEvent(ev) {
   const d = ev.data || {};
+  reduceRunEvent(state, ev);   // pure aggregation (util.js) — the switch below only touches the DOM
   switch (ev.type) {
     case "status":
       noteQueuedStart();
@@ -602,34 +648,20 @@ function handleEvent(ev) {
       (d.subtasks || []).forEach(st => {
         $("agents").appendChild(makeAgentCard(st));
         state.agents[st.id] = true;
-        state.agentData[st.id] = {
-          id: st.id, agent: st.agent, title: st.title || "",
-          depends_on: st.depends_on || [], status: "queued",
-          score: null, passed: null, attempts: null, reasons: [],
-          steps: [], result: null, start: null, end: null,
-        };
       });
-      $("m-agents").textContent = (d.subtasks || []).length;
-      state.total = (d.subtasks || []).length;
-      state.reviewed = new Set();
+      $("m-agents").textContent = state.total;
       renderPlanDag(d.subtasks || []);
       setPhase("execute");
       updateProgress();
       feed(ev.message);
       break;
-    case "subtask_start": {
+    case "subtask_start":
       setAgentState(d.id, "running", "running");
       setPlanNodeState(d.id, "running");
-      if (!state.timeline[d.id]) state.timeline[d.id] = { agent: d.agent, start: ev.ts, end: ev.ts };
-      const a = state.agentData[d.id];
-      if (a) { a.status = "running"; a.start = ev.ts; }
       if (state.openAgentId === d.id) renderAgentModal(state.agentData[d.id]);
       feed("▶ " + ev.message);
       break;
-    }
     case "agent_step": {
-      const a = state.agentData[d.id];
-      if (a) a.steps.push({ kind: d.kind || "text", tool: d.tool, input: d.input, text: d.text });
       if (state.openAgentId === d.id) renderAgentModal(state.agentData[d.id]);
       const card = $("agent-" + d.id);
       if (!card) break;
@@ -637,38 +669,23 @@ function handleEvent(ev) {
       if (!stream) break;
       const line = document.createElement("div");
       line.className = "as-" + (d.kind || "text");
-      if (d.kind === "tool") line.textContent = "→ " + d.tool + (d.input ? " " + d.input : "");
-      else if (d.kind === "thinking") line.textContent = "… " + (d.text || "");
-      else line.textContent = d.text || "";
+      line.textContent = formatStepLine(d);
       stream.appendChild(line);
       while (stream.childElementCount > 6) stream.removeChild(stream.firstChild);
       stream.scrollTop = stream.scrollHeight;
       break;
     }
-    case "subtask_review": {
+    case "subtask_review":
       setAgentState(d.id, d.passed ? "passed" : "failed", d.passed ? "passed" : "failed", d.score);
       setPlanNodeState(d.id, d.passed ? "passed" : "failed");
-      if (state.timeline[d.id]) state.timeline[d.id].end = ev.ts;
-      if (state.reviewed) state.reviewed.add(d.id);
-      const a = state.agentData[d.id];
-      if (a) {
-        a.status = d.passed ? "passed" : "failed";
-        a.passed = d.passed; a.score = d.score;
-        a.attempts = d.attempts ?? a.attempts;
-        a.reasons = d.reasons || [];
-        if (d.result) a.result = d.result;
-        a.end = ev.ts;
-      }
-      if (a) { a.objective_note = d.objective_note || ""; a.cost = d.cost || null; }
       if (state.openAgentId === d.id) renderAgentModal(state.agentData[d.id]);
       updateProgress();
       setMetricsFrom(d);
       if ("cost_usd" in d) updateBudgetMeter(d.cost_usd);
       feed((d.passed ? "✓ " : "✗ ") + ev.message + (d.objective_note ? "  ·  " + d.objective_note : ""));
       break;
-    }
     case "message":
-      $("m-msgs").textContent = (parseInt($("m-msgs").textContent) || 0) + 1;
+      $("m-msgs").textContent = state.messages;
       feed("✉ " + d.sender + " → " + (d.recipient || "all") + ": " + d.content, "msg");
       break;
     case "sessions":
@@ -681,13 +698,9 @@ function handleEvent(ev) {
       showToast("⚠ " + (ev.message || "Budget exceeded"), "warn", 7000);
       feed("⚠ " + ev.message);
       break;
-    case "diff": {
-      const added = (d.added || []).length, mod = (d.modified || []).length;
-      feed(`✎ ${d.id}: +${added} file(s), ~${mod} changed`);
-      const a = state.agentData[d.id];
-      if (a) a.diff = { added: d.added || [], modified: d.modified || [] };
+    case "diff":
+      feed(`✎ ${d.id}: +${(d.added || []).length} file(s), ~${(d.modified || []).length} changed`);
       break;
-    }
     case "git":
       showToast("⎇ " + (ev.message || "Committed to a branch"), "success", 6000);
       feed("⎇ " + ev.message);
@@ -830,9 +843,9 @@ async function renderPlanEditor(plan) {
     row.className = "pe-row";
     const opts = names.map(n => `<option value="${escapeAttr(n)}"${n === st.agent ? " selected" : ""}>${escapeHtml(n)}</option>`).join("");
     row.innerHTML = `<span class="chip">${escapeHtml(st.id)}</span>` +
-      `<input class="pe-title" value="${escapeAttr(st.title)}" />` +
-      `<span class="pe-agent-wrap"><span class="pe-dot" style="background:${agentStyle(st.agent).color}"></span><select class="pe-agent">${opts}</select></span>` +
-      `<button class="pe-remove" title="Remove step">✕</button>`;
+      `<input class="pe-title" value="${escapeAttr(st.title)}" aria-label="Title for step ${escapeAttr(st.id)}" />` +
+      `<span class="pe-agent-wrap"><span class="pe-dot" style="background:${agentStyle(st.agent).color}" aria-hidden="true"></span><select class="pe-agent" aria-label="Agent for step ${escapeAttr(st.id)}">${opts}</select></span>` +
+      `<button type="button" class="pe-remove" title="Remove step" aria-label="Remove step ${escapeAttr(st.id)}">✕</button>`;
     const _sel = row.querySelector(".pe-agent"), _dot = row.querySelector(".pe-dot");
     _sel.onchange = () => { _dot.style.background = agentStyle(_sel.value).color; };
     row.querySelector(".pe-remove").onclick = () => row.remove();
@@ -987,15 +1000,18 @@ async function loadRecent() {
                    `${cost ? `<span class="r-cost">${cost}</span>` : ""}${tests}</div>`;
       const titleText = it.title || it.tldr || it.id;
       const cancelBtn = it.status === "running"
-        ? `<button class="r-act r-cancel" title="Cancel this run">Cancel</button>` : "";
+        ? `<button type="button" class="r-act r-cancel" title="Cancel this run">Cancel</button>` : "";
       // W5: retry/resume affordance on runs that stopped short of completion
-      const resumeBtn = RESUMABLE_STATUSES.has(it.status)
-        ? `<button class="r-act r-resume" title="Retry / resume this run">Resume</button>` : "";
+      const resumeBtn = isResumable(it.status)
+        ? `<button type="button" class="r-act r-resume" title="Retry / resume this run">Resume</button>` : "";
       li.innerHTML = `<div class="r-title">${escapeHtml(titleText)}</div>` +
         (it.tldr ? `<div class="r-tldr">${escapeHtml(it.tldr)}</div>` : "") +
-        `${meta}<div class="r-actions"><span class="r-files">Files →</span>` +
-        `${cancelBtn}${resumeBtn}<button class="r-act r-delete" title="Delete this task">Delete</button></div>`;
-      li.onclick = () => { if (it.status === "running") attachToRun(it.id, it.prompt); else openTask(it.id, it); };
+        `${meta}<div class="r-actions"><button type="button" class="r-files">Files →</button>` +
+        `${cancelBtn}${resumeBtn}<button type="button" class="r-act r-delete" title="Delete this task">Delete</button></div>`;
+      makeActivatable(li, (e) => {
+        if (e && e.target && e.target.closest("button")) return;
+        if (it.status === "running") attachToRun(it.id, it.prompt); else openTask(it.id, it);
+      }, `Open task ${titleText}`);
       li.querySelector(".r-files").onclick = (e) => {
         e.stopPropagation();
         switchView("files");
@@ -1010,9 +1026,6 @@ async function loadRecent() {
     });
   } catch (e) { /* ignore */ }
 }
-
-// W5: statuses a stopped run may be retried/resumed from (mirrors the server's gate)
-const RESUMABLE_STATUSES = new Set(["interrupted", "failed", "over_budget", "cancelled", "partial"]);
 
 async function resumeTask(id, title) {
   let resp;
@@ -1087,11 +1100,15 @@ async function openDocs(id) {
     currentDocs = await (await fetch("/api/tasks/" + id)).json();
   } catch (e) { return; }
   currentDocsId = id;
-  $("modal").classList.remove("hidden");
+  openModalEl("modal");
   selectTab("brief");
 }
 function selectTab(which) {
-  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.doc === which));
+  document.querySelectorAll(".tab").forEach(t => {
+    const on = t.dataset.doc === which;
+    t.classList.toggle("active", on);
+    t.setAttribute("aria-selected", on ? "true" : "false");
+  });
   if (which === "diff") { renderDiffTab(); return; }
   $("modal-content").textContent = (currentDocs && currentDocs[which]) || "(empty)";
 }
@@ -1190,13 +1207,9 @@ async function openTask(id, meta) {
   $("agents-title").classList.remove("hidden");
   subtasks.forEach(st => {
     $("agents").appendChild(makeAgentCard(st));
-    state.agentData[st.id] = {
-      id: st.id, agent: st.agent, title: st.title || "",
-      depends_on: st.depends_on || [], status: "queued",
-      score: null, passed: null, attempts: null, reasons: [],
+    state.agentData[st.id] = Object.assign(makeAgentRecord(st), {
       steps: (docs.activity && docs.activity[st.id]) || [],
-      result: null, start: null, end: null,
-    };
+    });
   });
   $("m-agents").textContent = subtasks.length;
   renderPlanDag(subtasks);
@@ -1260,7 +1273,11 @@ const VIEWS = { run: "view-run", agents: "view-agents", memory: "view-memory", g
 
 function switchView(name) {
   currentView = name;
-  document.querySelectorAll(".vtab").forEach(b => b.classList.toggle("active", b.dataset.view === name));
+  document.querySelectorAll(".vtab").forEach(b => {
+    const on = b.dataset.view === name;
+    b.classList.toggle("active", on);
+    if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+  });
   Object.entries(VIEWS).forEach(([n, id]) => $(id).classList.toggle("hidden", n !== name));
   if (name === "agents") loadAgents();
   if (name === "memory") loadMemory();
@@ -1298,25 +1315,13 @@ async function compareRuns() {
     data = await resp.json();
     if (!resp.ok || data.error) { el.textContent = "Compare failed: " + (data.error || ("HTTP " + resp.status)); return; }
   } catch (e) { el.textContent = "Compare failed: " + e; return; }
-  const rows = [
-    ["Status", r => (r.status || "—") + (r.run_status && r.run_status !== r.status ? " · " + r.run_status : "")],
-    ["Quality", r => r.quality_score != null ? r.quality_score + "/100" : "—"],
-    ["Subtasks passed", r => (r.subtasks_passed != null && r.subtasks_total != null)
-      ? r.subtasks_passed + "/" + r.subtasks_total : "—"],
-    ["Tests", r => r.tests || "—"],
-    ["Cost", r => r.cost_usd != null ? fmtCost(r.cost_usd) : "—"],
-    ["Tokens", r => (r.input_tokens != null || r.output_tokens != null)
-      ? fmtTok(r.input_tokens || 0) + " in + " + fmtTok(r.output_tokens || 0) + " out" : "—"],
-    ["Duration", r => fmtDuration(r.duration_s)],
-    ["Sessions", r => r.sessions_spawned != null
-      ? r.sessions_spawned + " spawned · " + (r.sessions_reaped || 0) + " reaped" : "—"],
-  ];
+  const rows = compareRowModel(data.a, data.b);
   el.innerHTML =
-    `<table class="cmp-table"><thead><tr><th></th>` +
-    `<th>${escapeHtml(data.a.title || data.a.id)}</th>` +
-    `<th>${escapeHtml(data.b.title || data.b.id)}</th></tr></thead><tbody>` +
-    rows.map(([label, f]) =>
-      `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(f(data.a))}</td><td>${escapeHtml(f(data.b))}</td></tr>`).join("") +
+    `<table class="cmp-table"><thead><tr><th scope="col"></th>` +
+    `<th scope="col">${escapeHtml(data.a.title || data.a.id)}</th>` +
+    `<th scope="col">${escapeHtml(data.b.title || data.b.id)}</th></tr></thead><tbody>` +
+    rows.map(r =>
+      `<tr><td>${escapeHtml(r.label)}</td><td>${escapeHtml(r.a)}</td><td>${escapeHtml(r.b)}</td></tr>`).join("") +
     `</tbody></table>`;
 }
 
@@ -1414,7 +1419,7 @@ async function loadAgents() {
         <div class="ac-desc">${escapeHtml(a.description)}</div>
         <div class="ac-when">${escapeHtml(a.when_to_use)}</div>
         <div class="tool-chips">${a.tools.map(t => `<span class="tool-chip">${escapeHtml(t)}</span>`).join("")}</div>`;
-      card.addEventListener("click", () => openRosterModal(a.name));
+      makeActivatable(card, () => openRosterModal(a.name), `Open profile for agent ${a.name}`);
       wrap.appendChild(card);
     });
     agentsLoaded = true;
@@ -1430,9 +1435,9 @@ function openRosterModal(name) {
   $("rm-desc").textContent = a.description || "";
   $("rm-when").textContent = a.when_to_use || "—";
   $("rm-tools").innerHTML = a.tools.map(t => `<span class="tool-chip">${escapeHtml(t)}</span>`).join("") || '<span class="muted">none</span>';
-  $("roster-modal").classList.remove("hidden");
+  openModalEl("roster-modal");
 }
-function closeRosterModal() { $("roster-modal").classList.add("hidden"); }
+function closeRosterModal() { closeModalEl("roster-modal"); }
 
 // ---- Memory ----
 async function loadMemory() {
@@ -1527,7 +1532,7 @@ function renderGraph() {
 function showNode(n, facts) {
   const taskEdge = (graphData.edges || []).find(e => e.relation === "produced_file" && e.target === n.id);
   const extra = taskEdge
-    ? `<div class="open-file" data-task="${escapeAttr(taskEdge.source)}" data-path="${escapeAttr(n.id)}">Open in Files →</div>`
+    ? `<button type="button" class="open-file" data-task="${escapeAttr(taskEdge.source)}" data-path="${escapeAttr(n.id)}">Open in Files →</button>`
     : "";
   $("node-detail").classList.remove("muted");
   $("node-detail").innerHTML = `<b>${escapeHtml(n.id)}</b> <span class="muted">(${n.type})</span><br>` +
@@ -1619,7 +1624,7 @@ async function renderFileList() {
     const li = document.createElement("li");
     li.className = "file";
     li.innerHTML = `${escapeHtml(it.path)}<span class="f-size">${fmtSize(it.size)}</span>`;
-    li.onclick = () => selectFile(it.path, li);
+    makeActivatable(li, () => selectFile(it.path, li), `View file ${it.path}`);
     ul.appendChild(li);
   });
 }
@@ -1661,18 +1666,21 @@ $("files-task").onchange = () => { filesTask = $("files-task").value; renderFile
 $("refresh").onclick = loadRecent;
 $("prompt").addEventListener("keydown", (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") runTask(); });
 $("docs-link").onclick = (e) => { e.preventDefault(); if (state.docsId) openDocs(state.docsId); };
-$("modal-close").onclick = () => $("modal").classList.add("hidden");
-$("modal").onclick = (e) => { if (e.target === $("modal")) $("modal").classList.add("hidden"); };
+$("modal-close").onclick = () => closeModalEl("modal");
+$("modal").onclick = (e) => { if (e.target === $("modal")) closeModalEl("modal"); };
 $("agent-modal-close").onclick = closeAgentModal;
 $("agent-modal").onclick = (e) => { if (e.target === $("agent-modal")) closeAgentModal(); };
 $("roster-modal-close").onclick = closeRosterModal;
 $("roster-modal").onclick = (e) => { if (e.target === $("roster-modal")) closeRosterModal(); };
+// a11y: Escape closes the topmost dialog; Tab is trapped inside an open dialog
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!$("roster-modal").classList.contains("hidden")) closeRosterModal();
   else if (!$("agent-modal").classList.contains("hidden")) closeAgentModal();
-  else if (!$("modal").classList.contains("hidden")) $("modal").classList.add("hidden");
+  else closeModalEl("modal");
 });
+["modal", "agent-modal", "roster-modal"].forEach(id =>
+  $(id).addEventListener("keydown", (e) => _trapModalTab($(id), e)));
 document.querySelectorAll(".tab").forEach(t => t.onclick = () => selectTab(t.dataset.doc));
 $("project").onchange = onProjectChange;
 $("new-project").onclick = createProject;

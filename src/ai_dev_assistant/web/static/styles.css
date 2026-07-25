@@ -11,7 +11,8 @@
   --mono: 'JetBrains Mono', ui-monospace, monospace;
   --bg:#f1efe8; --surface:#faf9f5; --surface-2:#f5f3ec; --elev:#ffffff;
   --border:#e7e1d5; --border-2:#d8d1c3;
-  --text:#2a2620; --text-2:#5d574c; --muted:#948d7e;
+  /* a11y: muted darkened from #948d7e for >=4.5:1 contrast on the light surfaces */
+  --text:#2a2620; --text-2:#5d574c; --muted:#756e60;
   --accent-base:#2f7d5e; --accent:var(--accent-base);
   --accent-soft:color-mix(in srgb, var(--accent) 13%, var(--surface));
   --accent-text:color-mix(in srgb, var(--accent) 70%, var(--text));
@@ -43,6 +44,19 @@ body {
 .muted { color:var(--muted); }
 button, input, select, textarea { font-family:inherit; }
 a { color:var(--accent-text); }
+
+/* a11y: visible keyboard-focus ring everywhere (mouse clicks stay outline-free) */
+:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.modal-box:focus { outline:none; }
+
+/* a11y: honor the OS "reduce motion" preference */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration:.01ms !important;
+    animation-iteration-count:1 !important;
+    transition-duration:.01ms !important;
+  }
+}
 
 ::-webkit-scrollbar { width:11px; height:11px; }
 ::-webkit-scrollbar-thumb { background:var(--border-2); border-radius:8px; border:3px solid transparent; background-clip:content-box; }
@@ -226,7 +240,8 @@ body.resizing .sidebar { transition:none; }
 .r-tests-pass { font-family:var(--mono); font-size:10px; color:var(--accent-text); }
 .r-tests-fail { font-family:var(--mono); font-size:10px; color:var(--danger); }
 .r-actions { margin-top:7px; display:flex; align-items:center; gap:12px; }
-.r-files { font-family:var(--mono); font-size:10.5px; color:var(--accent-text); cursor:pointer; }
+/* now a real <button> (a11y) — reset chrome, keep the link look */
+.r-files { padding:0; border:0; background:transparent; font-family:var(--mono); font-size:10.5px; color:var(--accent-text); cursor:pointer; }
 .r-files:hover { text-decoration:underline; }
 .r-act { margin-left:auto; padding:0; border:0; background:transparent; font-family:var(--mono); font-size:10.5px; color:var(--muted); cursor:pointer; }
 .r-act + .r-act { margin-left:0; }
@@ -442,7 +457,8 @@ body.resizing .sidebar { transition:none; }
 .legend i { width:9px; height:9px; border-radius:50%; display:inline-block; }
 .node-detail { margin-top:14px; padding:15px; background:var(--surface); border:1px solid var(--border); border-radius:13px; box-shadow:var(--shadow); font-size:12.5px; line-height:1.6; color:var(--text-2); }
 .node-detail b { color:var(--text); }
-.open-file { margin-top:8px; font-family:var(--mono); font-size:11px; color:var(--accent-text); cursor:pointer; }
+/* now a real <button> (a11y) — reset chrome, keep the link look */
+.open-file { display:block; margin-top:8px; padding:0; border:0; background:transparent; font-family:var(--mono); font-size:11px; color:var(--accent-text); cursor:pointer; }
 .open-file:hover { text-decoration:underline; }
 
 /* ---------- files ---------- */
@@ -504,11 +520,13 @@ body.resizing .sidebar { transition:none; }
 /* ===== Tier 5 additions: pause/steer, feedback, dashboard ===== */
 .pill-warn { background:color-mix(in srgb,#f59e0b 16%,transparent); color:#b45309; border-color:color-mix(in srgb,#f59e0b 35%,transparent); }
 .pill-warn::before { background:#f59e0b; }
+/* a11y: #b45309 is too dim on the dark background — lift it there */
+[data-theme="dark"] .pill-warn { color:#f0b269; }
 
 .feedback-box { margin-top:14px; padding-top:14px; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:8px; }
 .fb-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
 .fb-stars { display:inline-flex; gap:2px; }
-.fb-stars button { background:none; border:none; cursor:pointer; font-size:20px; line-height:1; color:var(--border); padding:0 1px; }
+.fb-stars button { background:none; border:none; cursor:pointer; font-size:20px; line-height:1; color:var(--border-2); padding:0 1px; }
 .fb-stars button.on, .fb-stars button:hover { color:#f59e0b; }
 
 .dash-metrics { margin-bottom:16px; }
@@ -524,6 +542,7 @@ body.resizing .sidebar { transition:none; }
 .pe-refine .title-input { flex:1; margin:0; }
 #refine-btn { white-space:nowrap; }
 #pe-warning { color:#b45309; margin-top:6px; }
+[data-theme="dark"] #pe-warning { color:var(--warn); }  /* a11y: contrast on dark */
 
 /* ===== Re-engage (continue a completed task) ===== */
 .continue-banner { display:flex; align-items:center; justify-content:space-between; gap:8px;
