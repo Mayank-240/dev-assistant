@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 import threading
 import time
@@ -18,10 +19,20 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Settings
-from .embeddings import get_embedder
+from .embeddings import _tokenize, get_embedder
 from .vector import VectorStore
 
 _HALF_LIFE_S = 14 * 24 * 3600.0  # recall relevance halves after ~two weeks
+_DEFAULT_MAX_ENTRIES = 5000      # growth cap per store; override via ADA_MEMORY_MAX_ENTRIES
+
+
+def _max_entries() -> int:
+    # Read at call time (not import time) so tests/ops can adjust without a restart.
+    # ADA_-prefixed knob with a safe default; 0 or negative disables the cap.
+    try:
+        return int(os.getenv("ADA_MEMORY_MAX_ENTRIES", "") or _DEFAULT_MAX_ENTRIES)
+    except ValueError:
+        return _DEFAULT_MAX_ENTRIES
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory (
@@ -70,6 +81,13 @@ class MemoryStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        try:
+            # WAL lets concurrent runs read while another writes; busy_timeout waits out
+            # a sibling's write lock instead of raising "database is locked".
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+        except sqlite3.DatabaseError:
+            pass  # e.g. read-only or exotic filesystems — degrade to defaults
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._lock = threading.RLock()
@@ -105,10 +123,35 @@ class MemoryStore:
                 "INSERT INTO memory(scope, key, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
                 (scope, key, content, json.dumps(metadata or {}), time.time()),
             )
-            self._conn.commit()
             mem_id = int(cur.lastrowid)
+            self._enforce_cap_locked()
+            self._conn.commit()
         self.vectors.add(f"memory:{scope}", str(mem_id), content)
         return mem_id
+
+    def _enforce_cap_locked(self) -> None:
+        """Keep the store under ADA_MEMORY_MAX_ENTRIES by evicting overflow.
+
+        Eviction order is oldest-first — with the recency half-life applied at recall
+        time, the oldest entries are exactly the lowest decayed-relevance ones. Their
+        vectors are dropped too so search never returns a dangling ref.
+        """
+        cap = _max_entries()
+        if cap <= 0:
+            return
+        n = int(self._conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0])
+        if n <= cap:
+            return
+        rows = self._conn.execute(
+            "SELECT id, scope FROM memory ORDER BY created_at ASC, id ASC LIMIT ?",
+            (n - cap,),
+        ).fetchall()
+        for row in rows:
+            self._conn.execute("DELETE FROM memory WHERE id = ?", (row["id"],))
+            self._conn.execute(
+                "DELETE FROM vectors WHERE namespace = ? AND ref_id = ?",
+                (f"memory:{row['scope']}", str(row["id"])),
+            )
 
     def remember_unique(
         self,
@@ -130,8 +173,9 @@ class MemoryStore:
 
     def recall(self, scope: str, query: str, top_k: int = 5,
                min_score: float = 0.0, decay: bool = False) -> list[MemoryEntry]:
-        # Over-fetch so re-ranking by recency has something to work with.
-        hits = self.vectors.search(f"memory:{scope}", query, top_k=top_k * 3, min_score=min_score)
+        # Hybrid (cosine + lexical) retrieval; over-fetch so re-ranking by recency
+        # has something to work with.
+        hits = self.vectors.search_hybrid(f"memory:{scope}", query, top_k=top_k * 3, min_score=min_score)
         entries: list[MemoryEntry] = []
         for ref_id, score, _text in hits:
             row = self._conn.execute("SELECT * FROM memory WHERE id = ?", (int(ref_id),)).fetchone()
@@ -184,6 +228,14 @@ class MemoryStore:
         )
 
 
+def _near_duplicate(a: set[str], b: set[str], threshold: float = 0.9) -> bool:
+    """Near-identical by normalized-token Jaccard (casing/punctuation-insensitive)."""
+    if not a or not b:
+        return a == b
+    union = len(a | b)
+    return union > 0 and len(a & b) / union >= threshold
+
+
 class ScopedMemory:
     """Memory view over a project store + the shared global store.
 
@@ -221,7 +273,19 @@ class ScopedMemory:
         merged = (self.project.recall(scope, query, top_k=top_k, min_score=min_score, decay=decay)
                   + self.glob.recall(scope, query, top_k=top_k, min_score=min_score, decay=decay))
         merged.sort(key=lambda e: (e.score if e.score is not None else 0.0), reverse=True)
-        return merged[:top_k]
+        # Dedupe near-identical lessons across the two stores before filling top_k —
+        # otherwise a lesson duplicated project+global eats two of the k slots.
+        kept: list[MemoryEntry] = []
+        kept_tokens: list[set[str]] = []
+        for entry in merged:
+            tokens = set(_tokenize(entry.content))
+            if any(_near_duplicate(tokens, seen) for seen in kept_tokens):
+                continue
+            kept.append(entry)
+            kept_tokens.append(tokens)
+            if len(kept) >= top_k:
+                break
+        return kept
 
     def recent(self, scope: str, limit: int = 10) -> list[MemoryEntry]:
         return self.project.recent(scope, limit)

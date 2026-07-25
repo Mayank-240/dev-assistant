@@ -8,16 +8,25 @@ Hardening:
   - a dimension mismatch (e.g. a fastembed→hash fallback mid-project) is skipped instead
     of crashing the dot product,
   - ``min_score`` lets callers drop weak matches rather than always returning top_k.
+
+Retrieval comes in two flavors:
+  - ``search``:        pure cosine (kept score-stable for dedup thresholds like 0.92),
+  - ``search_hybrid``: cosine + lexical (idf-weighted token overlap) fused with
+    reciprocal-rank fusion — dependency-free and useful with both embedder kinds,
+    since lessons are short sentences where lexical matching helps a lot.
 """
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import threading
 
 import numpy as np
 
-from .embeddings import Embedder
+from .embeddings import Embedder, _tokenize
+
+_RRF_K = 60  # standard reciprocal-rank-fusion damping constant
 
 
 class VectorStore:
@@ -58,19 +67,20 @@ class VectorStore:
     def search_vector(
         self, namespace: str, query_vec: np.ndarray, top_k: int = 5, min_score: float = 0.0
     ) -> list[tuple[str, float, str]]:
+        q = np.asarray(query_vec, dtype="float32")
+        # Filter dimension in SQL: rows written under a different embedding model can
+        # never match, so don't even pull them off disk.
         rows = self._conn.execute(
-            "SELECT ref_id, vector, dim, text FROM vectors WHERE namespace = ?", (namespace,)
+            "SELECT ref_id, vector, text FROM vectors WHERE namespace = ? AND dim = ?",
+            (namespace, int(q.shape[0])),
         ).fetchall()
         if not rows:
             return []
 
-        q = np.asarray(query_vec, dtype="float32")
         q_norm = float(np.linalg.norm(q)) or 1.0
 
         scored: list[tuple[str, float, str]] = []
         for row in rows:
-            if int(row["dim"]) != q.shape[0]:
-                continue  # embedding-model mismatch — skip rather than crash the dot product
             vec = np.frombuffer(row["vector"], dtype="float32")
             denom = (float(np.linalg.norm(vec)) or 1.0) * q_norm
             score = float(np.dot(vec, q) / denom)
@@ -79,3 +89,66 @@ class VectorStore:
 
         scored.sort(key=lambda item: item[1], reverse=True)
         return scored[:top_k]
+
+    def search_hybrid(self, namespace: str, query: str, top_k: int = 5,
+                      min_score: float = 0.0) -> list[tuple[str, float, str]]:
+        """Cosine + lexical retrieval fused by reciprocal-rank fusion.
+
+        The lexical leg scores each stored text by idf-weighted coverage of the query's
+        tokens (a normalized BM25-ish overlap in [0, 1]). Ranking fuses both legs via
+        RRF; the *reported* score is ``max(cosine, lexical)`` so it stays comparable to
+        the cosine-scale ``min_score`` thresholds callers already use.
+        """
+        rows = self._conn.execute(
+            "SELECT ref_id, vector, dim, text FROM vectors WHERE namespace = ?", (namespace,)
+        ).fetchall()
+        if not rows:
+            return []
+
+        q = np.asarray(self._embedder.embed([query])[0], dtype="float32")
+        q_norm = float(np.linalg.norm(q)) or 1.0
+
+        texts: dict[str, str] = {}
+        cos: dict[str, float] = {}
+        doc_tokens: dict[str, set[str]] = {}
+        for row in rows:
+            ref = row["ref_id"]
+            texts[ref] = row["text"] or ""
+            doc_tokens[ref] = set(_tokenize(texts[ref]))
+            if int(row["dim"]) == q.shape[0]:  # dim mismatch → lexical leg only
+                vec = np.frombuffer(row["vector"], dtype="float32")
+                denom = (float(np.linalg.norm(vec)) or 1.0) * q_norm
+                cos[ref] = float(np.dot(vec, q) / denom)
+
+        # Lexical leg: idf-weighted share of the query's informative tokens each doc covers.
+        q_tokens = set(_tokenize(query))
+        n_docs = len(rows)
+        lex: dict[str, float] = {}
+        if q_tokens:
+            idf = {}
+            for tok in q_tokens:
+                df = sum(1 for toks in doc_tokens.values() if tok in toks)
+                idf[tok] = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+            denom_idf = sum(idf.values()) or 1.0
+            for ref, toks in doc_tokens.items():
+                lex[ref] = sum(idf[t] for t in q_tokens & toks) / denom_idf
+        else:
+            lex = {ref: 0.0 for ref in texts}
+
+        cos_rank = {r: i for i, r in enumerate(sorted(cos, key=lambda r: (-cos[r], r)))}
+        lex_hits = [r for r in lex if lex[r] > 0.0]
+        lex_rank = {r: i for i, r in enumerate(sorted(lex_hits, key=lambda r: (-lex[r], r)))}
+
+        fused: list[tuple[float, float, str]] = []
+        for ref in texts:
+            rrf = 0.0
+            if ref in cos_rank:
+                rrf += 1.0 / (_RRF_K + cos_rank[ref] + 1)
+            if ref in lex_rank:
+                rrf += 1.0 / (_RRF_K + lex_rank[ref] + 1)
+            combined = max(cos.get(ref, 0.0), lex.get(ref, 0.0))
+            if combined >= min_score:
+                fused.append((rrf, combined, ref))
+
+        fused.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        return [(ref, combined, texts[ref]) for _rrf, combined, ref in fused[:top_k]]

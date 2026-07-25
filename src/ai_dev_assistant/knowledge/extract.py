@@ -8,6 +8,7 @@ graph from a task/agent skeleton into an actual map of the produced code.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 from .graph import KnowledgeGraph
@@ -15,6 +16,60 @@ from .graph import KnowledgeGraph
 _SKIP_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "dist", "build"}
 _MAX_FILES = 80
 _MAX_DEFS_PER_FILE = 50
+
+
+def parse_python_outline(
+    text: str, *, max_symbols: int = 50
+) -> tuple[list[tuple[str, str]], list[tuple[str, int]]]:
+    """Outline a Python source: top-level symbols and imports, via ``ast`` (no LLM).
+
+    Returns ``(symbols, imports)`` where symbols are ``(name, kind)`` for top-level
+    functions/classes and imports are ``(dotted_module, relative_level)`` —
+    ``level`` is 0 for absolute imports, ≥1 for ``from . import x`` style.
+    """
+    try:
+        tree = ast.parse(text)
+    except Exception:
+        return [], []
+    symbols: list[tuple[str, str]] = []
+    for node in tree.body:
+        if len(symbols) >= max_symbols:
+            break
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            symbols.append((node.name, "function"))
+        elif isinstance(node, ast.ClassDef):
+            symbols.append((node.name, "class"))
+    imports: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend((alias.name, 0) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imports.append((node.module or "", node.level or 0))
+    return symbols, imports
+
+
+# Light JS/TS outline — regex, not a parser (tree-sitter isn't available here).
+_JS_PATTERNS = (
+    (re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)", re.M), "function"),
+    (re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)", re.M), "class"),
+    (re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)\n]*\)|[A-Za-z_$][\w$]*)\s*=>", re.M), "function"),
+    (re.compile(r"^\s*export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)", re.M), "const"),
+)
+
+
+def parse_js_outline(text: str, *, max_symbols: int = 50) -> list[tuple[str, str]]:
+    """Top-level-ish ``(name, kind)`` symbols for JS/TS/JSX/TSX via light regex."""
+    seen: set[str] = set()
+    symbols: list[tuple[str, str]] = []
+    for pattern, kind in _JS_PATTERNS:
+        for match in pattern.finditer(text):
+            name = match.group(1)
+            if name not in seen:
+                seen.add(name)
+                symbols.append((name, kind))
+                if len(symbols) >= max_symbols:
+                    return symbols
+    return symbols
 
 
 def enrich_kg_from_workspace(kg: KnowledgeGraph, workspace: Path, run_id: str) -> int:

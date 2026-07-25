@@ -1,3 +1,5 @@
+from ai_dev_assistant.config import Settings
+from ai_dev_assistant.memory.embeddings import active_embedder_name, get_embedder
 from ai_dev_assistant.memory.store import MemoryStore
 
 
@@ -27,3 +29,16 @@ def test_blackboard_roundtrip():
     mem.blackboard_put("k", "v", author="coder")
     assert mem.blackboard_get("k") == "v"
     assert mem.blackboard_all() == {"k": "v"}
+
+
+def test_get_embedder_is_a_process_wide_singleton():
+    settings = Settings(embeddings_backend="hash")
+    first = get_embedder(settings)
+    second = get_embedder(settings)
+    assert first is second, "repeat construction must reuse the cached embedder"
+
+
+def test_active_embedder_name_reports_backend():
+    settings = Settings(embeddings_backend="hash")
+    get_embedder(settings)
+    assert active_embedder_name() == "hash"
