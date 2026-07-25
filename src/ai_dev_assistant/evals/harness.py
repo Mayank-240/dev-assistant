@@ -5,9 +5,13 @@ produced workspace with deterministic graders and emits a Scorecard (pass/fail, 
 wall-time, subtasks passed). Driven from the CLI via ``ada eval``.
 
 What the harness measures beyond the toy tasks:
-  - E2  repo-level golden tasks: fixture repos under ``evals/fixtures/<task>/repo`` are
-    bound via ``Settings.repo_path`` so the flagship materialize → edit → verify path is
-    graded end to end.
+  - E2/F8  repo-level golden tasks run through the REAL project path: per attempt the
+    fixture repo under ``evals/fixtures/<task>/repo`` is copied to a tmp dir, turned
+    into a git repo (init + baseline commit), imported as an ephemeral project
+    (``projects.import_project``), and the run executes with ``settings.project`` set
+    to that slug — the same create → import → run → grade path production tasks take.
+    ``Settings.repo_path`` is never used. The attempt's tmp dir owns the whole
+    ephemeral project (registry, data, workspace), so it dies with the attempt.
   - E3  held-out grading: ``evals/fixtures/<task>/heldout`` tests live OUTSIDE the
     fixture repo; the agent never sees them. After the run they are copied into the
     finished workspace and run alone (``heldout_tests_pass``).
@@ -29,12 +33,14 @@ import asyncio
 import dataclasses
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from .. import projects
 from ..config import Settings
 from ..engine import Engine
 from ..orchestration.events import Event
@@ -71,8 +77,9 @@ class GoldenTask:
     id: str
     prompt: str
     graders: list[Grader]
-    # E2: fixture dir name under evals/fixtures/<name>/ — its repo/ subdir is bound as
-    # settings.repo_path so the run materializes and edits a real checkout.
+    # E2/F8: fixture dir name under evals/fixtures/<name>/ — its repo/ subdir is copied
+    # out, git-initialized, and imported as an ephemeral project for each attempt, so
+    # the run takes the real project path (never Settings.repo_path).
     repo_fixture: str = ""
     # E5: agents the plan is expected to route to; grades routing accuracy when set.
     expected_agents: tuple[str, ...] = ()
@@ -229,6 +236,9 @@ class Scorecard:
     # Skipped cards never count as failures (excluded from the pass/fail denominator).
     # to_dict stays backward compatible — the new key is purely additive.
     skipped: bool = False
+    # F8: slug of the ephemeral project this attempt ran in ("" for toy/greenfield
+    # tasks, which stay on the default scratch project). Additive in to_dict.
+    project: str = ""
 
     def to_dict(self) -> dict:
         return {**dataclasses.asdict(self),
@@ -366,6 +376,32 @@ def _parallelism_from_events(events: list[Event], fallback: int) -> int:
     return peak if saw else fallback
 
 
+def _prepare_ephemeral_project(settings: Settings, task: GoldenTask, tmp: Path) -> Settings:
+    """F8: stand up this attempt's ephemeral project and return settings bound to it.
+
+    Copies the pristine in-package fixture repo into the attempt's tmp dir (the
+    package tree is never touched), makes it a real git repo (init + baseline
+    commit with an explicit identity), imports it in place via
+    ``projects.import_project`` — so the ENGINE runs the real project path — and
+    returns ``settings`` with ``project`` set to the new slug. Everything (registry,
+    project data, workspaces) lives under the attempt's tmp dir, so deleting the
+    attempt dir is the project teardown.
+    """
+    repo = tmp / "fixture-repo"
+    shutil.copytree(task.fixture_repo, repo)
+    for args in (["git", "init", "-q"],
+                 ["git", "add", "-A"],
+                 ["git", "-c", "user.email=ada-eval@local", "-c", "user.name=Ada Eval",
+                  "commit", "-q", "-m", "fixture baseline"]):
+        res = subprocess.run(args, cwd=repo, capture_output=True, text=True, timeout=60)
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"fixture git setup failed ({' '.join(args)}): "
+                f"{(res.stderr or res.stdout).strip()[:300]}")
+    entry = projects.import_project(settings, str(repo), name=f"eval-{task.id}")
+    return dataclasses.replace(settings, project=entry["slug"])
+
+
 async def _run_one(
     base: Settings,
     task: GoldenTask,
@@ -377,9 +413,21 @@ async def _run_one(
     overrides: dict[str, Any] = dict(
         data_dir=tmp / "data", docs_dir=tmp / "docs", workspace_dir=tmp / "ws",
         git_finalize=False)
-    if task.repo_fixture:  # E2: bind the fixture repo for materialize → edit → verify
-        overrides.update(repo_path=str(task.fixture_repo), repo_url="", repo_ref="")
+    if task.repo_fixture:
+        # F8: repo tasks never bind Settings.repo_path — they run through the real
+        # project path via an ephemeral imported project (below).
+        overrides.update(repo_path="", repo_url="", repo_ref="")
     settings = dataclasses.replace(base, **overrides)
+    card = Scorecard(task_id=task.id, passed=False, graders=[])
+    start = time.monotonic()
+    if task.repo_fixture:
+        try:
+            settings = _prepare_ephemeral_project(settings, task, tmp)
+            card.project = settings.project
+        except Exception as exc:  # noqa: BLE001 — a broken fixture fails the attempt, not the suite
+            card.error = f"ephemeral project setup failed: {exc}"
+            card.wall_s = time.monotonic() - start
+            return card
     engine = Engine(settings)
     if provider_factory is not None:
         provider = provider_factory()
@@ -388,13 +436,16 @@ async def _run_one(
         engine.reviewer._provider = provider
         engine.reflector._provider = provider
     events: list[Event] = []
-    start = time.monotonic()
-    card = Scorecard(task_id=task.id, passed=False, graders=[])
     try:
         run, _brief, _out = await asyncio.wait_for(
             engine.run(task.prompt, on_event=events.append),
             timeout=task_timeout if task_timeout > 0 else None)
-        ws = settings.run_workspace(run.id)
+        # Grade wherever the engine actually ran: for project runs the workspace is a
+        # git worktree under workspace_dir/<slug>/worktrees/<task_id>, surfaced as
+        # engine.last_run_workspace; fall back to the classic per-run workspace so
+        # this stays correct on engines without that attribute.
+        ws = Path(getattr(engine, "last_run_workspace", None)
+                  or settings.run_workspace(run.id))
         card.graders = [g(ws) for g in task.graders]
         if task.heldout_dir is not None:  # E3: grade on tests the agent never saw
             card.graders.append(

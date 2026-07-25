@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +25,29 @@ from ai_dev_assistant.evals.harness import (
     run_eval,
 )
 from ai_dev_assistant.llm.schemas import BriefDoc, Plan, RunLessons, SubTask, Verdict
+from ai_dev_assistant.orchestration.run_store import RunStore
+
+
+def _track_attempt_dirs(monkeypatch, tmp_path):
+    """Route the harness's per-attempt mkdtemp under tmp_path and record the dirs, so
+    tests can inspect the ephemeral project (registry, run store, fixture repo)."""
+    made: list[str] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def tracking_mkdtemp(*args, **kwargs):
+        kwargs.setdefault("dir", str(tmp_path))
+        d = real_mkdtemp(*args, **kwargs)
+        made.append(d)
+        return d
+
+    monkeypatch.setattr(tempfile, "mkdtemp", tracking_mkdtemp)
+    return made
+
+
+def _git_out(args: list[str], cwd: Path) -> str:
+    res = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    return res.stdout.strip()
 
 
 def test_graders(tmp_path):
@@ -126,9 +152,11 @@ class _RepoFixProvider:
         return None
 
 
-async def test_repo_golden_task_offline():
-    """E2+E3: a fixture repo is materialized, edited by a (scripted) agent, then graded —
-    including on held-out tests the agent never saw."""
+async def test_repo_golden_task_offline(tmp_path, monkeypatch):
+    """E2+E3+F8: a fixture repo runs through the REAL project path — copied out,
+    git-initialized, imported as an ephemeral project — then a (scripted) agent edits it
+    and grading runs, including on held-out tests the agent never saw."""
+    made = _track_attempt_dirs(monkeypatch, tmp_path)
     task = next(t for t in GOLDEN if t.id == "fix_calculator_subtract")
     report = await run_eval(_offline_settings(), only=[task.id], repeat=1, task_timeout=120,
                             provider_factory=_RepoFixProvider)
@@ -145,6 +173,26 @@ async def test_repo_golden_task_offline():
     summary = report.tasks[0]
     assert summary.pass_rate == 1.0
     assert summary.routing_accuracy == 1.0
+
+    # ---- F8: the attempt went through an ephemeral project, not Settings.repo_path ----
+    attempts = [Path(d) for d in made if Path(d).name.startswith(f"ada-eval-{task.id}-")]
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    slug = "eval-fix-calculator-subtract"  # slugify(f"eval-{task.id}")
+    assert card.project == slug
+    rows = RunStore(attempt / "data" / "runs.db").list()
+    assert len(rows) == 1
+    assert rows[0]["project"] == slug  # the run row is bound to the ephemeral project
+    # The imported (user-side) fixture repo copy was operated on in place but never
+    # mutated: still the single baseline commit, clean tree, no branch switch.
+    repo = attempt / "fixture-repo"
+    branch = _git_out(["branch", "--show-current"], repo)
+    assert branch and not branch.startswith("ada/")
+    assert _git_out(["rev-list", "--count", "HEAD"], repo) == "1"
+    assert _git_out(["log", "-1", "--format=%s"], repo) == "fixture baseline"
+    assert _git_out(["status", "--porcelain"], repo) == ""
+    # The in-package fixture source tree was never turned into a git repo.
+    assert not (FIXTURES_DIR / task.repo_fixture / "repo" / ".git").exists()
 
 
 _FIXED_PAGINATION = '''\
@@ -171,9 +219,11 @@ def page_items(items, page, page_size):
 '''
 
 
-async def test_pagination_repo_golden_task_offline():
+async def test_pagination_repo_golden_task_offline(tmp_path, monkeypatch):
     """E2+E3 on the second Python fixture: the off-by-one pagination bug is fixed by a
-    scripted agent and graded, including on held-out tests."""
+    scripted agent and graded, including on held-out tests — again via an ephemeral
+    project (F8)."""
+    made = _track_attempt_dirs(monkeypatch, tmp_path)
     task = next(t for t in GOLDEN if t.id == "fix_pagination_total_pages")
     report = await run_eval(
         _offline_settings(), only=[task.id], repeat=1, task_timeout=120,
@@ -186,6 +236,11 @@ async def test_pagination_repo_golden_task_offline():
     assert card.passed, [f"{g.name}: {g.detail}" for g in card.graders]
     assert card.run_status == "completed"
     assert report.tasks[0].pass_rate == 1.0
+    assert card.project == "eval-fix-pagination-total-pages"
+    attempts = [Path(d) for d in made if Path(d).name.startswith(f"ada-eval-{task.id}-")]
+    assert len(attempts) == 1
+    rows = RunStore(attempts[0] / "data" / "runs.db").list()
+    assert [r["project"] for r in rows] == [card.project]
 
 
 async def test_missing_required_tool_skips_task(monkeypatch):
