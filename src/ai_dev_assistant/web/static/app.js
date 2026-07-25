@@ -10,6 +10,8 @@ const {
   renderDiffHtml, reviewCardModel, permissionsModel, policyFormModel, parsePolicyForm,
   sparklinePoints, childrenFromRows, childrenGridModel,
   sidebarProjectRows, projectTabsModel, projectTaskRows, composerModel,
+  visibleProjects, combineChipsModel, combinedProjectsParam, itemProjects,
+  taggedItemRows, combinedBannerModel, projectColorMap,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -488,13 +490,15 @@ function clearContinue() {
 
 // ---- project-first navigation state ----
 // The selected project drives the whole main area. "multi" is the pseudo-entry
-// for cross-project fan-out parents (it only has a task list).
-let currentProject = "default";
-let currentMainView = "project";   // project | task | activity
+// for cross-project fan-out parents (it only has a task list). null means no
+// real project exists yet -> the first-run empty state. The backend's scratch
+// "default" project is never rendered or auto-selected.
+let currentProject = null;
+let currentMainView = "project";   // project | task | activity | agents | empty
 let currentTab = "overview";       // overview | tasks | knowledge | settings
 let currentKnow = "memory";        // memory | graph | files
 
-function selectedProject() { return currentProject || "default"; }
+function selectedProject() { return currentProject; }
 
 let projectList = [];        // last-fetched /api/projects list
 let projectActivity = {};    // slug -> /activity body (feeds sidebar state dots)
@@ -510,16 +514,18 @@ function currentProjectEntry(slug) {
 async function loadProjects() {
   let list = [];
   try { list = await (await fetch("/api/projects")).json(); } catch (e) { list = []; }
-  if (!list.length) list = [{ slug: "default", name: "Default" }];
-  projectList = list;
-  const saved = localStorage.getItem("ada-project") || currentProject || "default";
+  projectList = visibleProjects(list);   // the scratch "default" project is never rendered
   if (currentProject !== "multi") {
-    currentProject = list.some(p => p.slug === saved) ? saved : list[0].slug;
+    const saved = localStorage.getItem("ada-project") || currentProject;
+    currentProject = projectList.some(p => p.slug === saved) ? saved
+      : (projectList.length ? projectList[0].slug : null);
   }
   renderSidebar();
   renderMultiProjects();
-  updateComposerProject();
-  renderProjectHeader(null);
+  if (currentProject) {
+    updateComposerProject();
+    renderProjectHeader(null);
+  }
 }
 
 // ---- sidebar: one nav row per project + the "⋔ Across projects" pseudo-entry ----
@@ -548,6 +554,11 @@ function renderSidebar() {
   if (nav) {
     if (currentMainView === "activity") nav.setAttribute("aria-current", "page");
     else nav.removeAttribute("aria-current");
+  }
+  const navAgents = $("nav-agents");
+  if (navAgents) {
+    if (currentMainView === "agents") navAgents.setAttribute("aria-current", "page");
+    else navAgents.removeAttribute("aria-current");
   }
 }
 
@@ -638,8 +649,9 @@ function toggleMultiBox() {
   if (multiOpen) {
     renderMultiProjects();
     // pre-check the current project so fan-out starts from where the user is
-    const cb = document.querySelector(
-      `#multi-projects .mp-check[value="${CSS.escape(selectedProject())}"]`);
+    const cur = selectedProject();
+    const cb = cur ? document.querySelector(
+      `#multi-projects .mp-check[value="${CSS.escape(cur)}"]`) : null;
     if (cb) cb.checked = true;
   }
 }
@@ -696,6 +708,8 @@ async function submitProjectModal() {
 
 // ---- select a project: the main area becomes that project ----
 function selectProject(slug, tab) {
+  if (!slug) { showEmptyState(); return; }
+  if (slug !== currentProject) { combineSelected = new Set(); setCombineBanner(0); }
   currentProject = slug;
   if (slug !== "multi") localStorage.setItem("ada-project", slug);
   showMainView("project");
@@ -710,6 +724,7 @@ function selectProject(slug, tab) {
 // ---- project header status + overview activity strip ----
 async function loadProjectStatus() {
   const slug = selectedProject();
+  if (!slug) return;
   if (slug === "multi") { renderProjectHeader(null); return; }
   let st = null;
   try {
@@ -722,6 +737,7 @@ async function loadProjectStatus() {
 
 async function loadProjectActivity() {
   const slug = selectedProject();
+  if (!slug) return;
   const el = $("ov-activity");
   let act = null;
   try {
@@ -1330,6 +1346,7 @@ async function fetchProjectRuns(slug) {
 
 async function loadRecent() {
   const slug = selectedProject();
+  if (!slug) return;
   let act = null;
   try {
     const r = await fetch("/api/projects/" + encodeURIComponent(slug) + "/activity");
@@ -1645,13 +1662,21 @@ async function openTask(id, meta) {
   state.docsId = id;
 }
 
-// ---- main views: project (tabs) · task detail · all activity ----
-const MAIN_VIEWS = { project: "view-project", task: "view-task", activity: "view-activity" };
+// ---- main views: project (tabs) · task detail · all activity · agents · empty ----
+const MAIN_VIEWS = {
+  project: "view-project", task: "view-task", activity: "view-activity",
+  agents: "view-agents", empty: "view-empty",
+};
 
 function showMainView(name) {
   currentMainView = name;
   Object.entries(MAIN_VIEWS).forEach(([n, id]) => $(id).classList.toggle("hidden", n !== name));
-  renderSidebar();   // keep the active row / All activity highlight in sync
+  renderSidebar();   // keep the active row / global-nav highlight in sync
+}
+
+// First-run empty state: no real projects yet -> invite to create/import one.
+function showEmptyState() {
+  showMainView("empty");
 }
 
 // Is a given knowledge sub-view currently on screen? (refresh-on-done checks)
@@ -1688,9 +1713,10 @@ function showKnowledge(sub) {
   ["memory", "graph", "files"].forEach(s => {
     $("know-" + s).classList.toggle("hidden", s !== sub);
   });
+  renderCombineRow();
   if (sub === "memory") return loadMemory();
   if (sub === "graph") return loadGraph();
-  if (sub === "files") return loadFiles();
+  if (sub === "files") { setCombineBanner(0); return loadFiles(); }
 }
 
 // Jump to a task's files inside the current project's Knowledge tab.
@@ -1725,6 +1751,11 @@ function backToProject() {
 function showActivity() {
   showMainView("activity");
   loadDashboard();
+}
+
+// ---- Agents: the specialist roster as its own view ----
+function showAgents() {
+  showMainView("agents");
   loadAgents();
 }
 
@@ -1773,6 +1804,7 @@ async function loadProjectsActivity() {
   if (!wrap) return;
   let list = [];
   try { list = await (await fetch("/api/projects")).json(); } catch (e) { list = []; }
+  list = visibleProjects(list);   // the scratch "default" project is never rendered
   if (!list.length) { wrap.innerHTML = '<p class="muted">No projects yet.</p>'; return; }
   const fetchAct = async (slug) => {
     try {
@@ -1811,10 +1843,11 @@ async function loadProjectsActivity() {
 // ---- Settings tab: repository state + policy editor + archive/delete ----
 async function loadSettingsPanel() {
   const slug = selectedProject();
-  if (slug === "multi") return;
+  if (!slug || slug === "multi") return;
   let list = [];
   try { list = await (await fetch("/api/projects")).json(); } catch (e) { list = []; }
-  if (Array.isArray(list) && list.length) projectList = list;
+  list = visibleProjects(list);
+  if (list.length) projectList = list;
   const entry = currentProjectEntry(slug) || { slug, name: slug };
   renderSettingsPolicy(entry);
   renderSettingsDanger(entry);
@@ -1904,10 +1937,11 @@ async function deleteProject() {
     else if (!resp.ok || data.error) _dangerFail(data.error || ("HTTP " + resp.status));
     else {
       showToast(`Deleted project "${name}"`, "warn");
-      currentProject = "default";
-      localStorage.setItem("ada-project", "default");
-      await loadProjects();
-      selectProject(currentProject, "overview");
+      currentProject = null;
+      localStorage.removeItem("ada-project");
+      await loadProjects();   // re-selects the first remaining project (or none)
+      if (currentProject) selectProject(currentProject, "overview");
+      else showEmptyState();
       return;
     }
   } catch (e) { _dangerFail("Request failed: " + e); }
@@ -2202,7 +2236,7 @@ async function sendFeedback(extra) {
   } catch (e) { showToast("Feedback failed", "warn"); }
 }
 
-// ---- Agents roster (a card in the All activity view) ----
+// ---- Agents roster (the sidebar's dedicated Agents view) ----
 let agentsLoaded = false;
 let rosterAgents = {};   // name -> agent profile, for the detail popup
 async function loadAgents() {
@@ -2242,37 +2276,142 @@ function openRosterModal(name) {
 }
 function closeRosterModal() { closeModalEl("roster-modal"); }
 
-// ---- Memory ----
+// ---- Combined knowledge across projects (read-only) ----
+// The Knowledge tab's Memory and Graph sub-views can merge OTHER non-archived
+// projects in via "Combine with…" chips. Combined fetches send an additional
+// `projects=<active,plus,selected>` query param; if that hasn't landed on the
+// server yet the code falls back to the single-project fetch and hides the
+// banner. Clearing the chips returns to the single-project view.
+let combineSelected = new Set();   // slugs of OTHER projects merged in
+
+function renderCombineRow() {
+  const row = $("combine-row"), box = $("combine-chips");
+  if (!row || !box) return;
+  const slug = selectedProject();
+  const chips = combineChipsModel(projectList, slug, [...combineSelected]);
+  // prune selections for projects that no longer exist / are archived
+  combineSelected = new Set(chips.filter(c => c.selected).map(c => c.slug));
+  const applicable = !!slug && slug !== "multi" && currentKnow !== "files" && chips.length > 0;
+  row.classList.toggle("hidden", !applicable);
+  if (!applicable) { box.innerHTML = ""; return; }
+  box.innerHTML = chips.map(c =>
+    `<label class="combine-chip${c.selected ? " on" : ""}">` +
+    `<input type="checkbox" class="cmb-check" value="${escapeAttr(c.slug)}"${c.selected ? " checked" : ""} /> ` +
+    `${escapeHtml(c.name)}</label>`).join("");
+  box.querySelectorAll(".cmb-check").forEach(cb => {
+    cb.onchange = () => {
+      if (cb.checked) combineSelected.add(cb.value);
+      else combineSelected.delete(cb.value);
+      if (currentKnow === "memory") loadMemory();
+      else if (currentKnow === "graph") loadGraph();
+      else renderCombineRow();
+    };
+  });
+}
+
+function setCombineBanner(projectCount) {
+  const el = $("combine-banner");
+  if (!el) return;
+  const m = combinedBannerModel(projectCount);
+  el.classList.toggle("hidden", !m.visible);
+  el.textContent = m.text;
+}
+
+// A combined response is only trusted when the server clearly honored the
+// `projects` param: it declares a "projects" list, tags items with the
+// additive "project"/"sources" fields, or returns an empty merge.
+function _combinedDeclared(body, items) {
+  const declared = (body && !Array.isArray(body) && Array.isArray(body.projects))
+    ? body.projects : null;
+  if (declared) return declared;
+  const arr = Array.isArray(items) ? items : [];
+  const tagged = arr.some(it => itemProjects(it).length > 0);
+  return (tagged || !arr.length) ? [] : null;   // [] = honored but undeclared
+}
+
+// ---- Memory (single project, or combined read-only across projects) ----
 async function loadMemory() {
-  try {
-    const items = await (await fetch("/api/memory?project=" + encodeURIComponent(selectedProject()))).json();
-    const wrap = $("memory-list");
-    if (!items.length) { wrap.innerHTML = '<p class="muted">No memories yet — run a task.</p>'; return; }
-    wrap.innerHTML = "";
-    items.forEach(m => {
-      const when = m.created_at ? new Date(m.created_at * 1000).toLocaleString() : "";
-      const scope = m.mem_scope === "global" ? "global" : "project";
-      const el = document.createElement("div");
-      el.className = "mem-item";
-      el.innerHTML = `
-        <div class="mem-meta"><span class="mem-scope-tag mem-scope-${scope}">${scope}</span>
-          <span class="mem-author">${escapeHtml(m.author || "agent")}</span>
-          <span>· ${escapeHtml(m.subtask || m.scope)}</span><span>· ${when}</span></div>
-        <div class="mem-content">${escapeHtml(m.content)}</div>`;
-      wrap.appendChild(el);
-    });
-  } catch (e) { /* ignore */ }
+  const slug = selectedProject();
+  if (!slug || slug === "multi") return;
+  renderCombineRow();
+  const param = combinedProjectsParam(slug, [...combineSelected]);
+  let items = null, combinedProjects = null;
+  if (param) {
+    try {
+      const resp = await fetch("/api/memory?projects=" + encodeURIComponent(param));
+      if (resp.ok) {
+        const body = await resp.json();
+        const arr = Array.isArray(body) ? body
+          : (Array.isArray(body.items) ? body.items : null);
+        const declared = arr ? _combinedDeclared(body, arr) : null;
+        if (arr && declared !== null) {
+          items = arr;
+          combinedProjects = declared.length ? declared : param.split(",");
+        }
+      }
+    } catch (e) { /* fall back to the single-project fetch below */ }
+  }
+  if (!items) {   // single-project view, or the combined param hasn't landed server-side
+    try { items = await (await fetch("/api/memory?project=" + encodeURIComponent(slug))).json(); }
+    catch (e) { return; }
+    combinedProjects = null;
+  }
+  const combined = !!(combinedProjects && combinedProjects.length > 1);
+  setCombineBanner(combined ? combinedProjects.length : 0);
+  const wrap = $("memory-list");
+  const rows = taggedItemRows(items, combined);
+  if (!rows.length) { wrap.innerHTML = '<p class="muted">No memories yet — run a task.</p>'; return; }
+  wrap.innerHTML = "";
+  rows.forEach(({ item: m, tag }) => {
+    const when = m.created_at ? new Date(m.created_at * 1000).toLocaleString() : "";
+    const scope = m.mem_scope === "global" ? "global" : "project";
+    const el = document.createElement("div");
+    el.className = "mem-item";
+    el.innerHTML = `
+      <div class="mem-meta"><span class="mem-scope-tag mem-scope-${scope}">${scope}</span>
+        ${tag ? `<span class="proj-tag" title="Project this memory belongs to">${escapeHtml(tag)}</span>` : ""}
+        <span class="mem-author">${escapeHtml(m.author || "agent")}</span>
+        <span>· ${escapeHtml(m.subtask || m.scope)}</span><span>· ${when}</span></div>
+      <div class="mem-content">${escapeHtml(m.content)}</div>`;
+    wrap.appendChild(el);
+  });
 }
 
 // ---- Knowledge graph (dependency-free force layout) ----
 const TYPE_COLOR = { task: "#2f7d5e", subtask: "#5a9bc4", agent: "#7b86c9", concept: "#c79248" };
 const SVGNS = "http://www.w3.org/2000/svg";
 let graphData = { nodes: [], edges: [] };
+let graphProjects = null;   // combined-view slugs (null = single-project view)
 
 async function loadGraph() {
-  try {
-    graphData = await (await fetch("/api/graph?project=" + encodeURIComponent(selectedProject()))).json();
-  } catch (e) { return; }
+  const slug = selectedProject();
+  if (!slug || slug === "multi") return;
+  renderCombineRow();
+  const param = combinedProjectsParam(slug, [...combineSelected]);
+  let data = null, combinedProjects = null;
+  if (param) {
+    try {
+      const resp = await fetch("/api/graph?projects=" + encodeURIComponent(param));
+      if (resp.ok) {
+        const body = await resp.json();
+        if (body && Array.isArray(body.nodes) && Array.isArray(body.edges)) {
+          const declared = _combinedDeclared(body, body.nodes);
+          if (declared !== null) {
+            data = body;
+            combinedProjects = declared.length ? declared : param.split(",");
+          }
+        }
+      }
+    } catch (e) { /* fall back to the single-project fetch below */ }
+  }
+  if (!data) {   // single-project view, or the combined param hasn't landed server-side
+    try { data = await (await fetch("/api/graph?project=" + encodeURIComponent(slug))).json(); }
+    catch (e) { return; }
+    combinedProjects = null;
+  }
+  graphData = data;
+  graphProjects = (combinedProjects && combinedProjects.length > 1) ? combinedProjects : null;
+  setCombineBanner(graphProjects ? graphProjects.length : 0);
   renderGraph();
 }
 
@@ -2312,6 +2451,9 @@ function renderGraph() {
     svg.appendChild(line);
   });
 
+  // combined view: ring each node with its source project's color
+  const pcolors = graphProjects ? projectColorMap(graphProjects) : null;
+
   nodes.forEach(n => {
     const p = pos[n.id];
     const r = n.type === "task" ? 13 : n.type === "subtask" ? 10 : 8;
@@ -2319,6 +2461,13 @@ function renderGraph() {
     c.setAttribute("cx", p.x); c.setAttribute("cy", p.y); c.setAttribute("r", r);
     c.setAttribute("fill", TYPE_COLOR[n.type] || TYPE_COLOR.concept);
     c.setAttribute("class", "node");
+    if (pcolors) {
+      const pj = itemProjects(n)[0];
+      if (pj && pcolors[pj]) {
+        c.setAttribute("stroke", pcolors[pj]);
+        c.setAttribute("stroke-width", "2.5");
+      }
+    }
     c.addEventListener("click", () => showNode(n, adj[n.id] || []));
     svg.appendChild(c);
     const label = document.createElementNS(SVGNS, "text");
@@ -2328,8 +2477,13 @@ function renderGraph() {
     svg.appendChild(label);
   });
 
-  $("graph-legend").innerHTML = Object.entries(TYPE_COLOR)
+  let legend = Object.entries(TYPE_COLOR)
     .map(([t, c]) => `<span><i style="background:${c}"></i>${t}</span>`).join("");
+  if (pcolors) {
+    legend += Object.entries(pcolors).map(([s, c]) =>
+      `<span><i style="background:transparent;border:2px solid ${c}"></i>${escapeHtml(s)}</span>`).join("");
+  }
+  $("graph-legend").innerHTML = legend;
 }
 
 function showNode(n, facts) {
@@ -2337,8 +2491,11 @@ function showNode(n, facts) {
   const extra = taskEdge
     ? `<button type="button" class="open-file" data-task="${escapeAttr(taskEdge.source)}" data-path="${escapeAttr(n.id)}">Open in Files →</button>`
     : "";
+  const pj = graphProjects ? itemProjects(n) : [];
+  const projTag = pj.length
+    ? ` <span class="proj-tag" title="Project this node belongs to">${escapeHtml(pj.join(" · "))}</span>` : "";
   $("node-detail").classList.remove("muted");
-  $("node-detail").innerHTML = `<b>${escapeHtml(n.id)}</b> <span class="muted">(${n.type})</span><br>` +
+  $("node-detail").innerHTML = `<b>${escapeHtml(n.id)}</b> <span class="muted">(${n.type})</span>${projTag}<br>` +
     (facts.length ? facts.map(f => escapeHtml(f)).join("<br>") : "<span class='muted'>no relations</span>") + extra;
   const of = $("node-detail").querySelector(".open-file");
   if (of) of.onclick = async () => { await openFilesView(of.dataset.task); selectFile(of.dataset.path, null); };
@@ -2499,8 +2656,10 @@ document.querySelectorAll("#modal .tab").forEach(t => t.onclick = () => selectTa
 document.querySelectorAll("#project-tabs .ptab").forEach(b => b.onclick = () => selectProjectTab(b.dataset.tab));
 document.querySelectorAll("#know-tabs .ktab").forEach(b => b.onclick = () => showKnowledge(b.dataset.know));
 $("nav-activity").onclick = showActivity;
+$("nav-agents").onclick = showAgents;
 $("multi-open").onclick = toggleMultiBox;   // F3: cross-project fan-out composer
 $("new-project").onclick = openProjectModal;
+$("empty-new").onclick = openProjectModal;  // first-run empty state
 $("project-modal-close").onclick = closeProjectModal;
 $("pm-cancel").onclick = closeProjectModal;
 $("pm-submit").onclick = submitProjectModal;
@@ -2528,7 +2687,9 @@ loadConfig();
 loadProjects().then(() => {
   // Project-first landing: the selected project's Overview is the default view.
   // Opening/attaching a task (openTask/attachToRun/launchRun) switches to its detail.
-  selectProject(currentProject, "overview");
+  // With no real projects yet, the main area is the first-run empty state.
+  if (currentProject) selectProject(currentProject, "overview");
+  else showEmptyState();
 });
 loadQueue();
 setInterval(loadQueue, 4000);  // keep the queue panel + chip fresh

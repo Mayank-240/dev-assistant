@@ -44,6 +44,10 @@
             <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 13h12"/><rect x="3" y="8" width="2.4" height="4"/><rect x="7" y="5" width="2.4" height="7"/><rect x="11" y="9" width="2.4" height="3"/></svg>
             All activity
           </button>
+          <button type="button" id="nav-agents" class="sb-item">
+            <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="5" cy="5" r="2.2"/><circle cx="11" cy="5" r="2.2"/><circle cx="5" cy="11" r="2.2"/><circle cx="11" cy="11" r="2.2"/></svg>
+            Agents
+          </button>
         </nav>
 
         <div class="sb-foot">
@@ -179,6 +183,12 @@
                 <button type="button" id="ktab-graph" class="ktab" role="tab" aria-selected="false" aria-controls="know-graph" data-know="graph">Knowledge graph</button>
                 <button type="button" id="ktab-files" class="ktab" role="tab" aria-selected="false" aria-controls="know-files" data-know="files">Files</button>
               </div>
+
+              <div id="combine-row" class="combine-row hidden">
+                <span class="combine-label" id="combine-label">Combine with…</span>
+                <div id="combine-chips" class="combine-chips" role="group" aria-labelledby="combine-label"></div>
+              </div>
+              <div id="combine-banner" class="combine-banner hidden" role="status" aria-live="polite"></div>
 
               <div id="know-memory" class="know-panel" role="tabpanel" aria-labelledby="ktab-memory">
                 <div class="know-head">
@@ -441,9 +451,26 @@
               </div>
               <div id="cmp-result" class="cmp-result muted">Pick two runs from history and press Compare.</div>
             </div>
-            <div class="card">
-              <h3 class="section-label">Agent roster — the specialist team the orchestrator routes work to</h3>
-              <div id="agents-roster" class="agents-grid"></div>
+          </div>
+
+          <!-- ============ AGENTS — the specialist roster ============ -->
+          <div id="view-agents" class="view hidden">
+            <div class="view-header">
+              <div>
+                <h1>Agents</h1>
+                <p>The specialist team the orchestrator routes work to — what each one does, when to use it, and its tools.</p>
+              </div>
+            </div>
+            <div id="agents-roster" class="agents-grid"></div>
+          </div>
+
+          <!-- ============ FIRST-RUN EMPTY STATE (no projects yet) ============ -->
+          <div id="view-empty" class="view hidden">
+            <div class="empty empty-first">
+              <div class="empty-mark" aria-hidden="true">◆</div>
+              <h2>Create your first project</h2>
+              <p>Projects keep your tasks, memory and knowledge together — start empty, or import an existing repository.</p>
+              <button id="empty-new" type="button" class="btn-primary">+ New / Import</button>
             </div>
           </div>
 

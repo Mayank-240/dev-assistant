@@ -643,3 +643,101 @@ def test_effort_tiers_including_xhigh_and_max():
     assert mx.max_retries >= 2
     # higher tiers keep Opus (no cheaper-model override)
     assert xh.sdk_model == base.sdk_model and mx.sdk_model == base.sdk_model
+
+
+# ---- Cross-project combine: /api/graph and /api/memory with ?projects=a,b ----
+# (read-only merged views; knowledge/combine.py)
+
+def _seed_project_data(c, name, facts=(), memories=()):
+    """Create a project via the API, then write real KG facts + memories to its
+    per-project stores (the same APIs the engine uses)."""
+    import dataclasses as _dc
+
+    from ai_dev_assistant.knowledge.graph import NetworkXKnowledgeGraph
+    from ai_dev_assistant.memory.store import MemoryStore
+
+    slug = c.post("/api/projects", json={"name": name}).json()["slug"]
+    s = _dc.replace(c.app.state.settings, project=slug)
+    kg = NetworkXKnowledgeGraph(s.graph_path)
+    for subj, rel, obj in facts:
+        kg.add_fact(subj, rel, obj)
+    kg.save()
+    store = MemoryStore(s)
+    for content in memories:
+        store.remember("longterm", content, metadata={"author": "tester"})
+    store.close()
+    return slug
+
+
+def test_graph_endpoint_combines_projects_with_sources(tmp_path):
+    c = _client(tmp_path)
+    a = _seed_project_data(c, "Combi A", facts=[("app.py", "imports", "flask")])
+    b = _seed_project_data(c, "Combi B", facts=[("worker.py", "imports", "celery")])
+    r = c.get(f"/api/graph?projects={a},{b}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["projects"] == [a, b]
+    nodes = {n["id"]: n for n in body["nodes"]}
+    assert nodes["app.py"]["sources"] == [a]
+    assert nodes["worker.py"]["sources"] == [b]
+    edges = {(e["source"], e["target"], e["relation"]): e for e in body["edges"]}
+    assert edges[("app.py", "flask", "imports")]["sources"] == [a]
+    assert edges[("worker.py", "celery", "imports")]["sources"] == [b]
+
+
+def test_graph_endpoint_ignores_unknown_slugs(tmp_path):
+    c = _client(tmp_path)
+    a = _seed_project_data(c, "Combi Solo", facts=[("x", "rel", "y")])
+    r = c.get(f"/api/graph?projects={a},ghost")
+    assert r.status_code == 200  # unknown slugs are dropped, never a 400
+    assert r.json()["projects"] == [a]
+
+
+def test_graph_endpoint_without_projects_param_unchanged(tmp_path):
+    c = _client(tmp_path)
+    _seed_project_data(c, "Combi Base", facts=[("m.py", "imports", "os")])
+    body = c.get("/api/graph").json()
+    # exactly today's single-project shape: no "projects" list, no "sources"
+    assert set(body) == {"project", "nodes", "edges"}
+    assert body["project"] == "default"
+    assert all("sources" not in n for n in body["nodes"])
+
+
+def test_memory_endpoint_combines_projects_tagged(tmp_path):
+    c = _client(tmp_path)
+    a = _seed_project_data(c, "Mem A", memories=["postgres pooling tip from a"])
+    b = _seed_project_data(c, "Mem B", memories=["postgres tuning tip from b"])
+    # listing (no q): merged recent rows, each tagged with its project
+    rows = c.get(f"/api/memory?projects={a},{b}").json()
+    assert {row["project"] for row in rows} == {a, b}
+    assert all({"id", "scope", "content", "created_at", "mem_scope"} <= set(row)
+               for row in rows)
+    # search (&q=): scored hits tagged with their project, sorted by score desc
+    hits = c.get(f"/api/memory?projects={a},{b}&q=postgres").json()
+    assert hits
+    assert {h["project"] for h in hits if "postgres" in h["content"]} == {a, b}
+    scores = [h["score"] for h in hits]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_memory_endpoint_projects_with_unknown_slug(tmp_path):
+    c = _client(tmp_path)
+    a = _seed_project_data(c, "Mem Solo", memories=["a lesson to find"])
+    rows = c.get(f"/api/memory?projects={a},ghost").json()
+    assert rows and all(row["project"] == a for row in rows)
+
+
+def test_memory_endpoint_without_projects_param_unchanged(tmp_path):
+    import dataclasses as _dc
+
+    from ai_dev_assistant.memory.store import MemoryStore
+
+    c = _client(tmp_path)
+    store = MemoryStore(_dc.replace(c.app.state.settings, project="default"))
+    store.remember("longterm", "a default-project lesson")
+    store.close()
+    rows = c.get("/api/memory").json()
+    # exactly today's item shape: no additive "project"/"score" fields
+    assert rows
+    assert all("project" not in row and "score" not in row for row in rows)
+    assert rows[0]["mem_scope"] in ("project", "global")

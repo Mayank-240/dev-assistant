@@ -19,7 +19,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -29,6 +29,7 @@ from .. import projects, vcs
 from ..agents.registry import build_agents
 from ..config import Settings
 from ..engine import Engine
+from ..knowledge import combine
 from ..knowledge.graph import NetworkXKnowledgeGraph
 from ..llm.errors import LLMError
 from ..llm.schemas import Plan
@@ -1269,8 +1270,26 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             comment=comment or f"subtask {subtask_id} rejected in review")
         return JSONResponse({"ok": True, "decision": "rejected", "comment": comment})
 
+    def _combine_slugs(csv: str) -> list[str]:
+        """Comma-separated slugs -> deduped list validated against the registry.
+        Unknown slugs are dropped (never a 400) — combining is best-effort."""
+        known = {p.get("slug") for p in projects.list_projects(settings)}
+        out: list[str] = []
+        for s in (csv or "").split(","):
+            s = s.strip()
+            if s and s in known and s not in out:
+                out.append(s)
+        return out
+
     @app.get("/api/graph")
-    async def get_graph(project: str | None = None) -> JSONResponse:
+    async def get_graph(project: str | None = None,
+                        combine_csv: str | None = Query(None, alias="projects")) -> JSONResponse:
+        # ?projects=a,b — combined, read-only multi-project view (same shape,
+        # plus "projects" and per-item "sources"). The wire name stays `projects`;
+        # the alias avoids shadowing the projects module in this scope.
+        if combine_csv is not None and combine_csv.strip():
+            return JSONResponse(
+                combine.combined_triples(settings, _combine_slugs(combine_csv)))
         # The knowledge graph is project-scoped only.
         s = dataclasses.replace(settings, project=projects.resolve(settings, project))
         kg = NetworkXKnowledgeGraph(s.graph_path)
@@ -1304,7 +1323,21 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         return out
 
     @app.get("/api/memory")
-    async def get_memory(project: str | None = None) -> JSONResponse:
+    async def get_memory(project: str | None = None,
+                         combine_csv: str | None = Query(None, alias="projects"),
+                         q: str | None = None, top_k: int = 10,
+                         kind: str | None = None) -> JSONResponse:
+        # ?projects=a,b — combined, read-only multi-project view, every item
+        # tagged with its "project" slug. With &q=... it runs the same hybrid
+        # recall memory search uses (score-sorted, cross-project deduped);
+        # without q it merges the projects' recent memories (today's item shape).
+        if combine_csv is not None and combine_csv.strip():
+            slugs = _combine_slugs(combine_csv)
+            if q is not None and q.strip():
+                return JSONResponse(combine.combined_memory_search(
+                    settings, slugs, q.strip(),
+                    top_k=max(1, min(int(top_k), 100)), kind=kind))
+            return JSONResponse(combine.combined_memory_recent(settings, slugs, kind=kind))
         # Show the project's memories plus the shared global memories.
         s = dataclasses.replace(settings, project=projects.resolve(settings, project))
         out = _read_memory(s.db_path, "project") + _read_memory(s.global_db_path, "global")

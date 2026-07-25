@@ -497,12 +497,26 @@
   // merged task-list rows and the composer heading/delivery model.
   // ===========================================================
 
+  // Projects the UI renders. The backend's scratch "default" project still
+  // exists server-side but is never shown or auto-selected in the UI.
+  function visibleProjects(projects) {
+    return (Array.isArray(projects) ? projects : [])
+      .filter(p => p && p.slug && p.slug !== "default");
+  }
+
+  // Empty-state flag: no real (non-default) projects yet -> the main area
+  // shows the first-run "Create your first project" hero instead of a project.
+  function projectsEmptyState(projects) {
+    return visibleProjects(projects).length === 0;
+  }
+
   // /api/projects list + {slug: activity body} -> sidebar nav rows.
   // `multi` = { activity, hasRuns } for the "⋔ Across projects" pseudo-entry,
   // appended only when there is (or was) cross-project work to show.
+  // The scratch "default" project is filtered out (visibleProjects).
   // Text fields are plain — the caller escapes before injecting.
   function sidebarProjectRows(projects, actBySlug, currentSlug, multi) {
-    const rows = (Array.isArray(projects) ? projects : []).map(p => {
+    const rows = visibleProjects(projects).map(p => {
       const m = activityStripModel((actBySlug || {})[p.slug]);
       return {
         slug: String(p.slug || ""), name: String(p.name || p.slug || ""),
@@ -601,6 +615,75 @@
     return { drawable: true, points, last: vals[vals.length - 1], min, max };
   }
 
+  // ===========================================================
+  // Combined knowledge across projects (read-only) — pure models
+  // for the "Combine with…" chips, the query param, per-item
+  // project tags and the combined-view banner.
+  // ===========================================================
+
+  // "Combine with…" chips: every OTHER visible, non-archived project.
+  // Text fields are plain — the caller escapes before injecting.
+  function combineChipsModel(projects, activeSlug, selected) {
+    const sel = new Set(Array.isArray(selected) ? selected : []);
+    return visibleProjects(projects)
+      .filter(p => !p.archived && p.slug !== activeSlug)
+      .map(p => ({
+        slug: String(p.slug),
+        name: String(p.name || p.slug),
+        selected: sel.has(p.slug),
+      }));
+  }
+
+  // Active project + selected chips -> the `projects=` query value (active
+  // first, deduped). "" means no combination -> use the single-project fetch.
+  function combinedProjectsParam(activeSlug, selected) {
+    const out = [];
+    const seen = new Set();
+    [activeSlug].concat(Array.isArray(selected) ? selected : []).forEach(s => {
+      if (s && !seen.has(s)) { seen.add(s); out.push(s); }
+    });
+    return out.length > 1 ? out.join(",") : "";
+  }
+
+  // Which project(s) a combined-view item came from. Reads the additive
+  // "sources" (list) or "project" (string) response fields; tolerates plain
+  // single-project items (returns []).
+  function itemProjects(item) {
+    if (!item) return [];
+    if (Array.isArray(item.sources) && item.sources.length) return item.sources.map(String);
+    if (item.project) return [String(item.project)];
+    return [];
+  }
+
+  // Memory hits / graph nodes -> rows with a per-item project tag. Tags only
+  // exist in combined mode; tag text is plain (caller escapes).
+  function taggedItemRows(items, combined) {
+    return (Array.isArray(items) ? items : []).map(it => {
+      const projects = combined ? itemProjects(it) : [];
+      return { item: it, projects, tag: projects.join(" · ") };
+    });
+  }
+
+  // Combined-view banner: visible only when actually spanning 2+ projects.
+  function combinedBannerModel(projectCount) {
+    const n = Number(projectCount) || 0;
+    if (n < 2) return { visible: false, text: "" };
+    return { visible: true, text: "Combined view — read-only across " + n + " projects" };
+  }
+
+  // Stable per-project accent color for combined graph nodes (cycled palette).
+  const PROJECT_COLORS = ["#C96442", "#5a9bc4", "#3f9f7a", "#9a7bd0",
+                          "#bf9540", "#c2607f", "#5b93a6", "#8fae4f"];
+  function projectColorMap(slugs) {
+    const map = {};
+    (Array.isArray(slugs) ? slugs : []).forEach(s => {
+      if (s && !(s in map)) {
+        map[s] = PROJECT_COLORS[Object.keys(map).length % PROJECT_COLORS.length];
+      }
+    });
+    return map;
+  }
+
   const AdaUtil = {
     escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine,
     makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
@@ -611,6 +694,9 @@
     sparklinePoints,
     makeChildRecord, childrenFromRows, childrenGridModel,
     sidebarProjectRows, projectTabsModel, projectTaskRows, composerModel,
+    visibleProjects, projectsEmptyState,
+    combineChipsModel, combinedProjectsParam, itemProjects, taggedItemRows,
+    combinedBannerModel, projectColorMap,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = AdaUtil;
