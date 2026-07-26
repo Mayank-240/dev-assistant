@@ -66,13 +66,23 @@ specified in [PLAN.md](PLAN.md) and not yet built.
 
 ## CLI · evals · CI
 - `ada run` (`-i`, `--continue`, `--ingest`) · `ada resume` · `ada server` ·
-  `ada eval` (`--only/--json/--repeat/--timeout/--replay/--record-cassettes/--ab`).
+  `ada eval` (`--only/--json/--repeat/--timeout/--replay/--record-cassettes/--ab/--record-history`).
 - 11 golden tasks (multi-language + one cross-project fan-out task) with
   held-out grading + toolchain skips;
   offline replay cassettes in CI; secret-gated live-eval workflow; A/B knob
   harness; retrieval benchmark. CI: pytest + node tests + replay eval.
 - Per-task artifacts: plan/report/brief/activity docs, streamed events.jsonl,
   trace spans, audit log, per-subtask cost.
+- Benchmark tracking over time: `ada eval --record-history` (and
+  `python -m ai_dev_assistant.evals.replay_eval --record-history`, or
+  `ADA_EVAL_RECORD_HISTORY=1`) appends one JSONL entry per suite run to
+  `<data_dir>/benchmarks.jsonl` — timestamp, short git SHA + dirty flag, suite,
+  pass rate, quality mean/min, cost, duration, run count — so you can see
+  whether prompt/agent changes actually improve the assistant across commits.
+  View via `evals.history.trend_report(settings)`: latest entry, deltas vs the
+  previous same-suite entry, and a per-SHA series ready for charting (a UI
+  surface may come later). Recording is strictly opt-in; default eval behavior
+  is unchanged.
 
 ## Core flows
 1. Greenfield task: prompt → plan → parallel agents → verify → tests → docs →
@@ -111,6 +121,14 @@ specified in [PLAN.md](PLAN.md) and not yet built.
   verdict table with cost/quality/branch/review-target, parent ↔ child
   `parent_id` lineage (parent row `project="multi"`), failure isolation (one
   child failing never blocks the others); cross-project composer + parent view.
+- Cross-project task dependencies: fan-out runs accept an optional
+  `project_deps` map (`{slug: [upstream slugs]}` on `POST /api/run`, `deps=` on
+  `run_cross_project`) — dependents run in topological waves after their
+  upstreams, with each upstream's status and summary (bounded, failures
+  included) appended to the dependent's prompt under an
+  `--- Upstream results ---` section. Unknown slugs and cycles are rejected up
+  front (HTTP 400); without deps, behavior and child prompts are unchanged. The
+  rollup report records the dependency order.
 - Cross-project golden eval task (`cross_logging_fix`): two sub-repo fixtures
   imported as two ephemeral projects, driven through the real fan-out path and
   graded per child on held-out tests plus a rollup grader.
@@ -125,6 +143,17 @@ specified in [PLAN.md](PLAN.md) and not yet built.
 - Notifications: webhook + macOS desktop channels, in-app notification center.
 - Global search + cmd+K palette across tasks, memories, KB, and files.
 - Cost analytics: spend dashboard, outcome ratios, per-run subtask breakdowns.
+- Per-role model routing (`role_models` setting, env `ADA_ROLE_MODELS`):
+  comma-separated `role=model` pairs route individual agent roles to their own
+  model while everything unmapped stays on the single default — e.g.
+  `documenter=claude-haiku-4-5,test_engineer=claude-sonnet-4-6` sends docs and
+  test-writing to cheaper models while coder/architect keep the default,
+  cutting cost without touching quality-critical work. `reviewer=...` overrides
+  the verdict reviewer (otherwise governed by `orchestrator_model`); the
+  orchestrator itself is not routable. Malformed pairs and unknown role names
+  are skipped with a logged warning. Works on both backends — on the default
+  `claude_sdk` backend the values are Claude Code model ids
+  (haiku/sonnet/opus family); blank keeps today's single-model behavior.
 - GitHub integration: labeled issues → runs → evidence-first PRs (poll-based;
   token env-only via ADA_GITHUB_TOKEN).
 - A/B replay smoke from the UI; KB drag-and-drop upload; knowledge-graph

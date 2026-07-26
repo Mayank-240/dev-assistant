@@ -77,6 +77,9 @@ def _build_parser() -> argparse.ArgumentParser:
     evalp.add_argument("--ab", metavar="ADA_KNOB=V1,V2", default=None,
                        help="A/B compare the suite under different values of one ADA_* knob "
                             "(combine with --replay for an offline smoke)")
+    evalp.add_argument("--record-history", action="store_true",
+                       help="Append this run's aggregate scores to <data_dir>/benchmarks.jsonl "
+                            "for commit-over-commit tracking (composes with --replay etc.)")
     return parser
 
 
@@ -205,8 +208,18 @@ def _eval(args: argparse.Namespace) -> int:
 
     logging.basicConfig(level=logging.WARNING, format="%(message)s", stream=sys.stderr)
 
+    def _record_history(suite: str, report_obj, settings_obj: Settings | None = None) -> None:
+        """--record-history: append the aggregate scores to <data_dir>/benchmarks.jsonl."""
+        from .evals.history import history_path, record_result
+        s = settings_obj if settings_obj is not None else Settings.load()
+        record_result(s, suite, report_obj)
+        print(f"Recorded benchmark entry ({suite}) -> {history_path(s)}", file=sys.stderr)
+
     # A/B knob comparison: run the suite once per value and compare the arms.
     if args.ab:
+        if args.record_history:
+            print("NOTE: --record-history is ignored with --ab (per-arm reports are not "
+                  "single-suite entries).", file=sys.stderr)
         from .evals.ab import run_ab
         knob, _, vals = args.ab.partition("=")
         values = [v for v in vals.split(",") if v]
@@ -233,11 +246,15 @@ def _eval(args: argparse.Namespace) -> int:
         if args.record_cassettes is not None:
             d = _P(args.record_cassettes) if args.record_cassettes else None
             report = replay_eval.record_cassettes(d)
+            suite = "record-cassettes"
         else:
             d = _P(args.replay) if args.replay else None
             report = replay_eval.run_replay_eval(d, repeat=args.repeat or 1)
+            suite = "replay"
         print(_json.dumps([c.to_dict() for c in report.cards], indent=2) if args.json
               else report.summary())
+        if args.record_history:
+            _record_history(suite, report)
         return 0 if report.passed == len(report.cards) else 1
 
     settings = Settings.load()
@@ -251,6 +268,8 @@ def _eval(args: argparse.Namespace) -> int:
         print(_json.dumps([c.to_dict() for c in report.cards], indent=2))
     else:
         print(report.summary())
+    if args.record_history:
+        _record_history("golden", report, settings)
     return 0 if report.passed == len(report.cards) else 1
 
 

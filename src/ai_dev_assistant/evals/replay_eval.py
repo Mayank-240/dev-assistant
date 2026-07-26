@@ -20,6 +20,7 @@ Nothing machine-specific (paths, run ids, timestamps) reaches any prompt.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -154,10 +155,22 @@ def main(argv: list[str] | None = None) -> int:
                     help="Regenerate the cassettes (offline, scripted provider) instead of replaying")
     ap.add_argument("--cassette-dir", default="",
                     help=f"Cassette directory (default: {CASSETTES_DIR})")
+    ap.add_argument("--record-history", action="store_true",
+                    help="Append the aggregate scores to <data_dir>/benchmarks.jsonl "
+                         "(also enabled by ADA_EVAL_RECORD_HISTORY=1)")
     args = ap.parse_args(argv)
     cdir = Path(args.cassette_dir) if args.cassette_dir else None
     report = record_cassettes(cdir) if args.record else run_replay_eval(cdir)
     print(report.summary())
+    record_history = args.record_history or (
+        os.getenv("ADA_EVAL_RECORD_HISTORY", "").strip().lower() in {"1", "true", "yes"})
+    if record_history:  # opt-in only — default output/behavior stays byte-identical
+        from .history import history_path, record_result
+        settings = Settings.load()
+        suite = "record-cassettes" if args.record else "replay"
+        record_result(settings, suite, report)
+        print(f"Recorded benchmark entry ({suite}) -> {history_path(settings)}",
+              file=sys.stderr)
     return 0 if report.passed == len(report.cards) else 1
 
 
