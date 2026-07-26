@@ -10,7 +10,9 @@ Pure, offline-testable building blocks for the GitHub flow:
   ``GitHubClient.open_pr``);
 - watch the assistant's own open PRs (``list_open_prs`` + ``is_own_pr``) for
   reviewer feedback (``list_pr_comments``) and turn it into a follow-up task on
-  the existing branch (``comments_to_followup`` -> ``FollowUp``).
+  the existing branch (``comments_to_followup`` -> ``FollowUp``);
+- once the follow-up run finishes, report the outcome back on the PR
+  (``format_followup_result`` -> ``GitHubClient.post_issue_comment``).
 
 The server wiring (poll loop, run triggering, dedupe store) lives elsewhere;
 ``seen_marker`` provides the dedupe key it persists.
@@ -200,6 +202,17 @@ class GitHubClient:
         if not ok:
             logger.warning("comment on %s#%s failed: HTTP %s", repo, number, status)
         return ok
+
+    def post_issue_comment(self, repo: str, number: int, body: str) -> bool:
+        """Post a comment on an issue OR a pull request — GitHub's issue-comment
+        endpoint (POST /repos/{repo}/issues/{number}/comments) serves both.
+
+        False without a token (posting requires auth; nothing is sent) and on
+        any HTTP/transport failure. Never raises."""
+        if not self.cfg.token:
+            logger.warning("post_issue_comment(%s#%s) skipped: no token", repo, number)
+            return False
+        return self.comment(repo, number, body)
 
     # -- pull requests ------------------------------------------------------
 
@@ -410,6 +423,51 @@ def pr_body(run_summary: dict) -> str:
     except Exception as exc:  # defensive: a PR must still open with a stub body
         logger.warning("pr_body rendering failed: %s", exc)
         return "## Summary\n\n_Run summary unavailable._\n"
+
+
+def format_followup_result(pr_number: Any, task: dict, verdicts: list[dict]) -> str:
+    """Markdown comment reporting a follow-up run's outcome back on its PR.
+
+    ``task`` is the follow-up run's row (``id``, ``status``, ``cost_usd`` — all
+    optional); ``verdicts`` is a ``[{id, title, status, score}]`` digest in the
+    same shape :func:`pr_body` renders in its Verification table. A
+    ``completed`` run gets the "Addressed reviewer feedback" comment with a
+    footer noting the branch was updated in place; any other terminal status
+    gets an honest did-not-complete variant naming the status. Factual tone
+    throughout. Never raises; tolerates junk input.
+    """
+    try:
+        row = task if isinstance(task, dict) else {}
+        status = str(row.get("status") or "unknown")
+        task_id = str(row.get("id") or "").strip()
+        lines: list[str] = []
+        if status == "completed":
+            lines += ["Addressed reviewer feedback — branch updated.", ""]
+        else:
+            ref = f" (task `{task_id}`)" if task_id else ""
+            lines += [f"The follow-up run for PR #{pr_number}{ref} did not "
+                      f"complete cleanly (status: {status}); see the run for "
+                      "details.", ""]
+        subs = [v for v in (verdicts or []) if isinstance(v, dict)]
+        if subs:
+            lines += ["| Subtask | Verdict | Score |", "| --- | --- | --- |"]
+            for v in subs:
+                name = v.get("title") or v.get("id") or "?"
+                verdict = v.get("status") or "unknown"
+                score = v.get("score")
+                lines.append(f"| {_md_cell(name)} | {_md_cell(verdict)} "
+                             f"| {_md_cell(score if score is not None else '-')} |")
+            lines.append("")
+        cost = row.get("cost_usd")
+        if isinstance(cost, (int, float)):
+            lines += [f"**Cost:** ${cost:.2f}", ""]
+        if status == "completed":
+            lines.append("_The existing branch was updated in place — this "
+                         "PR's diff reflects the new changes._")
+        return "\n".join(lines).strip() + "\n"
+    except Exception as exc:  # defensive: this feeds an automated loop
+        logger.warning("format_followup_result rendering failed: %s", exc)
+        return "Follow-up run finished; see the run for details.\n"
 
 
 def _head_ref(pr: Any) -> str:

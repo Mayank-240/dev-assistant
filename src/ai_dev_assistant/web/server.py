@@ -1450,6 +1450,32 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             return JSONResponse({"error": "name required"}, status_code=400)
         return JSONResponse(projects.create_project(settings, req.name))
 
+    @app.get("/api/fs/browse")
+    async def fs_browse(path: str = "") -> JSONResponse:
+        """Directory picker for the local-import flow. Confined to the user's home
+        tree (the server runs as that user anyway; this keeps the UI from wandering
+        into /etc), hidden dirs skipped, git repos flagged."""
+        home = Path.home().resolve()
+        try:
+            target = (Path(path).expanduser().resolve() if path.strip() else home)
+        except Exception:  # noqa: BLE001 — malformed input falls back to home
+            target = home
+        if not (target == home or home in target.parents) or not target.is_dir():
+            target = home
+        dirs = []
+        try:
+            for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
+                if not child.is_dir() or child.name.startswith("."):
+                    continue
+                dirs.append({"name": child.name, "path": str(child),
+                             "is_git": (child / ".git").exists()})
+                if len(dirs) >= 200:
+                    break
+        except OSError:
+            pass  # unreadable dir: return what we have (usually empty)
+        parent = str(target.parent) if target != home else None
+        return JSONResponse({"path": str(target), "parent": parent, "dirs": dirs})
+
     # ---- F1/F6: project lifecycle (import / status / activity / patch / delete) ----
     # projects.py is growing import_project/project_status/set_policy/archive_project/
     # delete_project in a parallel change; every call is guarded with AttributeError -> 501
@@ -2499,16 +2525,22 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         except (OSError, ValueError):
             data = None
         if not isinstance(data, dict):
-            return {"seen": [], "tracked": {}, "pr_seen": {}}
+            return {"seen": [], "tracked": {}, "pr_seen": {}, "pr_pending": {}}
         seen = data.get("seen")
         tracked = data.get("tracked")
-        # pr_seen ("owner/repo#number" -> last-seen comment created_at) is additive:
-        # files written before PR follow-ups landed simply have none.
+        # pr_seen ("owner/repo#number" -> last-seen comment created_at) and
+        # pr_pending (follow-up task_id -> {repo, pr, attempts?} awaiting its
+        # result comment) are additive: files written before PR follow-ups /
+        # result reporting landed simply have none.
         pr_seen = data.get("pr_seen")
+        pr_pending = data.get("pr_pending")
         return {"seen": [str(m) for m in seen] if isinstance(seen, list) else [],
                 "tracked": dict(tracked) if isinstance(tracked, dict) else {},
                 "pr_seen": ({str(k): str(v) for k, v in pr_seen.items()}
-                            if isinstance(pr_seen, dict) else {})}
+                            if isinstance(pr_seen, dict) else {}),
+                "pr_pending": ({str(k): dict(v) for k, v in pr_pending.items()
+                                if isinstance(v, dict)}
+                               if isinstance(pr_pending, dict) else {})}
 
     def _gh_save_state(state: dict[str, Any]) -> None:
         try:
@@ -2573,6 +2605,22 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             print(f"[ai-dev-assistant] github: completion of {task_id} failed: {exc}",
                   flush=True)
 
+    def _followup_verdicts(task_id: str, row: dict[str, Any]) -> list[dict[str, Any]]:
+        """Subtask verdict digest for the follow-up result comment, in the
+        {id, title, status, score} shape github.format_followup_result (and
+        pr_body's Verification table) renders. [] on any store hiccup."""
+        try:
+            states = app.state.runs.get_subtask_states(task_id) or {}
+            meta = {s.get("id"): s for s in _plan_subtasks(task_id, row)}
+            return [{
+                "id": sid,
+                "title": str((meta.get(sid) or {}).get("title") or ""),
+                "status": st.get("status"),
+                "score": _json_or(st.get("verdict"), {}).get("score"),
+            } for sid, st in sorted(states.items())]
+        except Exception:  # noqa: BLE001 — a comment must never crash the tick
+            return []
+
     async def _github_tick() -> None:
         """One poll cycle: new labeled issues become runs (deduped via the persisted
         seen-set); tracked runs that finished get a pushed branch + PR + comment."""
@@ -2584,6 +2632,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         seen = set(state["seen"])
         tracked: dict[str, Any] = state["tracked"]
         pr_seen: dict[str, str] = state["pr_seen"]
+        pr_pending: dict[str, dict[str, Any]] = state["pr_pending"]
         dirty = False
         started = 0
         for repo, slug in cfg.repo_map.items():
@@ -2667,8 +2716,48 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                         continue
                     if latest:
                         pr_seen[key] = latest
+                    pr_pending[task_id] = {"repo": repo, "pr": number}
                     dirty = True
                     started += 1
+            # Result sub-pass: a follow-up run that reached a terminal status
+            # reports its outcome back on the PR (pr_pending: task_id ->
+            # {repo, pr, attempts?}). A failed post stays pending for retry on
+            # a later tick, capped at 3 attempts, then dropped with a warning.
+            # A successful post also bumps pr_seen past "now" so the bot's own
+            # comment can never seed a new follow-up (the client's self-comment
+            # filter already drops it via the cached /user — belt and braces).
+            for task_id in list(pr_pending):
+                ref = pr_pending.get(task_id) or {}
+                row = app.state.runs.get(task_id)
+                if row is None:  # run row deleted — nothing left to report
+                    pr_pending.pop(task_id, None)
+                    dirty = True
+                    continue
+                if (row.get("status") or "") not in _TERMINAL_STATUSES:
+                    continue
+                repo = str(ref.get("repo") or "")
+                number = ref.get("pr")
+                key = f"{repo}#{number}"
+                posted = False
+                if repo and number is not None:
+                    body = github.format_followup_result(
+                        number, row, _followup_verdicts(task_id, row))
+                    posted = await asyncio.to_thread(
+                        client.post_issue_comment, repo, number, body)
+                if posted:
+                    pr_pending.pop(task_id, None)
+                    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    pr_seen[key] = max(pr_seen.get(key, ""), now)
+                else:
+                    attempts = int(ref.get("attempts") or 0) + 1
+                    if attempts >= 3:
+                        print(f"[ai-dev-assistant] github: result comment for "
+                              f"{key} (task {task_id}) failed {attempts} times "
+                              "— giving up", flush=True)
+                        pr_pending.pop(task_id, None)
+                    else:
+                        pr_pending[task_id] = {**ref, "attempts": attempts}
+                dirty = True
         # Completion pass: finished tracked runs -> branch push + PR, then untrack.
         for task_id in list(tracked):
             ref = tracked.get(task_id) or {}
@@ -2683,7 +2772,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             tracked.pop(task_id, None)
             dirty = True
         if dirty:
-            _gh_save_state({"seen": sorted(seen), "tracked": tracked, "pr_seen": pr_seen})
+            _gh_save_state({"seen": sorted(seen), "tracked": tracked,
+                            "pr_seen": pr_seen, "pr_pending": pr_pending})
         if started:
             _pump()
 

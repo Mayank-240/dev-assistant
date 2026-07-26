@@ -54,6 +54,18 @@ specified in [PLAN.md](PLAN.md) and not yet built.
 - Memory: hybrid semantic+lexical recall (RRF), dedup, decay, caps,
   project/global scopes; KB ingest/search; per-project knowledge graph
   (merge-on-save); reflection lessons (DO/AVOID/ROUTING); feedback → planning.
+- Knowledge-graph distillation: `ai-dev-assistant project distill <slug>
+  [--dry-run]` consolidates the graph's domain layer as runs accumulate — pure
+  heuristics plus local embeddings, no LLM calls, deterministic and free. It
+  merges near-duplicate concepts (plural/hyphen/stopword id variants; label
+  embedding cosine ≥ 0.92 when a real embedder is active — the hash backend
+  skips semantic merges), redirecting the dropped node's edges with provenance
+  unioned and load-merge weight semantics; prunes stale low-weight domain edges
+  (weight < 2 and untouched > 45 days, with the top-20 weighted hubs protected)
+  and removes orphaned degree-0 concepts. Run-layer bookkeeping edges are never
+  touched, merges never cross node types, a second pass is a no-op, and graphs
+  under 10 domain edges are left alone. `--dry-run` prints the proposed
+  merge/prune/orphan report without changing anything.
 
 ## Real-repo work
 - Materialize local path / git URL; branch+commit delivery; per-subtask git
@@ -153,6 +165,19 @@ specified in [PLAN.md](PLAN.md) and not yet built.
   expands the workspace — or a validated subset, dropping edges to excluded
   members — into the `projects` + `deps` payload fed straight into the
   existing cross-project fan-out run path.
+- Workspace-aware context (`workspace_context`, env `ADA_WORKSPACE_CONTEXT`,
+  on by default): when the active project belongs to a workspace with at least
+  one sibling, each subtask's context gains one extra part — "Related knowledge
+  from workspace '<name>'" — holding the top memories (top 2, same min-score as
+  the project's own recall) and KB hits (top 2) from up to 3 sibling projects,
+  queried with the same text as the project's own knowledge lookup. Every item
+  is attributed `[<sibling slug>] …`, the whole section is wrapped as untrusted
+  content (`source="workspace-sibling"`), capped at ~1500 chars, and placed
+  AFTER the project's own recall/KB parts so it yields first under the context
+  budget. Sibling stores are opened read-only via the memory module's
+  never-create wrapper — a sibling without a `memory.db` contributes nothing
+  and no files are created; per-sibling failures are swallowed (debug log).
+  Projects outside any workspace assemble byte-identical prompts to before.
 - Cross-project golden eval task (`cross_logging_fix`): two sub-repo fixtures
   imported as two ephemeral projects, driven through the real fan-out path and
   graded per child on held-out tests plus a rollup grader.
@@ -204,7 +229,14 @@ specified in [PLAN.md](PLAN.md) and not yet built.
   original task (continue_from lineage, same workspace + `ada/<task-id>` branch)
   when the head branch maps to a known run, else a fresh run on the repo's
   project. Per-PR last-seen timestamps persist in `github_seen.json`; every
-  batch is a billed run.
+  batch is a billed run. The loop closes back to the reviewer: when a
+  follow-up run reaches a terminal status, the poller posts a result comment
+  on the PR — "Addressed reviewer feedback — branch updated." with a compact
+  subtask-verdict table and the cost for a completed run, or an honest
+  did-not-complete note naming the status otherwise. Pending result comments
+  persist under `pr_pending` in `github_seen.json`; a failed post retries on
+  later ticks (capped at 3 attempts), and a successful post bumps the PR's
+  last-seen cursor so the bot's own comment never seeds a new follow-up.
 - Cron schedules: schedule create/update accept a 5-field `cron` expression as
   an alternative to `every_hours` (mutually exclusive; validated with a clear
   400 on bad expressions); the 60s tick fires on matching local-time minutes.

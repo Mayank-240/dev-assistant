@@ -1286,7 +1286,7 @@ def _qpayload(entry):
     return json.loads(payload) if isinstance(payload, str) else payload
 
 
-def _followup_client(tmp_path, monkeypatch, *, enable=True):
+def _followup_client(tmp_path, monkeypatch, *, enable=True, post_status=None):
     monkeypatch.setenv("ADA_GITHUB_TOKEN", "gh-test-token")
     c = _client(tmp_path)
     c.app.state.paused = True  # keep the pump from ever launching a real engine
@@ -1295,6 +1295,8 @@ def _followup_client(tmp_path, monkeypatch, *, enable=True):
         patch["github_pr_followups"] = True
     assert c.patch("/api/settings", json=patch).status_code == 200
     calls = []
+    posts = []  # (url, body) of every POSTed comment (follow-up result reports)
+    post_status = post_status if post_status is not None else {"code": 201}
 
     comments = [{"id": 11, "user": {"login": "reviewer"},
                  "body": "please rename the helper",
@@ -1303,6 +1305,9 @@ def _followup_client(tmp_path, monkeypatch, *, enable=True):
     def transport(method, url, headers, body):
         calls.append((method, url, body))
         assert "gh-test-token" in headers.get("Authorization", "")
+        if method == "POST" and url.endswith("/comments"):
+            posts.append((url, body))
+            return post_status["code"], {"id": 99}
         if "/repos/acme/widget/issues?" in url:
             return 200, []
         if url.endswith("/user"):
@@ -1325,11 +1330,22 @@ def _followup_client(tmp_path, monkeypatch, *, enable=True):
         return 200, []
 
     c.app.state.github_transport = transport
-    return c, calls
+    return c, calls, posts
+
+
+def _followup_task_ids(c):
+    """Pending follow-up queue task_ids keyed by the PR number in their prompt."""
+    out = {}
+    for entry in c.app.state.runs.queue_pending():
+        prompt = _qpayload(entry)["prompt"]
+        for n in (5, 6):
+            if f"PR #{n} " in prompt:
+                out[n] = entry["task_id"]
+    return out
 
 
 def test_github_pr_followups_reengage_fresh_and_dedupe(tmp_path, monkeypatch):
-    c, _calls = _followup_client(tmp_path, monkeypatch)
+    c, _calls, _posts = _followup_client(tmp_path, monkeypatch)
     # the branch ada/task-known maps to a known finished run on 'default'
     st = c.app.state.runs
     st.start("task-known", "original work", title="Original", project="default")
@@ -1363,10 +1379,125 @@ def test_github_pr_followups_reengage_fresh_and_dedupe(tmp_path, monkeypatch):
 
 
 def test_github_pr_followups_disabled_by_default(tmp_path, monkeypatch):
-    c, calls = _followup_client(tmp_path, monkeypatch, enable=False)
+    c, calls, _posts = _followup_client(tmp_path, monkeypatch, enable=False)
     asyncio.run(c.app.state.github_tick())
     assert c.app.state.runs.queue_pending() == []
     assert not any("/pulls?" in u for (_m, u, _b) in calls)  # PRs never listed
+
+
+def test_github_pr_followup_enqueue_records_pr_pending(tmp_path, monkeypatch):
+    c, _calls, posts = _followup_client(tmp_path, monkeypatch)
+    asyncio.run(c.app.state.github_tick())
+    ids = _followup_task_ids(c)
+    state = json.loads((tmp_path / "data" / "github_seen.json").read_text())
+    assert state["pr_pending"] == {
+        ids[5]: {"repo": "acme/widget", "pr": 5},
+        ids[6]: {"repo": "acme/widget", "pr": 6},
+    }
+    assert posts == []  # both runs still queued — nothing to report yet
+
+
+def test_github_pr_followup_completed_posts_result_comment_once(tmp_path, monkeypatch):
+    c, _calls, posts = _followup_client(tmp_path, monkeypatch)
+    asyncio.run(c.app.state.github_tick())
+    ids = _followup_task_ids(c)
+    tid = ids[5]
+    st = c.app.state.runs
+    st.start(tid, "follow-up work", title="Follow-up", project="default")
+    st.checkpoint_subtask(tid, "s1", status="passed", attempts=1, result="ok",
+                          verdict_json=json.dumps({"passed": True, "score": 91}))
+    st.finish(tid, status="completed", cost_usd=1.5)
+
+    asyncio.run(c.app.state.github_tick())
+    assert len(posts) == 1
+    url, body = posts[0]
+    assert url == "https://api.github.com/repos/acme/widget/issues/5/comments"
+    text = body["body"]
+    assert text.startswith("Addressed reviewer feedback — branch updated.")
+    assert "| s1 | passed | 91 |" in text            # verdict digest
+    assert "**Cost:** $1.50" in text
+    assert "updated in place" in text                # footer
+    state = json.loads((tmp_path / "data" / "github_seen.json").read_text())
+    assert tid not in state["pr_pending"]            # cleared on success
+    assert state["pr_pending"] == {ids[6]: {"repo": "acme/widget", "pr": 6}}
+    # pr_seen bumped past the batch so our own comment can never re-trigger
+    assert state["pr_seen"]["acme/widget#5"] > "2026-07-20T10:00:00Z"
+
+    asyncio.run(c.app.state.github_tick())
+    assert len(posts) == 1                           # exactly once
+    assert len(c.app.state.runs.queue_pending()) == 2  # no self-triggered run
+
+
+def test_github_pr_followup_result_post_retries_then_caps(tmp_path, monkeypatch):
+    box = {"code": 500}
+    c, _calls, posts = _followup_client(tmp_path, monkeypatch, post_status=box)
+    asyncio.run(c.app.state.github_tick())
+    tid = _followup_task_ids(c)[5]
+    c.app.state.runs.set_status(tid, "completed")
+    state_path = tmp_path / "data" / "github_seen.json"
+
+    asyncio.run(c.app.state.github_tick())           # attempt 1 fails
+    state = json.loads(state_path.read_text())
+    assert state["pr_pending"][tid] == {"repo": "acme/widget", "pr": 5,
+                                        "attempts": 1}
+    asyncio.run(c.app.state.github_tick())           # attempt 2 fails
+    assert json.loads(state_path.read_text())["pr_pending"][tid]["attempts"] == 2
+    asyncio.run(c.app.state.github_tick())           # attempt 3 fails — give up
+    state = json.loads(state_path.read_text())
+    assert tid not in state["pr_pending"]
+    assert len(posts) == 3
+    # never posted -> the last-seen cursor was never bumped
+    assert state["pr_seen"]["acme/widget#5"] == "2026-07-20T10:00:00Z"
+
+    asyncio.run(c.app.state.github_tick())           # dropped: no more attempts
+    assert len(posts) == 3
+
+
+def test_github_pr_followup_failed_run_posts_honest_variant(tmp_path, monkeypatch):
+    c, _calls, posts = _followup_client(tmp_path, monkeypatch)
+    asyncio.run(c.app.state.github_tick())
+    tid = _followup_task_ids(c)[6]
+    c.app.state.runs.set_status(tid, "failed")
+    asyncio.run(c.app.state.github_tick())
+    assert len(posts) == 1
+    url, body = posts[0]
+    assert url.endswith("/repos/acme/widget/issues/6/comments")
+    assert f"(task `{tid}`)" in body["body"]
+    assert "did not complete cleanly (status: failed)" in body["body"]
+    assert "Addressed reviewer feedback" not in body["body"]
+
+
+def test_github_pr_followup_result_pass_gated_off(tmp_path, monkeypatch):
+    c, _calls, posts = _followup_client(tmp_path, monkeypatch, enable=False)
+    st = c.app.state.runs
+    st.start("t-old", "x", title="T", project="default")
+    st.set_status("t-old", "completed")
+    state_path = tmp_path / "data" / "github_seen.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    pending = {"t-old": {"repo": "acme/widget", "pr": 5}}
+    state_path.write_text(json.dumps({
+        "seen": [], "tracked": {},
+        "pr_seen": {"acme/widget#5": "2026-07-20T10:00:00Z"},
+        "pr_pending": pending,
+    }))
+    asyncio.run(c.app.state.github_tick())
+    assert posts == []  # gated: no result comment, zero behavior change
+    assert json.loads(state_path.read_text())["pr_pending"] == pending
+
+
+def test_github_pr_followup_pending_dropped_when_run_deleted(tmp_path, monkeypatch):
+    c, _calls, posts = _followup_client(tmp_path, monkeypatch)
+    state_path = tmp_path / "data" / "github_seen.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "seen": [], "tracked": {},
+        "pr_seen": {"acme/widget#5": "2026-07-20T10:00:00Z",
+                    "acme/widget#6": "2026-07-20T10:00:00Z"},
+        "pr_pending": {"ghost": {"repo": "acme/widget", "pr": 5}},
+    }))
+    asyncio.run(c.app.state.github_tick())
+    assert posts == []  # no run row left — nothing to report
+    assert json.loads(state_path.read_text())["pr_pending"] == {}
 
 
 # ---- QoL wave: Slack/email notify settings reach the dispatch config ----

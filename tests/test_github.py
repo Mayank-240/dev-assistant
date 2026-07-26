@@ -202,6 +202,97 @@ def test_comment_failure_paths():
 
 
 # ---------------------------------------------------------------------------
+# post_issue_comment
+# ---------------------------------------------------------------------------
+
+def test_post_issue_comment_payload_and_success():
+    client, transport = _client([(201, {"id": 1})])
+    assert client.post_issue_comment("o/r", 12, "result") is True
+    method, url, headers, body = transport.calls[0]
+    assert method == "POST"
+    # the issues comment endpoint serves PRs too
+    assert url == "https://api.github.com/repos/o/r/issues/12/comments"
+    assert body == {"body": "result"}
+    assert headers["Authorization"] == f"Bearer {TOKEN}"
+
+
+def test_post_issue_comment_no_token_sends_nothing():
+    cfg = GitHubConfig(token="", label="ada", repo_map={"o/r": "proj"})
+    transport = FakeTransport([(201, {"id": 1})])
+    client = GitHubClient(cfg, transport=transport)
+    assert client.post_issue_comment("o/r", 12, "result") is False
+    assert transport.calls == []  # no anonymous POST
+
+
+def test_post_issue_comment_failure_paths():
+    client, _ = _client([(403, {"message": "forbidden"})])
+    assert client.post_issue_comment("o/r", 12, "x") is False
+    cfg = GitHubConfig(token=TOKEN, repo_map={"o/r": "p"})
+    raising = GitHubClient(cfg, transport=_raising_transport)
+    assert raising.post_issue_comment("o/r", 12, "x") is False
+
+
+# ---------------------------------------------------------------------------
+# format_followup_result
+# ---------------------------------------------------------------------------
+
+RESULT_VERDICTS = [
+    {"id": "s1", "title": "Implement cache", "status": "passed", "score": 92},
+    {"id": "s2", "title": "Docs | examples", "status": "failed", "score": 40},
+    {"id": "s3", "status": "passed"},
+]
+
+
+def test_format_followup_result_completed_snapshot():
+    task = {"id": "t-9", "status": "completed", "cost_usd": 1.239}
+    expected = (
+        "Addressed reviewer feedback — branch updated.\n"
+        "\n"
+        "| Subtask | Verdict | Score |\n"
+        "| --- | --- | --- |\n"
+        "| Implement cache | passed | 92 |\n"
+        "| Docs \\| examples | failed | 40 |\n"
+        "| s3 | passed | - |\n"
+        "\n"
+        "**Cost:** $1.24\n"
+        "\n"
+        "_The existing branch was updated in place — this PR's diff reflects "
+        "the new changes._\n"
+    )
+    assert gh.format_followup_result(12, task, RESULT_VERDICTS) == expected
+
+
+def test_format_followup_result_failed_variant_snapshot():
+    task = {"id": "t-9", "status": "failed"}
+    expected = (
+        "The follow-up run for PR #12 (task `t-9`) did not complete cleanly "
+        "(status: failed); see the run for details.\n"
+    )
+    assert gh.format_followup_result(12, task, []) == expected
+
+
+def test_format_followup_result_partial_is_honest_but_keeps_evidence():
+    task = {"id": "t-9", "status": "partial", "cost_usd": 0.5}
+    out = gh.format_followup_result(7, task, RESULT_VERDICTS)
+    assert "did not complete cleanly (status: partial)" in out
+    assert "PR #7" in out
+    assert "Addressed reviewer feedback" not in out
+    assert "updated in place" not in out          # no success footer
+    assert "| Implement cache | passed | 92 |" in out
+    assert "**Cost:** $0.50" in out
+
+
+def test_format_followup_result_tolerates_junk():
+    out = gh.format_followup_result(1, None, "not-a-list")
+    assert "(status: unknown)" in out             # honest fallback, never raises
+    assert isinstance(gh.format_followup_result(None, {}, [{"bad": 1}, "junk"]), str)
+    # a completed run with no verdicts/cost still renders header + footer
+    out = gh.format_followup_result(3, {"status": "completed"}, [])
+    assert out.startswith("Addressed reviewer feedback — branch updated.")
+    assert "updated in place" in out
+
+
+# ---------------------------------------------------------------------------
 # open_pr
 # ---------------------------------------------------------------------------
 
