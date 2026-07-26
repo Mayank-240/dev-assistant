@@ -374,3 +374,36 @@ def test_cherry_pick_refuses_checked_out_target(workspace: Path, tmp_path: Path)
     sha = _commit_in(wt_path, "plain.txt", "plain\n", "t1: plain")
     res = vcs.cherry_pick_merge(workspace, sha, "main")
     assert res == {"merged": False, "conflict": False, "error": "target branch is checked out"}
+
+
+def test_worktree_add_with_relative_workspace_path(tmp_path, monkeypatch):
+    """Regression: git resolves relative worktree paths against -C, silently nesting
+    the worktree INSIDE the workspace at a phantom path while callers use the intended
+    one (observed live with ADA_WORKSPACE_DIR=workspace). Paths must be absolutized."""
+    import subprocess
+    from pathlib import Path
+
+    from ai_dev_assistant import vcs
+
+    ws_abs = tmp_path / "ws"
+    ws_abs.mkdir()
+    (ws_abs / "base.txt").write_text("base\n")
+    for args in (("init", "-q"), ("add", "-A"),
+                 ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "b")):
+        subprocess.run(["git", *args], cwd=ws_abs, check=True, capture_output=True)
+
+    monkeypatch.chdir(tmp_path)
+    rel = Path("ws")  # relative, like a relative ADA_WORKSPACE_DIR in production
+
+    wt = vcs.worktree_add(rel, "sX")
+    assert wt.is_absolute() and wt.is_dir()
+    assert (wt / "base.txt").is_file(), "worktree checkout must be populated"
+    # no phantom nested worktree inside the workspace
+    assert not (ws_abs / "ws").exists()
+
+    (wt / "new.txt").write_text("n\n")
+    res = vcs.worktree_merge(rel, "sX", message="m")
+    assert res.get("merged"), res
+    assert (ws_abs / "new.txt").is_file()
+    vcs.worktree_remove(rel, "sX")
+    assert not wt.exists()

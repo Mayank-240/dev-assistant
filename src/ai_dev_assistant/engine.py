@@ -273,9 +273,12 @@ class Engine:
             # Project task (F2): the workspace is a git worktree OUTSIDE the checkout,
             # on branch ada/<rid>. It persists after the run — review, files, continue,
             # and resume all read it; it's removed when the task is deleted.
-            run_ws = self.settings.workspace_dir / self.settings.project / "worktrees" / rid
+            # Resolved absolute: git resolves relative worktree paths against -C, which
+            # silently nests them (observed in production with ADA_WORKSPACE_DIR=workspace).
+            run_ws = (self.settings.workspace_dir / self.settings.project
+                      / "worktrees" / rid).resolve()
         else:
-            run_ws = self.settings.run_workspace(rid)
+            run_ws = self.settings.run_workspace(rid).resolve()
             run_ws.mkdir(parents=True, exist_ok=True)  # agents (and repo materialize) write here
         self.last_run_workspace = run_ws
         self._tracer = Tracer(self.settings.docs_dir / rid / "trace.jsonl", enabled=self.settings.trace)

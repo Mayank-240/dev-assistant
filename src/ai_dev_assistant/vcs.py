@@ -112,6 +112,7 @@ def worktree_add(workspace: Path, subtask_id: str) -> Path:
     on branch ``ada/wt-{subtask_id}``; the container dir is excluded from status
     via ``.git/info/exclude`` (not .gitignore, so the repo's files are untouched).
     """
+    workspace = workspace.resolve()  # git resolves relative worktree paths against -C
     if _git(["rev-parse", "--git-dir"], workspace).returncode != 0:
         raise ValueError(f"not a git repository: {workspace}")
 
@@ -151,6 +152,7 @@ def worktree_merge(workspace: Path, subtask_id: str, *, message: str) -> dict:
     {"merged": False, "conflict": True, "files": [...]} on conflict — in which
     case the merge is aborted so the main workspace is left clean.
     """
+    workspace = workspace.resolve()  # git resolves relative worktree paths against -C
     wt_path = _worktree_path(workspace, subtask_id)
     _commit_all(wt_path, message)
 
@@ -178,6 +180,7 @@ def worktree_merge(workspace: Path, subtask_id: str, *, message: str) -> dict:
 
 def worktree_remove(workspace: Path, subtask_id: str) -> None:
     """Best-effort removal of the subtask's worktree and branch; never raises."""
+    workspace = workspace.resolve()  # git resolves relative worktree paths against -C
     try:
         wt_path = _worktree_path(workspace, subtask_id)
         _git(["worktree", "remove", "--force", str(wt_path)], workspace)
@@ -241,6 +244,8 @@ def task_worktree_add(repo: Path, wt_path: Path, task_id: str, *, base: str = ""
 
     Returns ``{"path": str, "branch": "ada/<task_id>", "created": bool}``.
     """
+    repo = repo.resolve()
+    wt_path = wt_path.resolve()
     repo = Path(repo)
     if _git(["rev-parse", "--git-dir"], repo).returncode != 0:
         raise ValueError(f"not a git repository: {repo}")
@@ -268,6 +273,8 @@ def task_worktree_remove(repo: Path, wt_path: Path, task_id: str, *, keep_branch
 
     The ``ada/{task_id}`` branch survives unless ``keep_branch=False``.
     """
+    repo = repo.resolve()
+    wt_path = wt_path.resolve()
     try:
         wt = Path(wt_path)
         _git(["worktree", "remove", "--force", str(wt)], repo)
