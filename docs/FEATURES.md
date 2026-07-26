@@ -54,6 +54,23 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   routed by capability descriptions + past lessons + human feedback + agent
   track records + repo map. Structural validation (cycles/dupes/dangling/size
   cap).
+- Roster pre-filtering (`roster_max` / `ADA_ROSTER_MAX`, default 10, 0 = off):
+  the planning catalog lists a core set (coder, researcher, test_engineer,
+  debugger, documenter) + every custom agent + the top task-relevant other
+  specialists up to the cap, ranked by embedding-cosine similarity between the
+  task and each agent's description/when_to_use blended with lexical token
+  overlap (lexical-only on the hash backend, as everywhere). Filtering changes
+  only the catalog text — every agent stays constructed and routable if a plan
+  names it. Track-record priors annotate listed roles with
+  "(recent: 8/9 passed)" once a role has ≥5 recorded outcomes
+  (`run_store.agent_stats`, aggregate or per-project), and a role whose last 3
+  outcomes in the active project all failed is dropped from the ranked slots
+  (core/custom roles are kept with a warning note instead).
+- Upstream result digests: a subtask with `depends_on` gets one "Upstream
+  results" context part — each completed upstream's result text as a
+  `[<id> <title>]`-prefixed digest (~500 chars each, ~1500 total, caveat-marked
+  for soft passes); failed upstreams contribute a status line only. Dependency-
+  free subtasks assemble byte-identical prompts (cassette rule).
 - Interactive plan mode (CLI `run -i`, web composer): propose → refine in plain
   English (`POST /api/plan/refine`) → approve → run.
 - Rolling scheduler (dependents start the moment a dep finishes), session pool
@@ -75,7 +92,21 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   test_engineer, documenter), quality roles (debugger, refactorer,
   security_auditor, accessibility_auditor, ux_reviewer), domain roles (devops,
   database, frontend, performance, integrator), delivery roles (api_designer,
-  migrator, release_manager). Review-oriented roles run read-only.
+  migrator, release_manager). Every persona (and the reviewer) ends with a
+  role-specific **definition-of-done checklist** — e.g. test_engineer: tests
+  were RUN, failed before / pass after, no weakened assertions;
+  security_auditor: findings table with severity + file:line + fix, explicit
+  "no findings" when clean; documenter: doc files verified on disk by
+  read-back.
+- Per-role toolsets: every role carries the same read+coordination core —
+  read-side tools plus the four coordination writes (`kg_write`,
+  `blackboard_write`, `remember`, `send_message`; read-only means read-only on
+  FILES, never on coordination). Write-side capability is granted per role:
+  file writes for producing roles (documenter included, for doc files),
+  exec (`run_tests`/`run_command`) only where execution is the point,
+  `install_packages` only for roles that manage the dependency set
+  (coder, test_engineer, debugger, devops, database, frontend, integrator,
+  migrator); auditors keep no exec and no file writes.
 - Custom agents: operator-defined specialists (name, description, when_to_use,
   system_prompt, tools, optional effort/model) editable from the console's
   **Agents** view or `<data_dir>/custom_agents.json`, validated on load/upsert
@@ -84,6 +115,15 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   `{builtin, custom, tools}`, `POST /api/agents {spec}`,
   `DELETE /api/agents/{name}` (400 for builtins). New runs pick customs up
   automatically.
+- Project-scoped custom agents: an optional `project` field on the spec
+  ("" = global, the default). All entries live in the single
+  `custom_agents.json`; a run's roster is globals + the active
+  `settings.project`'s own customs. The slug must name an existing project
+  (save rejects unknown slugs, load skips them with a warning); names are
+  globally unique across the file, so a scoped custom can shadow neither a
+  builtin nor a global nor another project's agent.
+  `list_custom_agents(settings, project=…)` filters: `None` = all scopes,
+  `""` = globals only, a slug = that project's own (globals not included).
 - Per-role model routing (`role_models` / `ADA_ROLE_MODELS`): comma-separated
   `role=model` pairs route individual roles (customs included) to their own
   model; `reviewer=...` overrides the verdict reviewer; the orchestrator itself
@@ -204,7 +244,13 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   repo workspace (project checkout or repo-backed) index it at run start
   (worker thread, time-capped, failures ignored) and each subtask gets the
   best-matching chunks as a "Relevant code (indexed)" untrusted part right
-  after the repo map. Strictly conditional: greenfield/eval runs never build
+  after the repo map. Retrieval is role-weighted: the subtask's agent role
+  biases ranking toward its path affinities (frontend → .html/.css/.js/.tsx/
+  static/components, database → .sql/migrations/schema/models, devops →
+  Dockerfile/.yml/.yaml/ci/deploy, test_engineer → tests//test_/spec,
+  api_designer → routes/api/openapi) via a ×1.5 score boost over a wider
+  candidate pool — a bias, never a hard filter; unmapped roles get no bias.
+  Strictly conditional: greenfield/eval runs never build
   the index, so their prompts are byte-identical with the setting on or off.
 
 ## Search & palette

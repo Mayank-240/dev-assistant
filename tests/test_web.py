@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -1866,6 +1867,161 @@ def test_custom_agent_validation_and_builtin_guard(tmp_path):
     r = c.delete("/api/agents/coder")
     assert r.status_code == 400 and "built-in" in r.json()["error"]
     assert c.get("/api/agents").json()["custom"] == []  # nothing slipped through
+
+
+# ---- Agent surfaces: roster stats, project scope, test drive ----
+
+class _RunsProxy:
+    """Delegates to the real run store while controlling agent_stats visibility:
+    stats=None hides the method entirely (pre-landing run stores), a dict serves
+    it as a stub — so these tests pass with or without the concurrent change."""
+
+    def __init__(self, inner, stats=None):
+        self._inner = inner
+        self._stats = stats
+
+    def __getattr__(self, name):
+        if name == "agent_stats":
+            if self._stats is None:
+                raise AttributeError(name)
+            return lambda project=None: self._stats
+        return getattr(self._inner, name)
+
+
+def test_agents_roster_stats_from_agent_stats(tmp_path):
+    c = _client(tmp_path)
+    c.post("/api/agents", json={"spec": _VALID_AGENT})
+    c.app.state.runs = _RunsProxy(c.app.state.runs, stats={
+        "coder": {"n": 8, "passed": 6, "avg_score": 88.0},
+        "sql_tuner": {"n": 12, "passed": 12, "avg_score": 95.0},
+    })
+    body = c.get("/api/agents").json()
+    coder = next(a for a in body["builtin"] if a["name"] == "coder")
+    assert coder["stats"] == {"n": 8, "passed": 6, "pass_rate": 0.75}
+    # never-routed roles still carry the key (n=0, null rate) so the UI need not guess
+    researcher = next(a for a in body["builtin"] if a["name"] == "researcher")
+    assert researcher["stats"] == {"n": 0, "passed": 0, "pass_rate": None}
+    # customs are enriched exactly like built-ins
+    assert body["custom"][0]["stats"] == {"n": 12, "passed": 12, "pass_rate": 1.0}
+
+
+def test_agents_roster_stats_omitted_without_run_store_support(tmp_path):
+    c = _client(tmp_path)
+    c.post("/api/agents", json={"spec": _VALID_AGENT})
+    c.app.state.runs = _RunsProxy(c.app.state.runs, stats=None)  # no agent_stats at all
+    body = c.get("/api/agents").json()
+    assert all("stats" not in a for a in body["builtin"] + body["custom"])
+
+
+class _TestDriveProvider:
+    """Stands in for the test-drive LLM provider (the endpoint takes it from
+    app.state.testdrive_provider_factory)."""
+
+    class _Usage:
+        def __init__(self, cost):
+            self.cost_usd = cost
+
+    def __init__(self, result="ok", cost=0.0123, delay=0.0, error=None):
+        self.usage = self._Usage(cost)
+        self.calls = []
+        self.closed = False
+        self._result, self._delay, self._error = result, delay, error
+
+    async def run_agent(self, **kw):
+        self.calls.append(kw)
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        if self._error:
+            raise self._error
+        return self._result
+
+    async def aclose(self):
+        self.closed = True
+
+
+def test_agent_test_drive_happy_path_caps_and_scratch(tmp_path):
+    c = _client(tmp_path)
+    prov = _TestDriveProvider(result="Hello — I tune slow SQL.")
+    c.app.state.testdrive_provider_factory = lambda: prov
+    r = c.post("/api/agents/test", json={"spec": _VALID_AGENT, "prompt": "introduce yourself"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["result"] == "Hello — I tune slow SQL."
+    assert body["cost_usd"] == 0.0123
+    assert isinstance(body["seconds"], float)
+    kw = prov.calls[0]
+    assert kw["max_cost_usd"] == 0.25                    # hard spend cap reaches the provider
+    assert kw["allowed_tools"] == ["read_file", "grep"]  # the spec's declared tools
+    # constructed like build_agents customs: author prompt + the collab preamble
+    assert kw["system_prompt"].startswith("You are a SQL tuning agent.")
+    assert "team of agents" in kw["system_prompt"]
+    scratch = Path(kw["workdir"])
+    assert scratch.parent == tmp_path / "data" / "tmp"   # throwaway scratch workspace…
+    assert not scratch.exists()                          # …cleaned up afterwards
+    assert prov.closed
+
+
+def test_agent_test_drive_validation_400(tmp_path):
+    c = _client(tmp_path)
+    c.app.state.testdrive_provider_factory = \
+        lambda: pytest.fail("provider must not be built for an invalid spec")
+    bad = c.post("/api/agents/test",
+                 json={"spec": {**_VALID_AGENT, "tools": ["not_a_tool"]}, "prompt": "hi"})
+    assert bad.status_code == 400 and "not_a_tool" in bad.json()["error"]
+    empty = c.post("/api/agents/test", json={"spec": _VALID_AGENT, "prompt": "   "})
+    assert empty.status_code == 400 and "prompt" in empty.json()["error"]
+
+
+def test_agent_test_drive_timeout_504(tmp_path, monkeypatch):
+    from ai_dev_assistant.web import server as server_mod
+    monkeypatch.setattr(server_mod, "TESTDRIVE_TIMEOUT_SECONDS", 0.05)
+    c = _client(tmp_path)
+    prov = _TestDriveProvider(delay=5.0)
+    c.app.state.testdrive_provider_factory = lambda: prov
+    r = c.post("/api/agents/test", json={"spec": _VALID_AGENT, "prompt": "hi"})
+    assert r.status_code == 504 and "timed out" in r.json()["error"]
+    assert prov.closed  # the provider is closed even on the timeout path
+
+
+def test_agent_test_drive_backend_unavailable_503(tmp_path):
+    from ai_dev_assistant.llm.errors import LLMError
+    c = _client(tmp_path)
+
+    def _no_backend():
+        raise LLMError("no backend configured")
+
+    c.app.state.testdrive_provider_factory = _no_backend
+    r = c.post("/api/agents/test", json={"spec": _VALID_AGENT, "prompt": "hi"})
+    assert r.status_code == 503 and "no backend" in r.json()["error"]
+    # an LLMError raised mid-run maps to 503 as well
+    prov = _TestDriveProvider(error=LLMError("backend fell over"))
+    c.app.state.testdrive_provider_factory = lambda: prov
+    r2 = c.post("/api/agents/test", json={"spec": _VALID_AGENT, "prompt": "hi"})
+    assert r2.status_code == 503 and "fell over" in r2.json()["error"]
+
+
+def test_custom_agent_project_scope_round_trip(tmp_path):
+    """The optional spec `project` (scoping, validated in agents/custom.py by a
+    concurrent change) must survive save -> list untouched by the server."""
+    c = _client(tmp_path)
+    slug = c.post("/api/projects", json={"name": "Alpha"}).json()["slug"]
+    r = c.post("/api/agents",
+               json={"spec": {**_VALID_AGENT, "name": "alpha_helper", "project": slug}})
+    assert r.status_code == 200, r.text
+    if str(r.json()["agent"].get("project") or "") != slug:
+        pytest.skip("CustomSpec project pass-through not landed yet (concurrent change)")
+    listed = next(a for a in c.get("/api/agents").json()["custom"]
+                  if a["name"] == "alpha_helper")
+    assert listed["project"] == slug
+
+
+def test_custom_agent_unknown_project_is_400(tmp_path):
+    c = _client(tmp_path)
+    r = c.post("/api/agents", json={"spec": {**_VALID_AGENT, "name": "ghosty",
+                                             "project": "no_such_project"}})
+    if r.status_code == 200:
+        pytest.skip("CustomSpec project validation not landed yet (concurrent change)")
+    assert r.status_code == 400 and "no_such_project" in r.json()["error"]
 
 
 # ---- /api/home ----

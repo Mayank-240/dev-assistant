@@ -22,6 +22,8 @@ const {
   homeModel, sidebarGroups, workspacesViewModel, wsDepsModel, wsRunPayload,
   graph2ViewModel, nodePanelModel,
   agentsListModel, agentFormModel, agentFormValidate,
+  agentStatsModel, AGENT_TEMPLATES, agentTemplate, agentTemplatePrefill,
+  agentScopeModel, testDriveModel,
   benchModel, distillReportModel, distillResultModel,
   userChipModel, usersListModel, userCreateModel,
   wsRecentTasksModel, agentToolsModel, backendLabel, seedLayout,
@@ -3619,6 +3621,16 @@ function _agentCard(a, custom) {
   card.className = "agent-card";
   const effortChip = a.effort
     ? `<span class="chip" title="Effort override">${escapeHtml(a.effort)}</span>` : "";
+  const scope = custom ? agentScopeModel(a) : null;
+  const scopeChip = scope
+    ? `<span class="chip ac-scope${scope.scoped ? " ac-scope-project" : ""}" title="${escapeAttr(scope.title)}">${escapeHtml(scope.label)}</span>`
+    : "";
+  const sm = agentStatsModel(a);
+  const statsHtml = sm.present
+    ? `<div class="ac-stats" title="${escapeAttr(sm.title)}">` +
+      `<span class="ac-stats-line">${escapeHtml(sm.line)}</span>` +
+      `<div class="ac-bar"><div class="ac-bar-fill" style="width:${sm.barPct}%"></div></div></div>`
+    : "";
   const acts = custom
     ? `<div class="af-card-acts">` +
       `<button type="button" class="q-act af-edit" title="Edit this agent">Edit</button>` +
@@ -3627,9 +3639,9 @@ function _agentCard(a, custom) {
   // tool chips start collapsed behind the count chip — 19 cards × ~26 chips is
   // a wall of noise; the count chip toggles this card's list inline
   card.innerHTML = `
-    <div class="ac-top"><span class="ac-dot" style="background:${agentStyle(a.name).color}"></span><span class="ac-agent ac-name">${escapeHtml(a.name)}</span>${effortChip}<button type="button" class="chip chip-tools ac-tools-toggle" aria-expanded="false" title="Show this agent's tools">${escapeHtml(tm.label)} ▸</button></div>
+    <div class="ac-top"><span class="ac-dot" style="background:${agentStyle(a.name).color}"></span><span class="ac-agent ac-name">${escapeHtml(a.name)}</span>${effortChip}${scopeChip}<button type="button" class="chip chip-tools ac-tools-toggle" aria-expanded="false" title="Show this agent's tools">${escapeHtml(tm.label)} ▸</button></div>
     <div class="ac-desc">${escapeHtml(a.description || "")}</div>
-    <div class="ac-when">${escapeHtml(a.when_to_use || "")}</div>
+    <div class="ac-when">${escapeHtml(a.when_to_use || "")}</div>${statsHtml}
     <div class="tool-chips hidden">${tm.tools.map(t => `<span class="tool-chip">${escapeHtml(t)}</span>`).join("")}</div>${acts}`;
   const tog = card.querySelector(".ac-tools-toggle");
   const chips = card.querySelector(".tool-chips");
@@ -3693,25 +3705,58 @@ async function loadAgents(force) {
 }
 
 // ---- custom-agent form (new + edit prefill; upsert by name) ----
-function openAgentForm(spec) {
-  const m = agentFormModel(spec, agentsBody.tools);
-  $("af-heading").textContent = m.heading;
+function _afFillFields(m) {
   $("af-name").value = m.name;
   $("af-desc").value = m.description;
   $("af-when").value = m.when_to_use;
   $("af-system").value = m.system_prompt;
   $("af-effort").value = m.effort;
   $("af-model").value = m.model;
+  $("af-project").value = m.project || "";
   $("af-tools").innerHTML = m.tools.length
     ? m.tools.map(t =>
         `<label class="check af-tool"><input type="checkbox" value="${escapeAttr(t.name)}"` +
         `${t.checked ? " checked" : ""} /> ${escapeHtml(t.name)}</label>`).join("")
     : '<span class="muted">Could not load the toolbox — refresh the roster.</span>';
+}
+
+// Scope select: Global + the current (non-archived) projects, keeping a stored
+// slug selectable even if its project has since been archived/removed.
+function _afFillProjectOptions(selected) {
+  const opts = ['<option value="">Global — every project</option>'];
+  const slugs = new Set([""]);
+  projectList.filter(p => !p.archived).forEach(p => {
+    slugs.add(p.slug);
+    opts.push(`<option value="${escapeAttr(p.slug)}">${escapeHtml(p.name || p.slug)}</option>`);
+  });
+  if (selected && !slugs.has(selected)) {
+    opts.push(`<option value="${escapeAttr(selected)}">${escapeHtml(selected)}</option>`);
+  }
+  $("af-project").innerHTML = opts.join("");
+}
+
+function openAgentForm(spec) {
+  const m = agentFormModel(spec, agentsBody.tools);
+  $("af-heading").textContent = m.heading;
+  $("af-template").value = "";
+  _afFillProjectOptions(m.project);
+  _afFillFields(m);
   $("af-error").classList.add("hidden");
   $("af-error").textContent = "";
+  $("af-td-error").classList.add("hidden");
+  $("af-td-out").classList.add("hidden");
   $("agent-form-card").classList.remove("hidden");
   $("af-name").focus();
   $("agent-form-card").scrollIntoView({ behavior: scrollBehavior(), block: "start" });
+}
+
+// "Start from template": prefill every field from the chosen starter (template
+// tools are intents — intersected with the live toolbox); still fully editable.
+function applyAgentTemplate(key) {
+  const tpl = agentTemplate(key);
+  if (!tpl) return;
+  _afFillFields(agentFormModel(agentTemplatePrefill(tpl, agentsBody.tools), agentsBody.tools));
+  $("af-error").classList.add("hidden");
 }
 
 function closeAgentForm() {
@@ -3724,13 +3769,19 @@ function _afFail(msg) {
   el.classList.remove("hidden");
 }
 
-async function saveAgentForm() {
-  const v = agentFormValidate({
+// The form's current field values, shared by save and test drive.
+function _afFormValues() {
+  return {
     name: $("af-name").value, description: $("af-desc").value,
     when_to_use: $("af-when").value, system_prompt: $("af-system").value,
     tools: [...document.querySelectorAll("#af-tools input:checked")].map(cb => cb.value),
     effort: $("af-effort").value, model: $("af-model").value,
-  }, agentsBody.tools);
+    project: $("af-project").value,
+  };
+}
+
+async function saveAgentForm() {
+  const v = agentFormValidate(_afFormValues(), agentsBody.tools);
   if (!v.ok) { _afFail(v.errors.join(" · ")); return; }
   const btn = $("af-save");
   btn.disabled = true;
@@ -3748,6 +3799,45 @@ async function saveAgentForm() {
   showToast(`Agent "${v.spec.name}" saved — routable on the next run`, "success");
   _agentNames = null;   // the plan editor's roster must pick the new agent up
   loadAgents(true);
+}
+
+// ---- test drive: run the CURRENT form spec once against a prompt.
+// This is a REAL model call on the server's backend, capped server-side
+// ($0.25 / 120s) — the warning line in the form says so.
+async function runAgentTestDrive() {
+  const err = $("af-td-error"), out = $("af-td-out");
+  err.classList.add("hidden");
+  const v = agentFormValidate(_afFormValues(), agentsBody.tools);
+  if (!v.ok) {
+    err.textContent = v.errors.join(" · ");
+    err.classList.remove("hidden");
+    return;
+  }
+  const btn = $("af-td-run");
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  let resp, body = {};
+  try {
+    resp = await fetch("/api/agents/test", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ spec: v.spec, prompt: $("af-td-prompt").value }),
+    });
+    body = await resp.json().catch(() => ({}));
+  } catch (e) {
+    body = { error: "request failed: " + e };
+  }
+  btn.disabled = false;
+  btn.textContent = "Run";
+  const m = testDriveModel(resp, body);
+  if (!m.ok) {
+    out.classList.add("hidden");
+    err.textContent = m.error;
+    err.classList.remove("hidden");
+    return;
+  }
+  $("af-td-text").textContent = m.text;
+  $("af-td-meta").textContent = m.metaLabel;
+  out.classList.remove("hidden");
 }
 
 async function deleteCustomAgent(name) {
@@ -5602,6 +5692,14 @@ $("ws-prompt").addEventListener("keydown", (e) => {
 $("agent-new").onclick = () => openAgentForm(null);
 $("af-save").onclick = saveAgentForm;
 $("af-cancel").onclick = closeAgentForm;
+// agent surfaces: starter templates + test drive
+$("af-template").innerHTML = '<option value="">— blank —</option>' + AGENT_TEMPLATES.map(t =>
+  `<option value="${escapeAttr(t.key)}">${escapeHtml(t.label)}</option>`).join("");
+$("af-template").onchange = () => applyAgentTemplate($("af-template").value);
+$("af-td-run").onclick = runAgentTestDrive;
+$("af-td-prompt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); runAgentTestDrive(); }
+});
 $("graph-layer").querySelectorAll(".seg-opt").forEach(b => b.onclick = () => {
   graphLayer = b.dataset.v;
   $("graph-layer").querySelectorAll(".seg-opt").forEach(x =>

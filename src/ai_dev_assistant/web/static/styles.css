@@ -1417,6 +1417,23 @@ button.ac-tools-toggle:hover { color:var(--text); border-color:var(--border); }
 #view-agents > .section-label { margin:22px 0 8px; }
 #view-agents > .section-label:first-of-type { margin-top:0; }
 
+/* ---- agent surfaces: card stats, scope chip, test drive ---- */
+.ac-scope { color:var(--muted); }
+.ac-scope-project { color:var(--accent-deep); border-color:var(--accent-deep); }
+.ac-stats { padding-top:8px; border-top:1px solid var(--border-soft); }
+.ac-stats-line { display:block; font-family:var(--mono); font-size:10.5px; color:var(--muted); margin-bottom:4px; }
+.ac-bar { height:3px; background:var(--accent-soft); overflow:hidden; }
+.ac-bar-fill { display:block; height:100%; background:var(--accent); }
+.af-testdrive { margin-top:18px; padding-top:12px; border-top:1px solid var(--border-soft); }
+.af-td-warn { margin:4px 0 8px; color:var(--accent-deep); }
+.af-td-row { display:flex; gap:10px; align-items:center; }
+.af-td-row .title-input { flex:1; }
+.af-td-out { margin-top:10px; border:1px solid var(--border-soft); background:var(--bg); }
+.af-td-text { margin:0; padding:10px 12px; max-height:260px; overflow:auto;
+  font-family:var(--mono); font-size:12px; line-height:1.6; white-space:pre-wrap; }
+.af-td-meta { padding:6px 12px; border-top:1px solid var(--border-soft);
+  font-family:var(--mono); font-size:10.5px; color:var(--muted); }
+
 /* ---- directory picker (local import) ---- */
 .pm-source-row { display:flex; gap:8px; }
 .pm-source-row .title-input { flex:1; }

@@ -1734,6 +1734,7 @@
       system_prompt: String(spec.system_prompt || ""),
       effort: AGENT_EFFORTS.includes(spec.effort) ? spec.effort : "",
       model: String(spec.model || ""),
+      project: String(spec.project || ""),   // "" = global scope
       tools: (Array.isArray(tools) ? tools : []).map(t => ({
         name: String(t), checked: chosen.has(t),
       })),
@@ -1761,17 +1762,162 @@
     if (unknown.length) errors.push("unknown tools: " + unknown.join(", "));
     const effort = String(f.effort || "");
     if (!AGENT_EFFORTS.includes(effort)) errors.push("effort must be inherit or one of low/medium/high/xhigh/max");
+    const spec = {
+      name,
+      description: String(f.description || "").trim(),
+      when_to_use: String(f.when_to_use || "").trim(),
+      system_prompt: String(f.system_prompt || "").trim(),
+      tools: chosen,
+      effort: AGENT_EFFORTS.includes(effort) ? effort : "",
+      model: String(f.model || "").trim(),
+    };
+    // Project scope rides along only when set — the server treats a missing
+    // key as global, and validates the slug itself (unknown project -> 400).
+    const project = String(f.project || "").trim();
+    if (project) spec.project = project;
+    return { ok: !errors.length, errors, spec };
+  }
+
+  // ===========================================================
+  // Agent surfaces — roster stats, starter templates, project scope
+  // and the test-drive panel. Pure models; endpoints in web/server.py.
+  // ===========================================================
+
+  const AGENT_STATS_LOW_N = 5;
+
+  // One roster entry's optional "stats" ({n, passed, pass_rate}) -> card model.
+  // Entries without stats (or never routed) render nothing; below AGENT_STATS_LOW_N
+  // routed subtasks the rate shows as a dash — 1/1 is not a 100% agent.
+  function agentStatsModel(a) {
+    const s = a && a.stats;
+    const n = s && typeof s === "object" ? (Number(s.n) || 0) : 0;
+    if (!n) return { present: false, n: 0, lowData: false, line: "", rateLabel: "", barPct: 0, title: "" };
+    const rate = (s.pass_rate != null && isFinite(Number(s.pass_rate)))
+      ? Math.max(0, Math.min(1, Number(s.pass_rate))) : null;
+    const low = n < AGENT_STATS_LOW_N || rate == null;
+    const pct = low ? 0 : Math.round(rate * 100);
+    const rateLabel = low ? "—" : pct + "%";
     return {
-      ok: !errors.length, errors,
-      spec: {
-        name,
-        description: String(f.description || "").trim(),
-        when_to_use: String(f.when_to_use || "").trim(),
-        system_prompt: String(f.system_prompt || "").trim(),
-        tools: chosen,
-        effort: AGENT_EFFORTS.includes(effort) ? effort : "",
-        model: String(f.model || "").trim(),
-      },
+      present: true, n, lowData: low,
+      line: "routed " + n + " · " + rateLabel,
+      rateLabel,
+      barPct: pct,
+      title: low ? "low data" : "pass rate over " + n + " routed subtasks",
+    };
+  }
+
+  // Starter templates for the New-agent form. `tools` are INTENTS — canonical
+  // toolbox names the template wants; templateTools() intersects them with the
+  // live /api/agents tools list so a slimmed toolbox never yields an invalid form.
+  const AGENT_TEMPLATES = [
+    {
+      key: "code-style-enforcer", label: "Code-style enforcer", name: "style_enforcer",
+      description: "Normalizes style, naming, and formatting so the codebase reads like one author.",
+      when_to_use: "Use for style/consistency cleanups across existing code — naming, imports, "
+        + "formatting, comment drift. Behavior-preserving only; not for features or bug fixes.",
+      system_prompt: "You are a Code-Style Enforcer agent. You fix style, naming, formatting, and "
+        + "consistency issues so the codebase reads as if one careful author wrote it. Match the "
+        + "project's existing conventions before reaching for personal preference — read neighboring "
+        + "files first. Apply mechanical fixes directly (imports, naming, dead code, comment drift) "
+        + "and keep every change strictly behavior-preserving; never mix style fixes with functional "
+        + "changes. Run the tests after editing, and report what you normalized plus any conventions "
+        + "worth writing down for the team.",
+      tools: ["read_file", "list_dir", "grep", "symbols", "edit_file", "apply_patch",
+              "run_tests", "git_diff", "blackboard_read", "ask_operator"],
+    },
+    {
+      key: "data-scientist", label: "Data scientist", name: "data_scientist",
+      description: "Explores datasets and answers concrete questions with reproducible analysis.",
+      when_to_use: "Use for data exploration, statistics, or lightweight modeling — when the answer "
+        + "must come from analyzing actual data rather than reading code.",
+      system_prompt: "You are a Data Scientist agent. You explore datasets, run analyses, and build "
+        + "lightweight models to answer concrete questions with evidence. State your hypothesis, "
+        + "write the analysis as reproducible scripts, and validate data quality first — nulls, "
+        + "duplicates, ranges — before trusting any aggregate. Report effect sizes with the caveats "
+        + "that matter, and prefer the simplest method that answers the question. Return the actual "
+        + "analysis code plus a short, decision-ready summary of the findings.",
+      tools: ["recall", "remember", "kb_search", "read_file", "write_file", "list_dir",
+              "grep", "run_command", "install_packages", "run_tests"],
+    },
+    {
+      key: "compliance-reviewer", label: "Compliance reviewer", name: "compliance_reviewer",
+      description: "Audits code and config against policy: licensing, PII, secrets, audit trails.",
+      when_to_use: "Use for reviewing code, configuration, or docs against compliance policy — "
+        + "licensing, data handling, secrets, regulatory constraints. Read-only findings; not for fixes.",
+      system_prompt: "You are a Compliance Reviewer agent. You review code, configuration, and docs "
+        + "against policy: licensing, data handling and PII, secrets, audit trails, and any "
+        + "regulatory constraints the project declares. Report concrete findings with the exact "
+        + "location, the policy or rule violated, a severity, and the specific remediation. "
+        + "Distinguish hard violations from advisory risks, and cite the evidence for each. "
+        + "You do not modify code — you produce findings the team can act on. Be specific, not generic.",
+      tools: ["recall", "kb_search", "kg_query", "read_file", "list_dir", "grep",
+              "find_references", "read_messages", "blackboard_read", "ask_operator"],
+    },
+    {
+      key: "prompt-engineer", label: "Prompt engineer", name: "prompt_engineer",
+      description: "Designs and refines prompts, personas, and tool descriptions for agents.",
+      when_to_use: "Use for writing or improving system prompts, agent personas, tool descriptions, "
+        + "or few-shot examples — including diagnosing why an existing prompt misbehaves.",
+      system_prompt: "You are a Prompt Engineer agent. You design, critique, and refine prompts and "
+        + "agent personas: system prompts, tool descriptions, and few-shot examples. Diagnose "
+        + "failures by reading the actual transcripts, then propose the minimal prompt change that "
+        + "fixes the behavior without regressing others. Make instructions concrete and testable — "
+        + "replace vague adverbs with observable criteria — and keep prompts short: every sentence "
+        + "must earn its place. Return the revised prompt plus a one-line rationale per change.",
+      tools: ["recall", "remember", "kb_search", "read_file", "write_file", "edit_file",
+              "list_dir", "grep", "blackboard_read", "blackboard_write"],
+    },
+  ];
+
+  function agentTemplate(key) {
+    return AGENT_TEMPLATES.find(t => t.key === String(key || "")) || null;
+  }
+
+  // Template tool intents ∩ the live toolbox — order preserved, unknowns dropped.
+  function templateTools(intents, available) {
+    const avail = new Set((Array.isArray(available) ? available : []).map(String));
+    return (Array.isArray(intents) ? intents : []).map(String).filter(t => avail.has(t));
+  }
+
+  // Template + live toolbox -> spec-shaped prefill for the form (fully editable).
+  function agentTemplatePrefill(tpl, available) {
+    tpl = tpl || {};
+    return {
+      name: String(tpl.name || ""),
+      description: String(tpl.description || ""),
+      when_to_use: String(tpl.when_to_use || ""),
+      system_prompt: String(tpl.system_prompt || ""),
+      tools: templateTools(tpl.tools, available),
+      effort: "", model: "", project: "",
+    };
+  }
+
+  // Custom-spec scope -> the card chip ("global" or the project slug).
+  function agentScopeModel(spec) {
+    const project = String((spec && spec.project) || "").trim();
+    return {
+      scoped: !!project,
+      label: project || "global",
+      title: project ? "Scoped — routable only in project " + project
+                     : "Global — routable in every project",
+    };
+  }
+
+  // POST /api/agents/test outcome -> the test-drive panel model. `resp` is the
+  // fetch Response ({ok, status}); `body` its parsed JSON ({result, cost_usd,
+  // seconds} on success, {error} on 400/503/504).
+  function testDriveModel(resp, body) {
+    resp = resp || {};
+    body = body || {};
+    if (body.error || resp.ok === false) {
+      return { ok: false, text: "", metaLabel: "",
+               error: String(body.error || ("HTTP " + (resp.status || "?"))) };
+    }
+    const secs = Number(body.seconds);
+    return {
+      ok: true, error: "",
+      text: String(body.result || ""),
+      metaLabel: fmtCost(body.cost_usd) + " · " + (isFinite(secs) ? secs.toFixed(1) + "s" : "—"),
     };
   }
 
@@ -2203,6 +2349,8 @@
     homeModel, sidebarGroups, workspacesViewModel, wsDepsModel, wsRunPayload,
     graph2ViewModel, nodePanelModel, GRAPH2_TYPES,
     agentsListModel, agentFormModel, agentFormValidate, AGENT_EFFORTS,
+    agentStatsModel, AGENT_TEMPLATES, agentTemplate, templateTools,
+    agentTemplatePrefill, agentScopeModel, testDriveModel,
     benchModel, distillReportModel, distillResultModel,
     userChipModel, usersListModel, userCreateModel,
     wsRecentTasksModel, agentToolsModel, backendLabel, seedLayout,

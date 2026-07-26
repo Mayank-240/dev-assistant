@@ -400,6 +400,17 @@ class AgentSaveRequest(BaseModel):
     spec: dict[str, Any]
 
 
+class AgentTestRequest(BaseModel):
+    spec: dict[str, Any]
+    prompt: str = ""
+
+
+# Hard caps on POST /api/agents/test (a live LLM call). Module-level so tests can
+# monkeypatch them (e.g. shrink the timeout to milliseconds).
+TESTDRIVE_MAX_COST_USD = 0.25
+TESTDRIVE_TIMEOUT_SECONDS = 120.0
+
+
 def create_app(settings: Settings | None = None, host: str | None = None,
                api_token: str | None = None) -> FastAPI:
     # `settings` is the env/default base (paths, backend identity). The settings
@@ -1563,16 +1574,38 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         roster = build_agents(app.state.base_settings)  # tool roster follows console edits
         custom_specs = custom_agents.list_custom_agents(settings)
         custom_names = {s.name for s in custom_specs}
+        # Review-outcome aggregates per role, via the run store's agent_stats.
+        # getattr-guarded (the method lands in a concurrent change) and purely
+        # decorative: when unavailable or failing, entries simply carry no "stats".
+        stats_fn = getattr(app.state.runs, "agent_stats", None)
+        stats_map: dict[str, Any] = {}
+        if callable(stats_fn):
+            try:
+                stats_map = stats_fn() or {}
+            except Exception:  # noqa: BLE001 — stats must never break the roster
+                stats_fn = None
+
+        def _with_stats(entry: dict[str, Any]) -> dict[str, Any]:
+            if not callable(stats_fn):
+                return entry
+            s = stats_map.get(entry.get("name"))
+            s = s if isinstance(s, dict) else {}
+            n = int(s.get("n") or 0)
+            passed = int(s.get("passed") or 0)
+            entry["stats"] = {"n": n, "passed": passed,
+                              "pass_rate": round(passed / n, 4) if n else None}
+            return entry
+
         return JSONResponse({
-            "builtin": [{
+            "builtin": [_with_stats({
                 "name": a.profile.name,
                 "description": a.profile.description,
                 "when_to_use": a.profile.when_to_use,
                 "tools": a.profile.tools,
                 "effort": a.profile.effort,
-            } for a in roster.values() if a.profile.name not in custom_names],
+            }) for a in roster.values() if a.profile.name not in custom_names],
             # Raw stored specs (incl. system_prompt/model) so the UI can edit them.
-            "custom": [s.to_dict() for s in custom_specs],
+            "custom": [_with_stats(s.to_dict()) for s in custom_specs],
             "tools": sorted(custom_agents.toolbox_tool_names()),
         })
 
@@ -1593,6 +1626,108 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         if not custom_agents.delete_custom_agent(settings, slug):
             return JSONResponse({"error": f"unknown custom agent: {slug}"}, status_code=404)
         return JSONResponse({"ok": True})
+
+    # Provider used by POST /api/agents/test — a factory so tests can inject a fake
+    # (and each test drive gets its own provider whose usage counter starts at zero).
+    def _testdrive_provider():
+        from ..llm.factory import get_provider
+
+        return get_provider(app.state.base_settings)
+
+    app.state.testdrive_provider_factory = _testdrive_provider
+
+    @app.post("/api/agents/test")
+    async def test_drive_agent(req: AgentTestRequest) -> JSONResponse:
+        """One-shot test drive of a draft agent spec against a single prompt.
+
+        THIS MAKES A LIVE LLM CALL on the configured backend (the operator's
+        Claude login or API key) — hard-capped at TESTDRIVE_MAX_COST_USD of
+        spend and TESTDRIVE_TIMEOUT_SECONDS of wall clock. Nothing persists:
+        the agent gets a throwaway scratch workspace under <data_dir>/tmp,
+        in-memory knowledge stores, and is discarded after the reply.
+        """
+        from ..agents import custom as custom_mod  # lazy: the validator may still be landing
+        from ..agents.base import AgentProfile, BaseAgent
+        from ..agents.registry import _COLLAB
+        from ..orchestration.message_bus import MessageBus
+        from ..tools.registry import ToolBox, ToolContext
+
+        prompt = (req.prompt or "").strip()
+        if not prompt:
+            return JSONResponse({"error": "prompt is required"}, status_code=400)
+        # Same validator as the save path, but with no reserved names: colliding with
+        # a built-in only matters when persisting, not for a throwaway dry run.
+        # (TypeError fallback: the project_slugs parameter lands in a concurrent change.)
+        entry = dict(req.spec or {})
+        slugs_fn = getattr(custom_mod, "_known_project_slugs", None)
+        try:
+            spec = custom_mod._validate(
+                entry, set(), custom_mod.toolbox_tool_names(),
+                slugs_fn(app.state.base_settings, [entry]) if callable(slugs_fn) else set())
+        except TypeError:
+            spec = custom_mod._validate(entry, set(), custom_mod.toolbox_tool_names())
+        if isinstance(spec, str):
+            return JSONResponse({"error": spec}, status_code=400)
+
+        base = app.state.base_settings
+        # Constructed exactly like build_agents() builds customs: the author's
+        # system_prompt verbatim plus the shared collaboration/safety preamble,
+        # blank effort/model inheriting the configured defaults.
+        agent = BaseAgent(
+            AgentProfile(name=spec.name, description=spec.description,
+                         when_to_use=spec.when_to_use, tools=list(spec.tools),
+                         effort=spec.effort or base.agent_effort),
+            system_prompt=spec.system_prompt + " " + _COLLAB,
+            model=spec.model or base.agent_model,
+        )
+        scratch = Path(base.data_dir) / "tmp" / f"agent-test-{new_task_id()}"
+        scratch.mkdir(parents=True, exist_ok=True)
+        mem = MemoryStore.in_memory()
+        bus = MessageBus()
+        bus.register(spec.name)
+        # Default toolbox, restricted to the spec's declared tools by the provider
+        # (allowed_tools). Field-filtered like Engine._build_toolbox so this stays
+        # compatible while optional ToolContext fields land.
+        ctx_kwargs: dict[str, Any] = dict(
+            memory=mem, kb=KnowledgeBase(mem.vectors), kg=NetworkXKnowledgeGraph(),
+            bus=bus, agent_name=spec.name, task_scope="agent-test",
+            base_dir=scratch, workspace=scratch,
+            verify_timeout=base.verify_timeout, redact=base.redact_secrets,
+            allow_run_command=base.allow_run_command, sandbox=base.sandbox,
+            sandbox_cpu=base.sandbox_cpu_seconds, sandbox_mem=base.sandbox_mem_mb,
+            allow_web=base.allow_web, protected_paths=base.protected_paths,
+        )
+        fields = {f.name for f in dataclasses.fields(ToolContext)}
+        toolbox = ToolBox(ToolContext(**{k: v for k, v in ctx_kwargs.items()
+                                         if k in fields}))
+        try:
+            provider = app.state.testdrive_provider_factory()
+        except LLMError as exc:
+            shutil.rmtree(scratch, ignore_errors=True)
+            return JSONResponse({"error": str(exc)}, status_code=503)
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                agent.run(task_text=prompt, context="", toolbox=toolbox,
+                          provider=provider, workdir=str(scratch), on_step=None,
+                          max_cost_usd=TESTDRIVE_MAX_COST_USD),
+                timeout=TESTDRIVE_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                {"error": f"test drive timed out after {TESTDRIVE_TIMEOUT_SECONDS:g}s"},
+                status_code=504)
+        except LLMError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
+        finally:
+            try:
+                await provider.aclose()
+            except Exception:  # noqa: BLE001 — cleanup must not mask the outcome
+                pass
+            shutil.rmtree(scratch, ignore_errors=True)
+        usage = getattr(provider, "usage", None)
+        cost = float(getattr(usage, "cost_usd", 0.0) or 0.0)
+        return JSONResponse({"result": result, "cost_usd": round(cost, 4),
+                             "seconds": round(time.monotonic() - started, 2)})
 
     @app.get("/api/projects")
     async def get_projects() -> JSONResponse:

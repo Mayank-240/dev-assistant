@@ -886,6 +886,18 @@
               <h3 class="section-label" id="af-heading">New agent</h3>
               <div class="af-grid">
                 <div>
+                  <label class="pm-label" for="af-template">Start from template</label>
+                  <select id="af-template" class="select">
+                    <option value="">— blank —</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="pm-label" for="af-project">Scope</label>
+                  <select id="af-project" class="select">
+                    <option value="">Global — every project</option>
+                  </select>
+                </div>
+                <div>
                   <label class="pm-label" for="af-name">Name — lowercase slug (upsert: saving an existing name replaces it)</label>
                   <input id="af-name" class="title-input" type="text" maxlength="40" placeholder="e.g. sec_reviewer" />
                 </div>
@@ -927,6 +939,20 @@
                 <button id="af-cancel" class="ghost-btn" type="button">Cancel</button>
               </div>
               <p class="hint">Saved agents are routable by the orchestrator immediately — the very next run can plan work onto them.</p>
+              <div class="af-testdrive">
+                <span class="section-label">Test drive</span>
+                <p class="hint af-td-warn">Runs a real model call on your Claude login (capped at $0.25).</p>
+                <div class="af-td-row">
+                  <input id="af-td-prompt" class="title-input" type="text" aria-label="Test-drive prompt"
+                         value="Introduce yourself and list what you'd check first on this repo." />
+                  <button id="af-td-run" class="ghost-btn" type="button">Run</button>
+                </div>
+                <p id="af-td-error" class="pm-error hidden" role="alert"></p>
+                <div id="af-td-out" class="af-td-out hidden">
+                  <pre id="af-td-text" class="af-td-text"></pre>
+                  <div id="af-td-meta" class="af-td-meta"></div>
+                </div>
+              </div>
             </div>
 
             <h3 class="section-label">Custom agents — yours, editable</h3>
