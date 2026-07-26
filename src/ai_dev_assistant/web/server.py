@@ -1392,36 +1392,58 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         out.sort(key=lambda m: m["created_at"], reverse=True)
         return JSONResponse(out[:300])
 
+    _WS_HIDDEN = {".git", ".ada_worktrees", ".ada_deps", "__pycache__", ".pytest_cache",
+                  "node_modules", ".venv"}
+
+    def _workspace_root(task: str | None) -> Path | None:
+        """Resolve a task's workspace dir across layouts: legacy workspace/<task-id>,
+        or the project layout workspace/<slug>/worktrees/<task-id>."""
+        ws = settings.workspace_dir.resolve()
+        if not task:
+            return ws
+        legacy = (ws / task).resolve()
+        if legacy.is_relative_to(ws) and legacy.is_dir():
+            return legacy
+        row = app.state.runs.get(task) or {}
+        slug = row.get("project")
+        if slug:
+            wt = (ws / slug / "worktrees" / task).resolve()
+            if wt.is_relative_to(ws) and wt.is_dir():
+                return wt
+        return None
+
     @app.get("/api/workspace")
     async def list_workspace(task: str | None = None) -> JSONResponse:
-        ws = settings.workspace_dir.resolve()
-        root = (ws / task).resolve() if task else ws
-        if not root.is_relative_to(ws) or not root.exists():
+        root = _workspace_root(task)
+        if root is None or not root.exists():
             return JSONResponse([])
         items = []
         for p in sorted(root.rglob("*")):
-            if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc":
+            if (p.is_file() and p.suffix != ".pyc"
+                    and not _WS_HIDDEN.intersection(p.parts)):
                 items.append({"path": str(p.relative_to(root)), "size": p.stat().st_size})
         return JSONResponse(items)
 
     @app.get("/api/workspace/file")
     async def workspace_file(path: str, task: str | None = None) -> JSONResponse:
-        ws = settings.workspace_dir.resolve()
-        root = (ws / task).resolve() if task else ws
-        if not root.is_relative_to(ws):
+        root = _workspace_root(task)
+        if root is None:
             return JSONResponse({"error": "not found"}, status_code=404)
         target = (root / path).resolve()
-        if not target.is_relative_to(root) or not target.is_file():
+        if (not target.is_relative_to(root) or not target.is_file()
+                or _WS_HIDDEN.intersection(target.relative_to(root).parts)):
             return JSONResponse({"error": "not found"}, status_code=404)
         data = target.read_text(errors="replace")
         return JSONResponse({"path": path, "content": data[:200_000], "truncated": len(data) > 200_000})
 
     @app.get("/api/workspace/download")
     async def workspace_download(path: str, task: str | None = None):
-        ws = settings.workspace_dir.resolve()
-        root = (ws / task).resolve() if task else ws
+        root = _workspace_root(task)
+        if root is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
         target = (root / path).resolve()
-        if not root.is_relative_to(ws) or not target.is_relative_to(root) or not target.is_file():
+        if (not target.is_relative_to(root) or not target.is_file()
+                or _WS_HIDDEN.intersection(target.relative_to(root).parts)):
             return JSONResponse({"error": "not found"}, status_code=404)
         return FileResponse(str(target), filename=target.name, media_type="application/octet-stream")
 

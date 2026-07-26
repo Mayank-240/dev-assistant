@@ -11,7 +11,7 @@ const {
   sparklinePoints, childrenFromRows, childrenGridModel,
   sidebarProjectRows, projectTabsModel, projectTaskRows, composerModel,
   visibleProjects, combineChipsModel, combinedProjectsParam, itemProjects,
-  taggedItemRows, combinedBannerModel, projectColorMap,
+  taggedItemRows, combinedBannerModel, projectColorMap, renderMarkdown,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -2690,6 +2690,8 @@ async function renderFileList() {
   $("files-stats").textContent = `${items.length} file${items.length === 1 ? "" : "s"} · ${fmtSize(total)}`;
   $("file-download").classList.add("hidden");
   $("file-name").textContent = "No file selected"; $("file-name").classList.add("muted");
+  currentFile = null;
+  resetFileView();
   if (!items.length) {
     ul.innerHTML = '<li class="muted">No files for this selection.</li>';
     pre.textContent = "No files yet — run a task that writes code."; pre.classList.add("muted");
@@ -2705,6 +2707,47 @@ async function renderFileList() {
   });
 }
 
+// ---- markdown preview (Files view) ----
+// Markdown files open rendered by default with a Preview | Raw toggle; every
+// other file shows the raw <pre> exactly as before. The choice persists for
+// the session (sessionStorage).
+const MD_FILE_RE = /\.(md|markdown)$/i;
+let fileMode = sessionStorage.getItem("ada-file-mode") === "raw" ? "raw" : "preview";
+let currentFile = null;   // { path, content, truncated, isMd } | null
+
+// Show the raw <pre> and hide the preview + toggle (non-md files, transient states).
+function resetFileView() {
+  $("file-mode").classList.add("hidden");
+  $("file-preview").classList.add("hidden");
+  $("file-content").classList.remove("hidden");
+}
+
+function renderFileView() {
+  const pre = $("file-content");
+  if (!currentFile || !currentFile.isMd) {
+    resetFileView();
+    if (currentFile) {
+      pre.textContent = (currentFile.content || "(empty)") + (currentFile.truncated ? "\n\n…[truncated]" : "");
+    }
+    return;
+  }
+  const seg = $("file-mode");
+  seg.classList.remove("hidden");
+  seg.querySelectorAll(".seg-opt").forEach(b =>
+    b.setAttribute("aria-pressed", b.dataset.v === fileMode ? "true" : "false"));
+  const preview = fileMode === "preview";
+  $("file-preview").classList.toggle("hidden", !preview);
+  pre.classList.toggle("hidden", preview);
+  if (preview) {
+    $("file-preview").innerHTML = currentFile.content
+      ? renderMarkdown(currentFile.content)
+        + (currentFile.truncated ? '<p class="md-truncated">…[truncated]</p>' : "")
+      : '<p class="muted">(empty)</p>';
+  } else {
+    pre.textContent = (currentFile.content || "(empty)") + (currentFile.truncated ? "\n\n…[truncated]" : "");
+  }
+}
+
 async function selectFile(path, li) {
   document.querySelectorAll("#file-list .file").forEach(x => x.classList.remove("active"));
   if (li) li.classList.add("active");
@@ -2715,12 +2758,21 @@ async function selectFile(path, li) {
   dl.classList.remove("hidden");
   const pre = $("file-content");
   pre.classList.remove("muted");
+  resetFileView();
   pre.textContent = "Loading…";
   const url = "/api/workspace/file?path=" + encodeURIComponent(path) + taskQ;
   try {
     const data = await (await fetch(url)).json();
-    pre.textContent = (data.content || "(empty)") + (data.truncated ? "\n\n…[truncated]" : "");
-  } catch (e) { pre.textContent = "Could not load file."; }
+    currentFile = {
+      path, content: data.content || "", truncated: !!data.truncated,
+      isMd: MD_FILE_RE.test(path),
+    };
+    renderFileView();
+  } catch (e) {
+    currentFile = null;
+    resetFileView();
+    pre.textContent = "Could not load file.";
+  }
 }
 
 // ---- Run tab: start/stop the project's app inside its checkout ----
@@ -2825,6 +2877,12 @@ $("mem-refresh").onclick = loadMemory;
 $("graph-refresh").onclick = loadGraph;
 $("files-refresh").onclick = () => loadFiles();
 $("files-task").onchange = () => { filesTask = $("files-task").value; renderFileList(); };
+// markdown Preview | Raw toggle — the choice sticks for the session
+$("file-mode").querySelectorAll(".seg-opt").forEach(b => b.onclick = () => {
+  fileMode = b.dataset.v;
+  sessionStorage.setItem("ada-file-mode", fileMode);
+  renderFileView();
+});
 $("tasks-refresh").onclick = loadRecent;
 $("prompt").addEventListener("keydown", (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") runTask(); });
 $("docs-link").onclick = (e) => { e.preventDefault(); if (state.docsId) openDocs(state.docsId); };

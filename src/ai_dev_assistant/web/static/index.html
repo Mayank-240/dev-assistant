@@ -249,9 +249,16 @@
                   <div class="file-view">
                     <div class="file-view-head">
                       <span id="file-name" class="muted">No file selected</span>
-                      <a id="file-download" class="dl hidden" download>↓ Download</a>
+                      <div class="fvh-actions">
+                        <div id="file-mode" class="seg file-mode hidden" role="group" aria-label="Markdown display mode">
+                          <button type="button" class="seg-opt" data-v="preview" aria-pressed="true">Preview</button>
+                          <button type="button" class="seg-opt" data-v="raw" aria-pressed="false">Raw</button>
+                        </div>
+                        <a id="file-download" class="dl hidden" download>↓ Download</a>
+                      </div>
                     </div>
                     <pre id="file-content" class="file-content muted">Select a file to view its contents.</pre>
+                    <div id="file-preview" class="md-preview hidden" aria-label="Rendered markdown preview"></div>
                   </div>
                 </div>
               </div>

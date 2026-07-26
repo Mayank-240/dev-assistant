@@ -684,6 +684,175 @@
     return map;
   }
 
+  // ===========================================================
+  // Markdown preview renderer (Files view) — security-first.
+  // The ENTIRE input is HTML-escaped first (escapeHtml); every transform
+  // below operates on that escaped text, so raw input HTML can never
+  // survive into the output. Unsupported syntax degrades to escaped
+  // plain text. No external libraries.
+  // ===========================================================
+
+  const MD_MAX_CHARS = 500 * 1024;   // cap for synchronous rendering
+  const MD_TRUNC_NOTICE = '<p class="md-truncated">(truncated for preview)</p>';
+
+  // href here is already-escaped text. Strip whitespace/control chars that
+  // browsers ignore when sniffing the scheme, then allow only http(s),
+  // mailto and in-page fragments. Everything else stays plain text.
+  function _mdSafeHref(href) {
+    const probe = String(href).replace(/[\s\u0000-\u001f]+/g, "");
+    return /^(?:https?:\/\/|mailto:|#)/i.test(probe);
+  }
+
+  // Inline transforms on ESCAPED text: code spans and links are stashed
+  // behind \u0000<idx>\u0000 placeholders (the input had all \u0000 stripped,
+  // so placeholders are always ours) so bold/italic can't chew into them.
+  function _mdInline(s, stash) {
+    const put = (html) => { stash.push(html); return "\u0000" + (stash.length - 1) + "\u0000"; };
+    s = s.replace(/`([^`\n]+)`/g, (m, code) => put("<code>" + code + "</code>"));
+    s = s.replace(/\[([^\]\n]*)\]\(([^()\s]+)\)/g, (m, text, href) =>
+      _mdSafeHref(href)
+        ? put('<a href="' + href + '" target="_blank" rel="noopener">') + text + put("</a>")
+        : m);
+    s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
+    return s;
+  }
+
+  // One list item's escaped text -> { cls, html } (task checkboxes supported).
+  function _mdListItem(text, inline) {
+    const task = text.match(/^\[( |x|X)\]\s+(.*)$/);
+    if (!task) return { cls: "", html: inline(text) };
+    const checked = task[1].toLowerCase() === "x" ? " checked" : "";
+    return {
+      cls: ' class="md-task"',
+      html: '<input type="checkbox" disabled' + checked + "> " + inline(task[2]),
+    };
+  }
+
+  // Consecutive list lines -> <ul>/<ol> with ONE nesting level (indent >= 2).
+  function _mdListHtml(items, inline) {
+    const base = items[0].indent;
+    const top = [];
+    items.forEach(it => {
+      if (it.indent >= base + 2 && top.length) top[top.length - 1].children.push(it);
+      else top.push({ indent: it.indent, ordered: it.ordered, text: it.text, children: [] });
+    });
+    const open = (o) => (o ? "<ol>" : "<ul>");
+    const close = (o) => (o ? "</ol>" : "</ul>");
+    const li = (it) => { const r = _mdListItem(it.text, inline); return "<li" + r.cls + ">" + r.html; };
+    let html = open(top[0].ordered);
+    top.forEach(t => {
+      html += li(t);
+      if (t.children.length) {
+        const co = t.children[0].ordered;
+        html += open(co) + t.children.map(c => li(c) + "</li>").join("") + close(co);
+      }
+      html += "</li>";
+    });
+    return html + close(top[0].ordered);
+  }
+
+  const _MD_LIST_RE = /^(\s*)([-*]|\d+\.)\s+(.*)$/;
+  const _MD_HR_RE = /^ {0,3}(?:-{3,}|\*{3,}|_{3,})\s*$/;
+
+  // Does this escaped line begin a non-paragraph block? (terminates paragraphs)
+  function _mdBlockStart(l) {
+    return /^#{1,6}\s/.test(l) || /^```/.test(l) || /^&gt;/.test(l)
+      || _MD_LIST_RE.test(l) || _MD_HR_RE.test(l);
+  }
+
+  // Markdown text -> safe HTML for the Files-view preview. Pure; Node-testable.
+  function renderMarkdown(text) {
+    let src = String(text == null ? "" : text)
+      .replace(/\u0000/g, "")            // reserve \u0000 for our placeholders
+      .replace(/\r\n?/g, "\n");
+    let truncated = false;
+    if (src.length > MD_MAX_CHARS) {
+      const cut = src.lastIndexOf("\n", MD_MAX_CHARS);
+      src = src.slice(0, cut > 0 ? cut : MD_MAX_CHARS);
+      truncated = true;
+    }
+    const lines = escapeHtml(src).split("\n");   // <-- security boundary
+    const n = lines.length;
+    const out = [];
+    const stash = [];
+    const inline = (s) => _mdInline(s, stash);
+    let i = 0;
+    while (i < n) {
+      const line = lines[i];
+      if (!line.trim()) { i++; continue; }
+      // fenced code block (``` with optional language)
+      let m = line.match(/^```([A-Za-z0-9_+-]*)\s*$/);
+      if (m) {
+        const cls = m[1] ? ' class="lang-' + m[1] + '"' : "";
+        const buf = [];
+        i++;
+        while (i < n && !/^```\s*$/.test(lines[i])) { buf.push(lines[i]); i++; }
+        i++;                                       // closing fence (or EOF)
+        out.push("<pre><code" + cls + ">" + buf.join("\n") + "</code></pre>");
+        continue;
+      }
+      // heading
+      m = line.match(/^(#{1,6})\s+(.*)$/);
+      if (m) {
+        const lvl = m[1].length;
+        out.push("<h" + lvl + ">" + inline(m[2].replace(/\s+#+\s*$/, "")) + "</h" + lvl + ">");
+        i++; continue;
+      }
+      // horizontal rule
+      if (_MD_HR_RE.test(line)) { out.push("<hr>"); i++; continue; }
+      // blockquote (escaped ">" is "&gt;")
+      if (/^&gt;/.test(line)) {
+        const buf = [];
+        while (i < n && /^&gt;/.test(lines[i])) { buf.push(lines[i].replace(/^&gt;\s?/, "")); i++; }
+        out.push("<blockquote><p>" + buf.map(inline).join("<br>") + "</p></blockquote>");
+        continue;
+      }
+      // GFM table: header row with pipes + a |---|---| separator line
+      if (line.includes("|") && i + 1 < n) {
+        const sep = lines[i + 1];
+        if (/^[|\s:-]+$/.test(sep) && sep.includes("-") && sep.includes("|")) {
+          const cells = (s) => {
+            let t = s.trim();
+            if (t.startsWith("|")) t = t.slice(1);
+            if (t.endsWith("|")) t = t.slice(0, -1);
+            return t.split("|").map(c => inline(c.trim()));
+          };
+          const head = cells(line);
+          i += 2;
+          const rows = [];
+          while (i < n && lines[i].includes("|") && lines[i].trim()) { rows.push(cells(lines[i])); i++; }
+          out.push("<table><thead><tr>"
+            + head.map(c => "<th>" + c + "</th>").join("")
+            + "</tr></thead><tbody>"
+            + rows.map(r => "<tr>" + r.map(c => "<td>" + c + "</td>").join("") + "</tr>").join("")
+            + "</tbody></table>");
+          continue;
+        }
+      }
+      // unordered / ordered list (one nesting level)
+      if (_MD_LIST_RE.test(line)) {
+        const items = [];
+        while (i < n) {
+          const lm = lines[i].match(_MD_LIST_RE);
+          if (!lm) break;
+          items.push({ indent: lm[1].length, ordered: /^\d/.test(lm[2]), text: lm[3] });
+          i++;
+        }
+        out.push(_mdListHtml(items, inline));
+        continue;
+      }
+      // paragraph — consume until a blank line or the start of another block
+      const buf = [line];
+      i++;
+      while (i < n && lines[i].trim() && !_mdBlockStart(lines[i])) { buf.push(lines[i]); i++; }
+      out.push("<p>" + inline(buf.join("\n")) + "</p>");
+    }
+    let html = out.join("\n").replace(/\u0000(\d+)\u0000/g, (m, k) => stash[+k] || "");
+    if (truncated) html += "\n" + MD_TRUNC_NOTICE;
+    return html;
+  }
+
   const AdaUtil = {
     escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine,
     makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
@@ -697,6 +866,7 @@
     visibleProjects, projectsEmptyState,
     combineChipsModel, combinedProjectsParam, itemProjects, taggedItemRows,
     combinedBannerModel, projectColorMap,
+    renderMarkdown,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = AdaUtil;
