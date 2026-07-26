@@ -86,6 +86,29 @@ def _build_parser() -> argparse.ArgumentParser:
     evalp.add_argument("--record-history", action="store_true",
                        help="Append this run's aggregate scores to <data_dir>/benchmarks.jsonl "
                             "for commit-over-commit tracking (composes with --replay etc.)")
+
+    bkp = sub.add_parser("backup", help="Back up / restore the data dir (runs, memory, knowledge)")
+    bksub = bkp.add_subparsers(dest="bcmd", required=True)
+    bk_create = bksub.add_parser("create", help="Archive the data dir (live-safe sqlite snapshots)")
+    bk_create.add_argument("--out", default=None, metavar="DIR",
+                           help="Destination directory (default: <data_dir>/backups/)")
+    bksub.add_parser("list", help="List backups in <data_dir>/backups/, newest first")
+    bk_rest = bksub.add_parser("restore", help="Restore an archive into the data dir")
+    bk_rest.add_argument("archive", help="Path to an ada-backup-*.tar.gz archive")
+    bk_rest.add_argument("--force", action="store_true",
+                         help="Non-empty data dir: move it aside to "
+                              "<data_dir>.pre-restore-<ts> and restore anyway")
+
+    attp = sub.add_parser("attend", help="Answer agents' questions/permission requests "
+                                         "from the terminal (polls a running server)")
+    attp.add_argument("--url", default="http://127.0.0.1:8000",
+                      help="Base URL of the running server (default: %(default)s)")
+    attp.add_argument("--token", default=None,
+                      help="API token (default: the ADA_API_TOKEN env var)")
+    attp.add_argument("--interval", type=float, default=5.0, metavar="SECONDS",
+                      help="Poll interval (default: %(default)s)")
+    attp.add_argument("--once", action="store_true",
+                      help="Process currently-open items once and exit (scripting)")
     return parser
 
 
@@ -101,6 +124,10 @@ def main(argv: list[str] | None = None) -> int:
         return _serve(args)
     if args.cmd == "eval":
         return _eval(args)
+    if args.cmd == "backup":
+        return _backup(args)
+    if args.cmd == "attend":
+        return _attend(args)
     return 1
 
 
@@ -321,6 +348,54 @@ def _eval(args: argparse.Namespace) -> int:
     if args.record_history:
         _record_history("golden", report, settings)
     return 0 if report.passed == len(report.cards) else 1
+
+
+def _backup(args: argparse.Namespace) -> int:
+    from . import backup as bkp
+
+    settings = Settings.load()
+    try:
+        if args.bcmd == "create":
+            archive = bkp.create_backup(settings, out_dir=args.out)
+            size_mb = archive.stat().st_size / 1e6
+            print(f"Backup written: {archive} ({size_mb:.1f} MB)")
+            print("Contains the data dir only (runs, memory, knowledge, settings, users, "
+                  "push keys — treat as sensitive).")
+            print("Workspace checkouts and generated docs are NOT included "
+                  "(re-creatable from git).")
+        elif args.bcmd == "list":
+            rows = bkp.list_backups(settings)
+            if not rows:
+                print(f"No backups in {settings.data_dir / 'backups'}.")
+                return 0
+            for b in rows:
+                print(f"{b['created']}  {b['size']:>12,} B  {b['path']}")
+        elif args.bcmd == "restore":
+            print("WARNING: stop the server before restoring, and restart it afterwards —")
+            print("a live server writing to the data dir during restore can corrupt both.")
+            result = bkp.restore_backup(settings, args.archive, force=args.force)
+            if result["moved_aside"]:
+                print(f"Previous data dir moved aside to: {result['moved_aside']}")
+            print(f"Restored {result['members']} file(s) from {result['archive']} "
+                  f"into {result['restored_to']}.")
+            print("Restart the server to pick up the restored state.")
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _attend(args: argparse.Namespace) -> int:
+    import os
+
+    from .attend import run_attend
+
+    token = args.token if args.token is not None else os.getenv("ADA_API_TOKEN", "")
+    try:
+        return run_attend(args.url, token, once=args.once, poll_seconds=args.interval)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 0
 
 
 def _serve(args: argparse.Namespace) -> int:
