@@ -30,6 +30,7 @@ from .context import assemble as assemble_context
 from .context import budget_for
 from .docs.writer import write_task_docs
 from .knowledge.base import KnowledgeBase
+from .knowledge.code_index import CodeIndex
 from .knowledge.extract import enrich_kg_from_workspace
 from .knowledge.graph import NetworkXKnowledgeGraph
 from .knowledge.repo_map import build_repo_map, onboard
@@ -69,6 +70,10 @@ _INTERNAL_DIRS = {".git", "__pycache__", ".ada_worktrees", ".ada_deps"}
 _SIBLING_PROJECTS_MAX = 3      # query at most this many sibling projects
 _SIBLING_ITEM_CHARS = 300      # per-item excerpt cap (matches the KB-hit excerpt size)
 _SIBLING_SECTION_CHARS = 1500  # total budget for the whole sibling section
+
+# Wall-clock cap on the run-start code-index pass; past it the run proceeds while the
+# indexing thread finishes in the background (retrieval sees a partial index until then).
+_CODE_INDEX_MAX_SECONDS = 60.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,6 +117,10 @@ class Engine:
         self._changed_by_subtask: dict[str, list[str]] = {}  # subtask id -> files it touched
         self._merge_by_subtask: dict[str, str] = {}  # subtask id -> its merge commit sha
         self._baseline: dict[str, Any] = {}  # pre-run test/lint snapshot (V3 delta gating)
+        # Semantic code retrieval: built at run start ONLY for runs on a real repo
+        # workspace with the setting on; None means no retrieval part is ever added,
+        # which is what keeps greenfield/eval prompts byte-identical (cassette rule).
+        self._code_index: CodeIndex | None = None
         self._repairs = 0
         self._tracer: Tracer | None = None
         self._audit: AuditLog | None = None
@@ -223,6 +232,32 @@ class Engine:
         except Exception:
             return None
 
+    async def _start_code_index(self, run_ws: Path, emit: EventFn) -> None:
+        """Build/refresh the per-project semantic code index at run start (best-effort).
+
+        Indexing runs in a worker thread, time-capped: past the cap the run proceeds
+        while the thread keeps filling the store in the background — later subtasks
+        simply retrieve over whatever is indexed by then. Any failure is logged and
+        the run continues without code retrieval (``self._code_index`` still set, so
+        an incrementally-built index from a prior run keeps serving).
+        """
+        try:
+            index = CodeIndex(self.settings)
+        except Exception as exc:  # noqa: BLE001 — retrieval is a convenience, never fatal
+            logger.warning("code index unavailable: %s", exc)
+            return
+        self._code_index = index
+        try:
+            stats = await asyncio.wait_for(
+                asyncio.to_thread(index.index_workspace, run_ws),
+                timeout=_CODE_INDEX_MAX_SECONDS)
+            if stats.get("indexed"):
+                emit(status(f"Code index: {stats['indexed']} file(s) (re)indexed."))
+        except asyncio.TimeoutError:
+            emit(status("Code index still building — retrieval will use what's ready."))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("code indexing failed: %s", exc)
+
     async def _prepare_continuation(self, parent_id: str, run_ws: Path, rid: str, emit: EventFn) -> str:
         """Carry the parent task's workspace + context forward into this run."""
         parent_ws = self.settings.run_workspace(parent_id)
@@ -259,6 +294,9 @@ class Engine:
         self._merge_by_subtask = {}
         self._baseline = {}
         self._repairs = 0
+        if self._code_index is not None:  # an earlier run on this engine built one
+            self._code_index.close()
+            self._code_index = None
 
         rid = task_id or new_task_id()  # fix the id now so workspace/trace paths are per-run
         # Events stream to the durable log as they happen (R2) — a crashed or cancelled run
@@ -314,6 +352,14 @@ class Engine:
 
         ctx = RunContext(rid=rid, run_ws=run_ws, emit=emit)
         repo_context = await self._setup_workspace(ctx, continue_from=continue_from, resume=resume)
+
+        # Semantic code retrieval (strictly conditional, cassette-safe): only a run on
+        # a real repo workspace — a project checkout or a repo-backed materialization,
+        # the same runs that get run-level repo-map context — builds the index.
+        # Greenfield/eval runs never construct it, so their prompts stay byte-identical
+        # whether the setting is on or off.
+        if self.settings.code_retrieval and (checkout is not None or self.settings.repo_backed):
+            await self._start_code_index(run_ws, emit)
 
         if plan is None:
             prior = self._recall_prior(prompt)
@@ -602,6 +648,9 @@ class Engine:
         await self.provider.aclose()
         self.memory.close()
         self.runs.close()
+        if self._code_index is not None:
+            self._code_index.close()
+            self._code_index = None
 
     # ---- internals ----
     def _recall_prior(self, prompt: str) -> str:
@@ -1029,6 +1078,21 @@ class Engine:
                     parts.append(("Workspace map (most relevant files first)", repo_slice))
             except Exception:
                 pass
+            # Semantic code retrieval (repo-workspace runs only; see _start_code_index):
+            # the best-matching indexed source chunks, AFTER the repo map and wrapped as
+            # untrusted — retrieved file content must never be treated as instructions.
+            # self._code_index is None on greenfield/eval runs or with the setting off,
+            # so this block adds nothing there (byte-identical prompts, cassette rule).
+            if self._code_index is not None:
+                try:
+                    code_part = await asyncio.to_thread(
+                        self._code_index.retrieval_context,
+                        f"{state.spec.title} {state.spec.description}")
+                    if code_part:
+                        parts.append(("Relevant code (indexed)",
+                                      untrusted(code_part, source="code-index")))
+                except Exception:
+                    pass
             try:
                 hits = self.kb.search(f"{state.spec.title} {state.spec.description}",
                                       top_k=3, min_score=0.2)

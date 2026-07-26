@@ -107,6 +107,8 @@ class Settings:
 
     # --- Cost guardrail ---
     budget_usd: float = 0.0         # 0 = no cap; otherwise stop scheduling new work past this
+    monthly_budget_usd: float = 0.0  # monthly spend cap for ALERTING only (0 disables);
+                                     # never stops runs — budget_usd is the per-run guardrail
     agent_max_turns: int = 24       # per-agent tool-loop cap (lower = cheaper)
     subtask_max_seconds: float = 1800.0  # wall-clock cap per subtask attempt (0 = no cap)
     attention_timeout: float = 600.0    # how long an agent waits for an operator answer
@@ -180,6 +182,11 @@ class Settings:
     # memories/KB hits from sibling projects (read-only, attributed). Strictly conditional —
     # a project outside any workspace assembles context exactly as before.
     workspace_context: bool = True
+    # Semantic code retrieval: index the run's repo workspace into the per-project
+    # code_index.db and append a "Relevant code (indexed)" untrusted context part per
+    # subtask. Strictly conditional — runs without a real repo workspace (greenfield,
+    # evals) assemble prompts byte-identically whether this is on or off.
+    code_retrieval: bool = True
     # Sandbox for agent file-writes (the Claude SDK's built-in tools run here, not in the
     # project source tree).
     workspace_dir: Path = Path("workspace")
@@ -215,6 +222,7 @@ class Settings:
             adaptive_replan=_bool("ADA_ADAPTIVE_REPLAN", True),
             max_plan_subtasks=_int("ADA_MAX_PLAN_SUBTASKS", 24),
             budget_usd=_float("ADA_BUDGET_USD", 0.0),
+            monthly_budget_usd=_float("ADA_MONTHLY_BUDGET_USD", 0.0),
             agent_max_turns=_int("ADA_AGENT_MAX_TURNS", 24),
             subtask_max_seconds=_float("ADA_SUBTASK_MAX_SECONDS", 1800.0),
             attention_timeout=_float("ADA_ATTENTION_TIMEOUT", 600.0),
@@ -260,6 +268,7 @@ class Settings:
             project=_get("ADA_PROJECT", "default"),
             memory_scope=_get("ADA_MEMORY_SCOPE", "project"),
             workspace_context=_bool("ADA_WORKSPACE_CONTEXT", True),
+            code_retrieval=_bool("ADA_CODE_RETRIEVAL", True),
             workspace_dir=Path(_get("ADA_WORKSPACE_DIR", "workspace")),
         )
         return apply_overrides(s) if overlay else s
@@ -406,6 +415,12 @@ SETTINGS_SCHEMA: list[dict] = [
     # --- Guardrails & Budget ---
     {"key": "budget_usd", "group": "Guardrails & Budget", "label": "Budget (USD)",
      "help": "Stop scheduling new work past this cost cap — 0 means no cap.", "type": "float"},
+    {"key": "monthly_budget_usd", "group": "Guardrails & Budget",
+     "label": "Monthly budget (USD)",
+     "help": "Monthly spend cap for alerting only — 30-day spend is checked against it "
+             "and a notification fires when 50/80/100% is newly crossed (at most once "
+             "per calendar month each). Never stops or blocks runs; 0 disables the "
+             "alerts.", "type": "float"},
     {"key": "agent_max_turns", "group": "Guardrails & Budget", "label": "Agent max turns",
      "help": "Per-agent tool-loop cap — lower is cheaper.", "type": "int"},
     {"key": "subtask_max_seconds", "group": "Guardrails & Budget", "label": "Subtask max seconds",
@@ -493,6 +508,12 @@ SETTINGS_SCHEMA: list[dict] = [
      "help": "Sibling recall only when the project is in a workspace: runs also pull "
              "relevant memories and knowledge-base hits from sibling projects (read-only, "
              "attributed per project). Projects outside any workspace are unaffected.",
+     "type": "bool"},
+    {"key": "code_retrieval", "group": "Memory & Knowledge", "label": "Code retrieval",
+     "help": "Index the run's repo workspace into the per-project semantic code index "
+             "and give each subtask a 'Relevant code (indexed)' context block of the "
+             "best-matching source chunks. Only affects runs on a real repo workspace "
+             "(project checkout or repo-backed run) — greenfield runs are unchanged.",
      "type": "bool"},
     {"key": "embeddings_backend", "group": "Memory & Knowledge", "label": "Embeddings backend",
      "help": "Vector backend for memory recall.", "type": "choice",

@@ -174,7 +174,7 @@ def test_background_loops_start_and_stop_with_the_app(tmp_path):
     app = create_app(_settings(tmp_path), api_token="")
     app.state.paused = True
     with TestClient(app):
-        assert len(app.state.bg_tasks) == 2  # schedules + github tickers
+        assert len(app.state.bg_tasks) == 3  # schedules + github + maintenance/spend tickers
         assert all(not t.done() for t in app.state.bg_tasks)
     assert app.state.bg_tasks == []  # cancelled and cleared at shutdown
 

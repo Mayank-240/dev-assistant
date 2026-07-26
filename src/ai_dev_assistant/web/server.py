@@ -30,7 +30,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import analytics, config, github, notify, playbooks, projects, search, vcs
+from .. import analytics, backup, config, github, maintenance, notify, playbooks, projects, search, vcs
 from .. import gc as workspace_gc
 from .. import workspaces as workspaces_mod
 from ..agents import custom as custom_agents
@@ -56,6 +56,7 @@ from ..orchestration.run_control import RunControl
 from ..orchestration.run_store import RunStore, derive_title
 from ..orchestration.schedules import ScheduleStore, next_run_at
 from ..orchestration.task import new_task_id
+from . import push as push_mod
 from . import users as users_mod
 
 _STATIC = Path(__file__).parent / "static"
@@ -95,6 +96,7 @@ _SETTINGS_FIELDS = {f.name for f in dataclasses.fields(Settings)}
 # Background loop cadences (seconds).
 _SCHEDULES_TICK_S = 60.0
 _GITHUB_TICK_S = 120.0
+_MAINTENANCE_TICK_S = 120.0  # maintenance enqueue + spend-alert check (one ops tick)
 
 _KB_UPLOAD_MAX_BYTES = 2 * 1024 * 1024  # per-file cap for /kb/upload
 
@@ -345,6 +347,15 @@ class ABRequest(BaseModel):
     values: list[str]
 
 
+class PushSubscribeRequest(BaseModel):
+    subscription: dict[str, Any]   # the browser's PushSubscription.toJSON()
+    ua: str | None = None          # optional user-agent label for the device list
+
+
+class PushUnsubscribeRequest(BaseModel):
+    endpoint: str
+
+
 class LoginRequest(BaseModel):
     token: str = ""
 
@@ -555,6 +566,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     # Recurring runs: same runs.db file, its own table + connection (schedules contract).
     app.state.schedules = ScheduleStore(settings.data_dir / "runs.db")
     app.state.github_transport = None  # tests inject a fake github Transport here
+    app.state.push_webpush = None      # tests inject a fake pywebpush.webpush here
+    app.state.notify_transport = None  # tests inject a fake notify Transport here
     app.state.bg_tasks = []  # background loop asyncio.Tasks (started at startup)
     # task queue / scheduler state
     app.state.concurrency = max(1, app.state.base_settings.max_concurrent_runs)
@@ -625,14 +638,50 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         return bool(cfg.webhook_url or cfg.slack_webhook_url or cfg.desktop
                     or (cfg.email_to and cfg.smtp_host))
 
+    def _send_push_payload(payload: dict[str, Any]) -> None:
+        """Web Push fan-out of one ``{title, body, tag, url}`` payload. Fire-and-forget:
+        the send runs in a thread and nothing here ever raises — a broken push service
+        must never affect the run path."""
+        try:
+            if app.state.push_webpush is None and not push_mod.push_available():
+                return
+            if not push_mod.list_subscriptions(settings.data_dir):
+                return
+            kwargs = ({"webpush": app.state.push_webpush}
+                      if app.state.push_webpush is not None else {})
+
+            def _send() -> None:
+                try:
+                    push_mod.send_push(settings.data_dir, payload, **kwargs)
+                except Exception:  # noqa: BLE001 — belt over send_push's never-raises brace
+                    pass
+
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                _send()  # no running loop (tests/teardown)
+                return
+            loop.create_task(asyncio.to_thread(_send))
+        except Exception:  # noqa: BLE001
+            pass
+
     def _dispatch_notify(event: Event, task_id: str, project_slug: str) -> None:
-        """Fan a run event out to the configured notify channels. Fire-and-forget:
-        the webhook/osascript work runs in a thread, and nothing here ever raises."""
+        """Fan a run event out to the configured notify channels plus Web Push.
+        Fire-and-forget: the webhook/osascript/push work runs in a thread, and
+        nothing here ever raises."""
         try:
             cfg = _notify_config(app.state.base_settings)
-            if not _notify_channels_configured(cfg):
-                return
             if not notify.should_notify(cfg, event.type):
+                return
+            # Web Push rides the SAME event selection as the other channels; no
+            # channel config is required for it — subscriptions alone opt a device in.
+            _send_push_payload({
+                "title": f"[{project_slug}] {event.type}",
+                "body": (event.message or "")[:160],
+                "tag": task_id,
+                "url": f"/app#task={task_id}",
+            })
+            if not _notify_channels_configured(cfg):
                 return
 
             def _send() -> None:
@@ -2555,6 +2604,192 @@ def create_app(settings: Settings | None = None, host: str | None = None,
 
     app.state.schedules_tick = _schedules_tick
 
+    # ---- Web Push: subscription CRUD + status + test send (web/push.py) ----
+    @app.get("/api/push/status")
+    async def push_status() -> JSONResponse:
+        available = push_mod.push_available()
+        body: dict[str, Any] = {
+            "available": available,
+            "subscriptions": len(push_mod.list_subscriptions(settings.data_dir)),
+        }
+        if available:
+            # ensure_vapid_keys under the hood: first status call mints the key pair.
+            body["public_key"] = await asyncio.to_thread(
+                push_mod.vapid_public_key, settings.data_dir)
+        else:
+            body["reason"] = push_mod.push_unavailable_reason()
+        return JSONResponse(body)
+
+    @app.post("/api/push/subscribe")
+    async def push_subscribe(req: PushSubscribeRequest) -> JSONResponse:
+        try:
+            entry = push_mod.add_subscription(settings.data_dir, req.subscription,
+                                              ua=(req.ua or None))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, "endpoint": entry["endpoint"]})
+
+    @app.delete("/api/push/subscribe")
+    async def push_unsubscribe(req: PushUnsubscribeRequest) -> JSONResponse:
+        removed = push_mod.remove_subscription(settings.data_dir, req.endpoint)
+        return JSONResponse({"ok": True, "removed": removed})
+
+    @app.post("/api/push/test")
+    async def push_test() -> JSONResponse:
+        kwargs = ({"webpush": app.state.push_webpush}
+                  if app.state.push_webpush is not None else {})
+        result = await asyncio.to_thread(
+            push_mod.send_push, settings.data_dir,
+            {"title": "[ada] test notification",
+             "body": "Web Push is working — task events will reach this device.",
+             "tag": "push-test", "url": "/app"},
+            **kwargs)
+        return JSONResponse(result)
+
+    # ---- Maintenance mode: per-project policy + the enqueue tick (maintenance.py) ----
+    @app.get("/api/projects/{slug}/maintenance")
+    async def get_maintenance_policy(slug: str) -> JSONResponse:
+        try:
+            pol = await asyncio.to_thread(
+                maintenance.get_policy, app.state.base_settings, slug)
+        except ValueError as exc:  # only raised for an unknown project
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        return JSONResponse(pol)
+
+    @app.put("/api/projects/{slug}/maintenance")
+    async def put_maintenance_policy(slug: str, policy: dict[str, Any]) -> JSONResponse:
+        try:
+            pol = await asyncio.to_thread(
+                maintenance.set_policy, app.state.base_settings, slug, policy)
+        except ValueError as exc:
+            code = 404 if str(exc).startswith("unknown project") else 400
+            return JSONResponse({"error": str(exc)}, status_code=code)
+        return JSONResponse(pol)
+
+    async def _maintenance_tick(now: float | None = None) -> int:
+        """One maintenance pass: enqueue every due entry as a normal run (same payload
+        shape the schedules tick uses, tagged ``maintenance: true``), then
+        mark_maintenance_started ONCE per project so the cadence advances and the tick
+        stays idempotent. Returns how many runs were enqueued; failures are logged and
+        skipped, never raised."""
+        live = app.state.base_settings
+        try:
+            due = await asyncio.to_thread(maintenance.due_maintenance, live, now)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ai-dev-assistant] maintenance: due_maintenance() failed: {exc}",
+                  flush=True)
+            return 0
+        started = 0
+        started_slugs: list[str] = []
+        for entry in due:
+            slug = entry.get("slug")
+            try:
+                task_id = new_task_id()
+                title = entry.get("title") or derive_title(entry.get("prompt") or "")
+                payload = {
+                    "prompt": entry.get("prompt") or "", "plan": None, "effort": None,
+                    "model": None, "budget": (entry.get("budget_usd") or None),
+                    "title": title, "project": slug, "memory_scope": None,
+                    "continue_from": None, "git_finalize": None,
+                    "settings_overrides": entry.get("settings_overrides"),
+                    "maintenance": True,  # additive attribution, never read by the run path
+                }
+                app.state.brokers[task_id] = Broker()
+                app.state.runs.enqueue(task_id, payload["prompt"], title, payload)
+                if slug not in started_slugs:
+                    started_slugs.append(slug)
+                started += 1
+            except Exception as exc:  # noqa: BLE001 — one bad entry must not stop the rest
+                print(f"[ai-dev-assistant] maintenance: {slug} failed to enqueue: {exc}",
+                      flush=True)
+        for slug in started_slugs:
+            try:
+                await asyncio.to_thread(
+                    maintenance.mark_maintenance_started, live, slug, now)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[ai-dev-assistant] maintenance: mark_started({slug}) failed: "
+                      f"{exc}", flush=True)
+        if started:
+            _pump()
+        return started
+
+    app.state.maintenance_tick = _maintenance_tick
+
+    # ---- Spend alerts: monthly_budget_usd threshold pings (analytics + notify) ----
+    async def _spend_alerts_tick(now: float | None = None) -> int:
+        """Compare 30-day spend against the ``monthly_budget_usd`` cap (alerting only;
+        0 disables) and fan each NEWLY crossed threshold out via the notify channels
+        plus Web Push. ``check_spend_alerts`` persists fire-once state per calendar
+        month, so re-ticking never re-pings. Returns how many alerts fired."""
+        live = app.state.base_settings
+        cap = float(live.monthly_budget_usd or 0.0)
+        if cap <= 0:
+            return 0
+        try:
+            alerts = await asyncio.to_thread(
+                analytics.check_spend_alerts, live, cap, now=now)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ai-dev-assistant] spend alerts: check failed: {exc}", flush=True)
+            return 0
+        for alert in alerts:
+            try:
+                cfg = _notify_config(live)
+                await asyncio.to_thread(notify.notify_spend_alert, cfg, alert,
+                                        app.state.notify_transport)
+                _send_push_payload({
+                    "title": f"[budget] {alert.get('percent', 0)}% of monthly cap",
+                    "body": notify.format_spend_alert(alert)[:160],
+                    "tag": "spend-alert", "url": "/app",
+                })
+            except Exception:  # noqa: BLE001 — alerting must never break the tick
+                pass
+        return len(alerts)
+
+    app.state.spend_alerts_tick = _spend_alerts_tick
+
+    async def _ops_tick() -> None:
+        """The ~120s housekeeping tick: maintenance enqueue, then spend alerts."""
+        await _maintenance_tick()
+        await _spend_alerts_tick()
+
+    # ---- Backup: archive the data dir over the API (backup.py) ----
+    @app.post("/api/backup")
+    async def create_backup_endpoint() -> JSONResponse:
+        """Create a data-dir backup archive in ``<data_dir>/backups/``.
+
+        Restore is deliberately CLI-ONLY (``ada backup restore <archive> [--force]``):
+        it replaces the live data dir — auth state included — and must never be
+        reachable from the web surface.
+        """
+        try:
+            path = await asyncio.to_thread(backup.create_backup, app.state.base_settings)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({"path": str(path), "size": path.stat().st_size})
+
+    @app.get("/api/backups")
+    async def list_backups_endpoint() -> JSONResponse:
+        rows = await asyncio.to_thread(backup.list_backups, app.state.base_settings)
+        return JSONResponse([{**r, "path": str(r["path"])} for r in rows])
+
+    @app.get("/api/backup/download")
+    async def download_backup(path: str):
+        """Download one archive from ``<data_dir>/backups/`` — guarded so only files
+        inside that directory are ever served (no traversal, no symlink escape)."""
+        backups_dir = (Path(settings.data_dir) / "backups").resolve()
+        target = Path(path)
+        if not target.is_absolute():
+            target = backups_dir / target
+        try:
+            target = target.resolve()
+        except OSError:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        if (target == backups_dir or not target.is_relative_to(backups_dir)
+                or not target.is_file() or not target.name.endswith(".tar.gz")):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return FileResponse(str(target), filename=target.name,
+                            media_type="application/gzip")
+
     # ---- Global search ----
     @app.get("/api/search")
     async def global_search_endpoint(
@@ -2935,6 +3170,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         app.state.bg_tasks = [
             asyncio.create_task(_periodic(_SCHEDULES_TICK_S, _schedules_tick)),
             asyncio.create_task(_periodic(_GITHUB_TICK_S, _github_tick)),
+            asyncio.create_task(_periodic(_MAINTENANCE_TICK_S, _ops_tick)),
         ]
 
     @app.on_event("shutdown")

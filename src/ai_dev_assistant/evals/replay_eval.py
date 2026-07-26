@@ -128,6 +128,8 @@ def replay_base_settings(**overrides) -> Settings:
         embeddings_backend="hash",
         verify_run_tests=False, objective_review=False, lint_check=False,
         objective_static=False,  # pinned like adaptive_replan: no host-tool variance in evals
+        code_retrieval=False,    # pinned: repo-fixture eval prompts must never grow an
+                                 # indexed-code part between record and replay
         adaptive_replan=False, git_finalize=False, max_retries=0,
         **overrides,
     )

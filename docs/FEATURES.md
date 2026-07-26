@@ -190,8 +190,9 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
 - Symbol-ranked repo map (AST + import centrality + query relevance);
   per-subtask context pack under a per-model token budget; prompt caching
   (anthropic backend).
-- Semantic code index (`knowledge/code_index.py`; **engine wiring next
-  phase**): per-project `code_index.db` next to `memory.db`; source chunked
+- Semantic code index (`knowledge/code_index.py`, wired into the engine via the
+  `code_retrieval` setting — on by default): per-project `code_index.db` next
+  to `memory.db`; source chunked
   into ~60-line windows (10-line overlap; binaries/lockfiles/minified
   skipped), embedded via the shared embedder (hash backend = lexical-only,
   as everywhere) into the standard vectors table. Incremental
@@ -199,7 +200,12 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   pruned), hybrid `search` with path:line spans, and `retrieval_context`
   renders a budget-bounded "relevant code" block ready to append as an
   untrusted context part. Index/search degrade silently — corrupt db is
-  rebuilt, embedder-down falls back to lexical.
+  rebuilt, embedder-down falls back to lexical. Engine wiring: runs on a real
+  repo workspace (project checkout or repo-backed) index it at run start
+  (worker thread, time-capped, failures ignored) and each subtask gets the
+  best-matching chunks as a "Relevant code (indexed)" untrusted part right
+  after the repo map. Strictly conditional: greenfield/eval runs never build
+  the index, so their prompts are byte-identical with the setting on or off.
 
 ## Search & palette
 - Global search (`GET /api/search`, `search.py`): one query, ranked hits across
@@ -228,6 +234,10 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   health produces no delivery branch. `due_maintenance()` hands the server
   tick ready-to-enqueue payloads (rendered prompt/title/settings_overrides +
   the policy budget); `mark_maintenance_started()` advances the cadence.
+  Wired: `GET/PUT /api/projects/{slug}/maintenance` edits the policy (PUT
+  validates, 400 with the validator's message) and the server's ~120s ops tick
+  enqueues due entries as normal runs (queue payloads tagged
+  `maintenance: true`), then marks the project started once per pass.
 - Scheduled tasks (`orchestration/schedules.py`): recurring per-project runs
   with **either** `every_hours` **or** a 5-field `cron` expression (mutually
   exclusive; bad expressions 400); the server's 60s tick enqueues due schedules
@@ -250,6 +260,12 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   reports itself unavailable with a reason the UI can show. Payloads are
   `{title, body, tag, url}` with `url` a console deep link the service worker
   opens on tap. No offline caching by design — the console is a live dashboard.
+  Wired: `GET /api/push/status` (availability + reason, public key,
+  subscription count), `POST/DELETE /api/push/subscribe`, `POST /api/push/test`;
+  the server's event dispatch pushes the same event kinds the `notify_events`
+  selection allows (`{title: "[project] kind", body, tag: task_id,
+  url: /app#task=<id>}`), fire-and-forget so a broken push service never
+  touches the run path.
 
 ## Cost, analytics & benchmarks
 - Cost attribution: pricing table populates `cost_usd` (budget guardrail trips
@@ -260,8 +276,10 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   snapshot on Home.
 - Budget alerts (`analytics.check_spend_alerts` + `notify.notify_spend_alert`):
   30-day spend is compared against a monthly cap at 50/80/100% thresholds; the
-  cap is passed in by the server (derived from its Settings, e.g.
-  `budget_usd`) — analytics deliberately does not read the config schema.
+  cap is the `monthly_budget_usd` setting (`ADA_MONTHLY_BUDGET_USD`; alerting
+  only, 0 disables — `budget_usd` stays the per-run guardrail), passed in by
+  the server's ~120s ops tick — analytics deliberately does not read the
+  config schema.
   Each threshold fires at most once per UTC calendar month, tracked in
   `<data_dir>/spend_alerts.json` (reset on month rollover). Alerts are
   formatted and fanned out through the existing notification channels
@@ -363,6 +381,10 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   forced, and with `--force` **moves the current data dir aside** to
   `<data_dir>.pre-restore-<ts>` (never deletes) before extracting behind a
   path-traversal guard. Stop the server before restoring; restart it after.
+- Over the API: `POST /api/backup` creates an archive (`{path, size}`),
+  `GET /api/backups` lists them, and `GET /api/backup/download?path=` serves
+  one — guarded to `<data_dir>/backups/` only (no traversal). Restore is
+  deliberately CLI-only: it replaces the live data dir, auth state included.
 
 ## Evals & quality
 - `ada eval` golden-task harness: **11 golden tasks** (greenfield +
