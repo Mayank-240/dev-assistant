@@ -40,6 +40,19 @@ jobs:
       #   uv run python -m ai_dev_assistant.evals.replay_eval --record
       - name: Offline replay eval (committed cassettes)
         run: uv run python -m ai_dev_assistant.evals.replay_eval
+        env:
+          ADA_EVAL_RECORD_HISTORY: "1"
+
+      # Benchmark history: the replay eval above appends its scores (pass rate,
+      # quality, cost, git sha) to .ada_data/benchmarks.jsonl; keep it as an
+      # artifact so trends across commits can be inspected/downloaded.
+      - name: Upload benchmark history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-history
+          path: .ada_data/benchmarks.jsonl
+          if-no-files-found: ignore
 
       # NOTE: `uv run ai-dev-assistant eval` against the FULL golden suite (incl.
       # the repo-fixture tasks in evals/fixtures/) still needs a live LLM backend

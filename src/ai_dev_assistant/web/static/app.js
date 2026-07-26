@@ -4942,6 +4942,46 @@ $("project-modal-close").onclick = closeProjectModal;
 $("pm-cancel").onclick = closeProjectModal;
 $("pm-submit").onclick = submitProjectModal;
 $("project-modal").onclick = (e) => { if (e.target === $("project-modal")) closeProjectModal(); };
+
+// ---- local-folder picker for the import flow (server-side /api/fs/browse) ----
+let fsCurrentPath = "";
+async function fsLoad(path) {
+  const body = await (await fetch("/api/fs/browse?path=" + encodeURIComponent(path || ""))).json();
+  fsCurrentPath = body.path;
+  $("fs-path").textContent = body.path;
+  const list = $("fs-list");
+  list.innerHTML = "";
+  if (body.parent) {
+    const up = document.createElement("li");
+    up.className = "fs-item fs-up";
+    up.textContent = "↑ ..";
+    up.onclick = () => fsLoad(body.parent);
+    list.appendChild(up);
+  }
+  for (const d of body.dirs) {
+    const li = document.createElement("li");
+    li.className = "fs-item";
+    li.innerHTML = "<span></span>" + (d.is_git ? '<code class="fs-git">GIT</code>' : "");
+    li.querySelector("span").textContent = d.name;
+    li.onclick = () => fsLoad(d.path);
+    list.appendChild(li);
+  }
+  if (!body.dirs.length && !body.parent) {
+    const li = document.createElement("li");
+    li.className = "fs-item muted";
+    li.textContent = "No sub-folders here.";
+    list.appendChild(li);
+  }
+}
+function closeFsModal() { $("fs-modal").classList.add("hidden"); }
+$("pm-browse").onclick = () => {
+  $("fs-modal").classList.remove("hidden");
+  fsLoad($("pm-source").value.trim() || "");
+};
+$("fs-select").onclick = () => { $("pm-source").value = fsCurrentPath; closeFsModal(); };
+$("fs-close").onclick = closeFsModal;
+$("fs-cancel").onclick = closeFsModal;
+$("fs-modal").onclick = (e) => { if (e.target === $("fs-modal")) closeFsModal(); };
 [["pm-name"], ["pm-source"], ["pm-import-name"], ["pm-ref"]].forEach(([id]) =>
   $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitProjectModal(); } }));
 $("q-pause").onclick = togglePause;

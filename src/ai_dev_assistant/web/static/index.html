@@ -1017,7 +1017,10 @@
         <div class="pm-divider" aria-hidden="true">or import an existing repository</div>
         <div>
           <label class="pm-label" for="pm-source">Source — local path or git URL</label>
-          <input id="pm-source" class="title-input" type="text" placeholder="~/projects/myrepo  ·  https://github.com/me/repo.git" />
+          <div class="pm-source-row">
+            <input id="pm-source" class="title-input" type="text" placeholder="~/projects/myrepo  ·  https://github.com/me/repo.git" />
+            <button id="pm-browse" type="button" class="ghost-btn">Browse…</button>
+          </div>
         </div>
         <div class="pm-grid">
           <div>
@@ -1033,6 +1036,24 @@
         <div class="pe-actions">
           <button id="pm-submit" class="btn-primary">Create / Import</button>
           <button id="pm-cancel" class="ghost-btn" type="button">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Directory picker (local import) -->
+  <div id="fs-modal" class="modal hidden">
+    <div class="modal-box pm-box" role="dialog" aria-modal="true" aria-label="Choose a folder" tabindex="-1">
+      <div class="modal-head">
+        <span class="kicker">Choose a folder</span>
+        <button id="fs-close" type="button" class="ghost" aria-label="Close dialog">✕</button>
+      </div>
+      <div class="am-body">
+        <div id="fs-path" class="fs-path" aria-live="polite"></div>
+        <ul id="fs-list" class="fs-list"></ul>
+        <div class="pe-actions">
+          <button id="fs-select" class="btn-primary">Use this folder</button>
+          <button id="fs-cancel" class="ghost-btn" type="button">Cancel</button>
         </div>
       </div>
     </div>
