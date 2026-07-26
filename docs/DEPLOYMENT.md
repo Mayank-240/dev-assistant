@@ -165,6 +165,26 @@ pre-creates all three under `/data` owned by the runtime user (uid/gid 1000),
 so named volumes inherit correct ownership on first mount. If you bind-mount
 host directories instead of named volumes, `chown -R 1000:1000` them first.
 
+**Backups.** `ada backup create` archives the `ada_data` contents (the only
+volume that is not re-creatable) into
+`<data_dir>/backups/ada-backup-<ts>.tar.gz`, snapshotting the SQLite stores
+with the sqlite3 backup API so it is safe to run against a live server —
+inside the container:
+
+```sh
+docker compose exec ada ai-dev-assistant backup create
+```
+
+then copy the archive off the volume (`docker compose cp
+ada:/data/.ada_data/backups/. ./backups/`). `ada_workspace` and `ada_docs` are
+deliberately not archived — checkouts/worktrees and generated docs are
+re-creatable or git-backed. Archives include `users.json` (token hashes) and
+`vapid.json` (push keys, private key included) so a restore brings back your
+own auth/push setup — store them like secrets. Restore with the server
+**stopped** (`ada backup restore <archive> [--force]`; `--force` moves the
+existing data dir aside to `<data_dir>.pre-restore-<ts>` rather than deleting
+it), then restart.
+
 ## Hardening in the shipped compose file
 
 `docker-compose.yml` runs the service with:

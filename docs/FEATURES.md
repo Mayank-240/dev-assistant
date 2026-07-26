@@ -103,6 +103,16 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   failures never blamed; scoped-green-only soft-pass, capped score. Test
   detection: Python, JS, Go, Rust, Java, Ruby. Final workspace test run;
   0-100 quality score.
+- Static-analysis gate (`objective_static`, default on): detected linters and
+  typecheckers — ruff (config or `.py` files), eslint (config +
+  `node_modules/.bin` or PATH), tsc (`tsconfig.json`, `--noEmit`) — are counted
+  once at the pre-run baseline and re-counted per reviewed subtask; the delta
+  joins the reviewer's objective note ("static checks: ruff +3 (baseline 12),
+  tsc +0") and a positive delta demotes the verdict exactly like a
+  newly-failing test, so "tests pass but the diff added 40 lint errors" fails
+  honestly. Zero/negative deltas add the note only; a check that times out or
+  crashes is logged and skipped; with no tools detected nothing is appended
+  anywhere.
 - Reviews & Permissions panel on every task: verdicts with per-criterion
   evidence + changed files + diffs, resolved policy, tools per agent, denied
   actions from the audit log.
@@ -133,6 +143,19 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
 - In-run control: pause/resume between batches, steer the next subtask, cancel
   (kills child process groups). Post-run: feedback (rate/accept/comment) feeds
   the next plan.
+- Terminal attention client (`ada attend`, `attend.py`): answer the same
+  ask/permission requests without the browser. Polls `GET /api/home` (base URL
+  `--url`, default `http://127.0.0.1:8000`; token from `--token` /
+  `ADA_API_TOKEN` as a bearer header) every `--interval` seconds, renders each
+  new request (agent, project, question, numbered options) and reads the answer
+  on stdin — a number picks an option, free text answers verbatim, and
+  permission requests take `y` (allow for this run) / `once` (allow once) / `n`
+  (deny), with unrecognized input denying-with-reason, never granting. Answers
+  are delivered via the console's own steer channel
+  (`POST /api/run/{task_id}/steer` with `[answer <id>] …` /
+  `[permission <id>] ALLOW ONCE|ALLOW FOR THIS RUN|DENIED: …` notes).
+  Unreachable server → retry with backoff; Ctrl-C exits cleanly; `--once`
+  processes the currently-open items and exits (scripting/cron).
 - Live transcripts: every agent step — thinking, text, tool calls, tool results
   (error-flagged), final result — is persisted (~4k chars per step) as
   `agent_step` events in the task's `events.jsonl` and served via
@@ -167,6 +190,16 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
 - Symbol-ranked repo map (AST + import centrality + query relevance);
   per-subtask context pack under a per-model token budget; prompt caching
   (anthropic backend).
+- Semantic code index (`knowledge/code_index.py`; **engine wiring next
+  phase**): per-project `code_index.db` next to `memory.db`; source chunked
+  into ~60-line windows (10-line overlap; binaries/lockfiles/minified
+  skipped), embedded via the shared embedder (hash backend = lexical-only,
+  as everywhere) into the standard vectors table. Incremental
+  `index_workspace` (unchanged (path, mtime, size) skipped, deletions
+  pruned), hybrid `search` with path:line spans, and `retrieval_context`
+  renders a budget-bounded "relevant code" block ready to append as an
+  untrusted context part. Index/search degrade silently — corrupt db is
+  rebuilt, embedder-down falls back to lexical.
 
 ## Search & palette
 - Global search (`GET /api/search`, `search.py`): one query, ranked hits across
@@ -176,10 +209,25 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
 - `cmd+K` command palette in the console fronts the same search.
 
 ## Playbooks, schedules & notifications
-- Playbooks: 7 pre-tuned task templates (raise-coverage, upgrade-dependency,
+- Playbooks: 11 pre-tuned task templates (raise-coverage, upgrade-dependency,
   security-audit, refactor-module, document-codebase, fix-failing-tests,
-  add-feature-tdd), one click from the project Overview
-  (`GET /api/playbooks`, `POST /api/playbooks/{pid}/run`).
+  add-feature-tdd, dependency-refresh, doc-drift, dead-code, cut-a-release),
+  one click from the project Overview
+  (`GET /api/playbooks`, `POST /api/playbooks/{pid}/run`). The
+  `cut-a-release` playbook prepares a release on the task branch (changelog
+  from git history, version bump, CHANGELOG.md) and explicitly never tags or
+  pushes — the human tags after acceptance.
+- Autonomous maintenance mode (`maintenance.py`): per-project opt-in
+  housekeeping on a cadence (interval hours or 5-field cron, validated by the
+  schedules cron parser). The policy — `{enabled, cadence, budget_usd, tasks,
+  last_run_at}` — lives under the `maintenance` key of the project's policy in
+  the registry (same mechanism as the run-policy editor). Tasks are a subset
+  of dependency-refresh / security-audit / doc-drift / dead-code, each backed
+  by a playbook whose prompt makes "nothing to do" a first-class outcome:
+  the agent completes WITHOUT changing files and says so, so a clean bill of
+  health produces no delivery branch. `due_maintenance()` hands the server
+  tick ready-to-enqueue payloads (rendered prompt/title/settings_overrides +
+  the policy budget); `mark_maintenance_started()` advances the cadence.
 - Scheduled tasks (`orchestration/schedules.py`): recurring per-project runs
   with **either** `every_hours` **or** a 5-field `cron` expression (mutually
   exclusive; bad expressions 400); the server's 60s tick enqueues due schedules
@@ -191,6 +239,17 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   **email** (stdlib SMTP; password env-only `ADA_SMTP_PASSWORD`), **macOS
   desktop** — plus the in-app notification center. All configurable live from
   the settings console.
+- Web Push / PWA (`web/push.py` + `static/manifest.webmanifest`, `static/sw.js`,
+  `static/icon.svg`): attention requests reach the phone as system
+  notifications even with the console closed. VAPID keys are auto-generated on
+  first use into `<data_dir>/vapid.json` (0600); browser subscriptions live in
+  `<data_dir>/push_subscriptions.json`, deduped by endpoint and pruned when the
+  push service reports them gone (404/410). Sending needs the optional
+  `pywebpush` dependency (`pip install ai-dev-assistant[push]`); without it —
+  or without `cryptography` for key generation — nothing breaks: the feature
+  reports itself unavailable with a reason the UI can show. Payloads are
+  `{title, body, tag, url}` with `url` a console deep link the service worker
+  opens on tap. No offline caching by design — the console is a live dashboard.
 
 ## Cost, analytics & benchmarks
 - Cost attribution: pricing table populates `cost_usd` (budget guardrail trips
@@ -199,6 +258,15 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   `GET /api/analytics/overview | outcomes | project/{slug} | run/{task_id}` —
   spend dashboard, outcome ratios, per-run subtask breakdowns; 30-day spend
   snapshot on Home.
+- Budget alerts (`analytics.check_spend_alerts` + `notify.notify_spend_alert`):
+  30-day spend is compared against a monthly cap at 50/80/100% thresholds; the
+  cap is passed in by the server (derived from its Settings, e.g.
+  `budget_usd`) — analytics deliberately does not read the config schema.
+  Each threshold fires at most once per UTC calendar month, tracked in
+  `<data_dir>/spend_alerts.json` (reset on month rollover). Alerts are
+  formatted and fanned out through the existing notification channels
+  (webhook/Slack/email/desktop) as a `spend_alert` event that bypasses the
+  per-event opt-in filter — crossing a budget threshold is always worth a ping.
 - Benchmark history (`evals/history.py`): `ada eval --record-history` (or
   `python -m ai_dev_assistant.evals.replay_eval --record-history`, or
   `ADA_EVAL_RECORD_HISTORY=1`) appends one JSONL entry per suite run to
@@ -248,6 +316,12 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
 - Extras: notification bell, `cmd+K` palette, KG filter/focus, A/B replay
   smoke from the UI, first-run tour, accessibility (dialogs, keyboard,
   contrast, reduced motion).
+- Editor integrations (`integrations/`): the console's REST + WebSocket API is
+  editor-agnostic — `integrations/README.md` documents the three calls any
+  editor needs (poll `/api/home` attention, answer via the steer note format,
+  deep-link `/app#task=<id>`); `integrations/vscode/` ships an experimental
+  status-bar + attention-answering extension (no build step, `ada.baseUrl` /
+  `ada.token` for remote deployments).
 
 ## Security & auth
 - SDK built-ins confined by deny-hook; toolbox path sandbox + secret denylist;
@@ -273,6 +347,22 @@ is in [ARCHITECTURE.md](ARCHITECTURE.md); production setup in
   env-only.
 - Every setting also has an `ADA_*` env var (see `.env.example`); the overlay
   (`<data_dir>/settings.json`) stores only overridden keys.
+
+## Operations: backup & restore
+- `ada backup create [--out DIR]` (`backup.py`): archives the **data dir only**
+  into `ada-backup-<UTC ts>.tar.gz` (default `<data_dir>/backups/`) — run store,
+  per-project/global memory, knowledge graphs, `projects.json`, settings
+  overlay, benchmark history, plus `users.json` and `vapid.json` (the user's
+  own auth/push state — treat archives as sensitive). SQLite databases are
+  snapshotted via the sqlite3 backup API first, so backing up under a live
+  server never captures a torn write; `backups/`, `*.lock`, and WAL/SHM
+  sidecars are excluded. Workspace checkouts and generated docs are **not**
+  included — both are re-creatable/git-backed.
+- `ada backup list` shows `<data_dir>/backups/` newest-first;
+  `ada backup restore <archive> [--force]` refuses a non-empty data dir unless
+  forced, and with `--force` **moves the current data dir aside** to
+  `<data_dir>.pre-restore-<ts>` (never deletes) before extracting behind a
+  path-traversal guard. Stop the server before restoring; restart it after.
 
 ## Evals & quality
 - `ada eval` golden-task harness: **11 golden tasks** (greenfield +
