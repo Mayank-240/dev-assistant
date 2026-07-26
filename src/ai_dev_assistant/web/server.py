@@ -246,6 +246,9 @@ class RunRequest(BaseModel):
     # rolled-up parent; a single entry behaves exactly like `project`.
     projects: list[str] | None = None
     stagger: bool = False  # run the first child alone so its lessons inform the rest
+    # Optional slug -> upstream slugs for fan-out runs: dependents start after their
+    # upstreams and get the upstream results appended to their prompt.
+    project_deps: dict[str, list[str]] | None = None
     memory_scope: str | None = None  # "project" | "global"
     continue_from: str | None = None  # re-engage: continue this completed task's workspace + context
     # Clean break: repo_path/repo_url/repo_ref are gone — the run's *project* owns the repo.
@@ -457,7 +460,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             app.state.tasks[task_id] = asyncio.create_task(_run_fanout(
                 task_id, payload.get("prompt", ""), list(slugs),
                 payload.get("effort"), payload.get("budget"), payload.get("title"),
-                bool(payload.get("stagger")), model=payload.get("model")))
+                bool(payload.get("stagger")), model=payload.get("model"),
+                deps=payload.get("project_deps")))
             return
         app.state.tasks[task_id] = asyncio.create_task(_run_task(
             task_id, payload.get("prompt", ""), payload.get("plan"),
@@ -619,7 +623,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     async def _run_fanout(task_id: str, prompt: str, slugs: list[str],
                           effort: str | None, budget: float | None,
                           title: str | None = None, stagger: bool = False,
-                          model: str | None = None) -> None:
+                          model: str | None = None,
+                          deps: dict[str, list[str]] | None = None) -> None:
         """F3: cross-project fan-out parent. run_cross_project owns the run rows
         (parent project='multi', children with parent_id) and emits plan/child_start/
         child_done/brief/done on the parent stream — we just wire it into the Broker."""
@@ -636,10 +641,13 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                 _publish(Event("error", msg, {"message": msg}))
                 app.state.runs.set_status(task_id, "failed")
                 return
+            # deps is passed only when set so fakes/older cores without the kwarg
+            # keep working for plain fan-out runs.
+            extra = {"deps": deps} if deps else {}
             await fn(_settings_for(app.state.base_settings, effort, budget, model=model),
                      prompt, slugs,
                      title=(title or None), stagger=bool(stagger), task_id=task_id,
-                     on_event=_publish)
+                     on_event=_publish, **extra)
         except asyncio.CancelledError:
             _publish(Event("error", "Run cancelled by user.", {"message": "cancelled"}))
             app.state.runs.set_status(task_id, "cancelled")
@@ -718,6 +726,17 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         if slugs and _fanout_runner() is None:
             return JSONResponse({"error": "cross-project fan-out is not available yet"},
                                 status_code=501)
+        deps: dict[str, list[str]] | None = None
+        if slugs and req.project_deps:
+            try:  # unknown slugs / cycles are a client error — reject before enqueue
+                from ..orchestration.fanout import validate_project_deps, _dependency_waves
+                deps = validate_project_deps(slugs, req.project_deps)
+                _dependency_waves(slugs, deps)  # cycle check
+                deps = deps or None
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except ImportError:  # core landing separately: pass through unvalidated
+                deps = req.project_deps
         task_id = req.task_id or new_task_id()
         app.state.brokers[task_id] = Broker()
         app.state.brokers[task_id].publish(Event("status", "Backend: " + settings.llm_backend,
@@ -727,6 +746,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                 "prompt": req.prompt, "projects": slugs, "stagger": bool(req.stagger),
                 "effort": req.effort, "model": req.model, "budget": req.budget, "title": req.title,
             }
+            if deps:
+                payload["project_deps"] = deps
         else:
             payload = {
                 "prompt": req.prompt, "plan": req.plan, "effort": req.effort,

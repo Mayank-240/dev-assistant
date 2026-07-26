@@ -582,6 +582,131 @@ def test_fanout_launch_reaches_run_cross_project(tmp_path, monkeypatch):
         assert any(e["type"] == "done" for e in broker.events)
 
 
+def test_run_request_has_project_deps_field():
+    assert "project_deps" in RunRequest.model_fields
+
+
+def test_run_project_deps_cycle_is_400(tmp_path):
+    if not _has_fanout():
+        pytest.skip("fan-out core not landed")
+    c = _client(tmp_path)
+    c.app.state.paused = True
+    a = c.post("/api/projects", json={"name": "Dep A"}).json()["slug"]
+    b = c.post("/api/projects", json={"name": "Dep B"}).json()["slug"]
+    r = c.post("/api/run", json={"prompt": "x", "projects": [a, b],
+                                 "project_deps": {a: [b], b: [a]}})
+    assert r.status_code == 400
+    assert "cycle" in r.json()["error"]
+    assert c.app.state.runs.queue_pending() == []  # rejected before enqueue
+
+
+def test_run_project_deps_unknown_slug_is_400(tmp_path):
+    if not _has_fanout():
+        pytest.skip("fan-out core not landed")
+    c = _client(tmp_path)
+    c.app.state.paused = True
+    a = c.post("/api/projects", json={"name": "Dep C"}).json()["slug"]
+    b = c.post("/api/projects", json={"name": "Dep D"}).json()["slug"]
+    r = c.post("/api/run", json={"prompt": "x", "projects": [a, b],
+                                 "project_deps": {a: ["not-in-run"]}})
+    assert r.status_code == 400
+    assert "unknown upstream project" in r.json()["error"]
+
+
+def test_run_project_deps_persisted_in_queue_payload(tmp_path):
+    if not _has_fanout():
+        pytest.skip("fan-out core not landed")
+    c = _client(tmp_path)
+    c.app.state.paused = True  # keep the pump from launching a real fan-out
+    a = c.post("/api/projects", json={"name": "Dep E"}).json()["slug"]
+    b = c.post("/api/projects", json={"name": "Dep F"}).json()["slug"]
+    r = c.post("/api/run", json={"prompt": "x", "projects": [a, b],
+                                 "project_deps": {b: [a]}})
+    assert r.status_code == 200 and r.json()["status"] == "queued"
+    payload = c.app.state.runs.queue_pending()[0]["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    assert payload["projects"] == [a, b]
+    assert payload["project_deps"] == {b: [a]}
+
+
+def test_fanout_launch_passes_project_deps_through(tmp_path, monkeypatch):
+    """POST /api/run with project_deps routes deps= into run_cross_project."""
+    import sys
+    import threading
+    import types
+
+    from ai_dev_assistant.orchestration import fanout as real_fanout
+    from ai_dev_assistant.web.server import create_app as _create_app
+
+    called: dict = {}
+    hit = threading.Event()
+
+    async def fake_run_cross_project(settings, prompt, slugs, *, title=None,
+                                     stagger=False, task_id=None, on_event=None,
+                                     engine_factory=None, deps=None):
+        called.update(prompt=prompt, slugs=list(slugs), deps=deps)
+        hit.set()
+        return {"parent_id": task_id, "status": "completed", "children": [],
+                "docs_dir": ""}
+
+    mod = types.ModuleType("ai_dev_assistant.orchestration.fanout")
+    mod.run_cross_project = fake_run_cross_project
+    mod.validate_project_deps = real_fanout.validate_project_deps
+    mod._dependency_waves = real_fanout._dependency_waves
+    monkeypatch.setitem(sys.modules, "ai_dev_assistant.orchestration.fanout", mod)
+
+    settings = Settings(
+        llm_backend="anthropic", anthropic_api_key="", embeddings_backend="hash",
+        data_dir=tmp_path / "data", docs_dir=tmp_path / "docs", workspace_dir=tmp_path / "ws",
+    )
+    app = _create_app(settings, api_token="")
+    with TestClient(app) as c:
+        a = c.post("/api/projects", json={"name": "Dep G"}).json()["slug"]
+        b = c.post("/api/projects", json={"name": "Dep H"}).json()["slug"]
+        r = c.post("/api/run", json={"prompt": "fan out", "projects": [a, b],
+                                     "project_deps": {b: [a]}})
+        assert r.status_code == 200, r.text
+        assert hit.wait(timeout=10), "run_cross_project was never reached"
+        assert called["slugs"] == [a, b]
+        assert called["deps"] == {b: [a]}
+
+
+def test_fanout_launch_without_deps_omits_kwarg(tmp_path, monkeypatch):
+    """Old-style payloads (no project_deps) never pass deps= — fakes and older
+    cores without the kwarg keep working."""
+    import sys
+    import threading
+    import types
+
+    from ai_dev_assistant.web.server import create_app as _create_app
+
+    hit = threading.Event()
+
+    async def fake_run_cross_project(settings, prompt, slugs, *, title=None,
+                                     stagger=False, task_id=None, on_event=None,
+                                     engine_factory=None):  # note: no deps kwarg
+        hit.set()
+        return {"parent_id": task_id, "status": "completed", "children": [],
+                "docs_dir": ""}
+
+    mod = types.ModuleType("ai_dev_assistant.orchestration.fanout")
+    mod.run_cross_project = fake_run_cross_project
+    monkeypatch.setitem(sys.modules, "ai_dev_assistant.orchestration.fanout", mod)
+
+    settings = Settings(
+        llm_backend="anthropic", anthropic_api_key="", embeddings_backend="hash",
+        data_dir=tmp_path / "data", docs_dir=tmp_path / "docs", workspace_dir=tmp_path / "ws",
+    )
+    app = _create_app(settings, api_token="")
+    with TestClient(app) as c:
+        a = c.post("/api/projects", json={"name": "Dep I"}).json()["slug"]
+        b = c.post("/api/projects", json={"name": "Dep J"}).json()["slug"]
+        r = c.post("/api/run", json={"prompt": "fan out", "projects": [a, b]})
+        assert r.status_code == 200, r.text
+        assert hit.wait(timeout=10), "run_cross_project was never reached"
+
+
 def test_children_endpoint_501_or_shape(tmp_path):
     c = _client(tmp_path)
     r = c.get("/api/tasks/parent-x/children")

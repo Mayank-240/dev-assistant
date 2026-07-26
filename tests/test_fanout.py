@@ -167,3 +167,165 @@ async def test_fanout_failure_isolation_and_stagger(tmp_path):
     assert "planner exploded" in by_slug[bad["slug"]]["error"]
     assert by_slug[good["slug"]]["status"] == "completed"
     assert order == [good["slug"]]  # bad never reached an agent; good ran after stagger head
+
+
+# ---- cross-project task dependencies (deps kwarg) ----
+
+def _spy_factory(seen_prompts: dict[str, str], order: list[tuple[str, str]] | None = None,
+                 exploding: set[str] | None = None):
+    """Engine factory that records the exact prompt each child engine received."""
+
+    def factory(child_settings: Settings) -> Engine:
+        slug = child_settings.project
+        engine = Engine(child_settings)
+        if exploding and slug in exploding:
+            class Exploder(ChildProvider):
+                async def structured(self, **kw):
+                    raise RuntimeError("planner exploded")
+            provider = Exploder()
+        else:
+            provider = ChildProvider()
+        engine.provider = provider
+        engine.orchestrator._provider = provider
+        engine.reviewer._provider = provider
+        orig_run = engine.run
+
+        async def spy_run(p, **kw):
+            seen_prompts[slug] = p
+            if order is not None:
+                order.append(("start", slug))
+            try:
+                return await orig_run(p, **kw)
+            finally:
+                if order is not None:
+                    order.append(("end", slug))
+
+        engine.run = spy_run
+        return engine
+
+    return factory
+
+
+async def test_no_deps_prompt_is_byte_identical(tmp_path):
+    """deps=None (and deps={}) must hand every child EXACTLY the caller's prompt."""
+    settings = _settings(tmp_path, max_concurrent_runs=2)
+    slugs = []
+    for name in ("plain-a", "plain-b"):
+        p = projects.create_project(settings, name)
+        _seed(projects.project_checkout(settings, p["slug"]), name.replace("-", "_"))
+        slugs.append(p["slug"])
+
+    prompt = "add a note file"
+    seen: dict[str, str] = {}
+    events = []
+    result = await run_cross_project(settings, prompt, slugs, on_event=events.append,
+                                     engine_factory=_spy_factory(seen))
+    assert result["status"] == "completed"
+    for s in slugs:
+        assert seen[s] == prompt  # byte-identical, no appended context
+    # no wave marker on the no-deps path
+    for e in events:
+        if e.type in ("child_start", "child_done"):
+            assert "wave" not in e.data
+
+
+async def test_deps_two_waves_order_and_injected_context(tmp_path):
+    settings = _settings(tmp_path, budget_usd=10.0, max_concurrent_runs=2)
+    a = projects.create_project(settings, "up-api")["slug"]
+    b = projects.create_project(settings, "down-web")["slug"]
+    _seed(projects.project_checkout(settings, a), "up_api")
+    _seed(projects.project_checkout(settings, b), "down_web")
+
+    seen: dict[str, str] = {}
+    order: list[tuple[str, str]] = []
+    seen_budgets: dict[str, float] = {}
+    base_factory = _spy_factory(seen, order)
+
+    def factory(child_settings: Settings) -> Engine:
+        seen_budgets[child_settings.project] = child_settings.budget_usd
+        return base_factory(child_settings)
+
+    prompt = "wire the endpoint"
+    events = []
+    result = await run_cross_project(
+        settings, prompt, [a, b], deps={b: [a]},
+        on_event=events.append, engine_factory=factory)
+
+    assert result["status"] == "completed"
+    # wave ordering: a fully finished before b started
+    assert order.index(("end", a)) < order.index(("start", b))
+    # upstream (wave-1) prompt untouched; downstream prompt gets the section
+    assert seen[a] == prompt
+    assert seen[b].startswith(prompt + "\n\n--- Upstream results ---\n")
+    assert f"[{a}] status: completed" in seen[b]
+    assert "Done." in seen[b]  # upstream summary (brief tldr) injected
+    # budget still split equally across all children
+    assert all(abs(v - 5.0) < 1e-9 for v in seen_budgets.values())
+    # wave marker on child events
+    waves = {e.data["slug"]: e.data["wave"] for e in events if e.type == "child_start"}
+    assert waves == {a: 1, b: 2}
+    done_waves = {e.data["slug"]: e.data["wave"] for e in events if e.type == "child_done"}
+    assert done_waves == {a: 1, b: 2}
+    # rollup records the dependency order
+    rollup = (settings.docs_dir / result["parent_id"] / "rollup.md").read_text()
+    assert "Dependency order" in rollup and f"[{a}] -> [{b}]" in rollup
+
+
+async def test_deps_failed_upstream_still_runs_downstream(tmp_path):
+    settings = _settings(tmp_path, max_concurrent_runs=2)
+    bad = projects.create_project(settings, "dep-bad")["slug"]
+    good = projects.create_project(settings, "dep-good")["slug"]
+    _seed(projects.project_checkout(settings, bad), "dep_bad")
+    _seed(projects.project_checkout(settings, good), "dep_good")
+
+    seen: dict[str, str] = {}
+    events = []
+    result = await run_cross_project(
+        settings, "do the thing", [bad, good], deps={good: [bad]},
+        on_event=events.append, engine_factory=_spy_factory(seen, exploding={bad}))
+
+    by_slug = {c["slug"]: c for c in result["children"]}
+    assert by_slug[bad]["status"] == "failed"
+    assert by_slug[good]["status"] == "completed"  # downstream ran anyway
+    # injected section states the failure, never silently skips it
+    assert f"[{bad}] status: failed" in seen[good]
+    assert "planner exploded" in seen[good]
+    # a status event flags the failed upstream
+    assert any(e.type == "status" and bad in e.message and "upstream" in e.message
+               for e in events)
+
+
+async def test_deps_validation_rejects_cycles_and_unknowns_before_running(tmp_path):
+    import pytest
+
+    settings = _settings(tmp_path, max_concurrent_runs=2)
+    a = projects.create_project(settings, "val-a")["slug"]
+    b = projects.create_project(settings, "val-b")["slug"]
+
+    events = []
+    with pytest.raises(ValueError, match="cycle"):
+        await run_cross_project(settings, "x", [a, b], deps={a: [b], b: [a]},
+                                on_event=events.append,
+                                engine_factory=lambda s: (_ for _ in ()).throw(
+                                    AssertionError("no child may start")))
+    with pytest.raises(ValueError, match="unknown upstream project"):
+        await run_cross_project(settings, "x", [a, b], deps={a: ["nope"]},
+                                on_event=events.append,
+                                engine_factory=lambda s: (_ for _ in ()).throw(
+                                    AssertionError("no child may start")))
+    with pytest.raises(ValueError, match="unknown project in dependencies"):
+        await run_cross_project(settings, "x", [a, b], deps={"nope": [a]},
+                                on_event=events.append,
+                                engine_factory=lambda s: (_ for _ in ()).throw(
+                                    AssertionError("no child may start")))
+    with pytest.raises(ValueError, match="cannot depend on itself"):
+        await run_cross_project(settings, "x", [a, b], deps={a: [a]},
+                                on_event=events.append,
+                                engine_factory=lambda s: (_ for _ in ()).throw(
+                                    AssertionError("no child may start")))
+    assert events == []  # validation fired before any run started
+    store = RunStore(settings.data_dir / "runs.db")
+    try:
+        assert store.list(10) == []  # no parent row was ever created
+    finally:
+        store.close()
