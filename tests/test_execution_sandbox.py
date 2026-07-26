@@ -6,6 +6,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 import ai_dev_assistant.execution as execution
 from ai_dev_assistant.execution import (
     detect_test_command,
@@ -15,6 +17,14 @@ from ai_dev_assistant.execution import (
 )
 
 _PRINT_SENTINEL = "import os; print(os.environ.get('ADA_TEST_SENTINEL', 'ABSENT'))"
+
+
+@pytest.fixture(autouse=True)
+def _unconfigured_sandbox(monkeypatch):
+    # An engine test elsewhere in the session may have bound its run's settings
+    # via configure_sandbox(); these tests exercise the env-var fallback and
+    # explicit configuration, so start each one unconfigured.
+    monkeypatch.setattr(execution, "_SANDBOX_CONFIG", None)
 
 
 def test_sync_sandbox_scrubs_parent_env(tmp_path, monkeypatch):
@@ -108,6 +118,69 @@ def test_fallback_still_scrubs_env(tmp_path, monkeypatch):
     r = run_command_sync([sys.executable, "-c", _PRINT_SENTINEL], tmp_path, 30, sandbox=True)
     assert r.passed
     assert "ABSENT" in r.stdout and "super-secret-value" not in r.stdout
+
+
+# --- Settings-driven selection: configure_sandbox() beats env; env is the fallback ---
+
+
+def test_configure_sandbox_overrides_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_SANDBOX", "container")
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+    execution.configure_sandbox("subprocess")
+    assert execution._apply_sandbox_backend(["echo", "hi"], tmp_path) == ["echo", "hi"]
+    # and the other direction: env says subprocess, settings say bwrap
+    monkeypatch.setenv("ADA_SANDBOX", "subprocess")
+    execution.configure_sandbox("bwrap")
+    assert execution._apply_sandbox_backend(["echo", "hi"], tmp_path)[0] == "bwrap"
+
+
+def test_env_fallback_when_never_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_SANDBOX", "container")
+    monkeypatch.setattr(execution.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert execution._apply_sandbox_backend(["echo", "hi"], tmp_path)[0] == "docker"
+
+
+def test_configured_backend_missing_binary_still_falls_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution.shutil, "which", lambda name: None)
+    execution.configure_sandbox("container")
+    r = run_command_sync([sys.executable, "-c", "print('ok')"], tmp_path, 30, sandbox=True)
+    assert r.passed and "ok" in r.stdout
+
+
+def test_none_backend_is_a_silent_passthrough(tmp_path):
+    # "none" is a legitimate settings choice, not an unknown backend.
+    execution.configure_sandbox("none")
+    assert execution._apply_sandbox_backend(["echo", "hi"], tmp_path) == ["echo", "hi"]
+    assert "none" not in execution._FALLBACK_WARNED
+
+
+def test_allow_network_toggles_bwrap_and_container_flags(tmp_path):
+    execution.configure_sandbox("bwrap", allow_network=False)
+    assert "--unshare-net" in execution._wrap_bwrap(["true"], tmp_path)
+    assert "--network=none" in execution._wrap_container(["true"], tmp_path)
+    execution.configure_sandbox("bwrap", allow_network=True)
+    assert "--unshare-net" not in execution._wrap_bwrap(["true"], tmp_path)
+    assert "--network=none" not in execution._wrap_container(["true"], tmp_path)
+
+
+def test_env_net_fallback_requires_exactly_1(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_SANDBOX_NET", "1")
+    assert "--unshare-net" not in execution._wrap_bwrap(["true"], tmp_path)
+    monkeypatch.setenv("ADA_SANDBOX_NET", "true")  # legacy semantics: only "1" allows
+    assert "--unshare-net" in execution._wrap_bwrap(["true"], tmp_path)
+
+
+def test_container_image_configured_env_and_default(tmp_path, monkeypatch):
+    execution.configure_sandbox("container", image="custom:img")
+    assert "custom:img" in execution._wrap_container(["python", "x.py"], tmp_path)
+    # configured with a blank image -> per-command default, env var no longer read
+    execution.configure_sandbox("container")
+    monkeypatch.setenv("ADA_SANDBOX_IMAGE", "env:img")
+    cmd = execution._wrap_container(["python", "x.py"], tmp_path)
+    assert "python:3.12-slim" in cmd and "env:img" not in cmd
+    # never configured -> the env var applies
+    monkeypatch.setattr(execution, "_SANDBOX_CONFIG", None)
+    assert "env:img" in execution._wrap_container(["python", "x.py"], tmp_path)
 
 
 # --- R5: tag registry lets the engine hard-cancel everything a run spawned ---

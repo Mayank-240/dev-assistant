@@ -144,6 +144,26 @@ def test_settings_load_applies_overlay_over_env(tmp_path, monkeypatch):
     assert Settings.load().budget_usd == 2.0
 
 
+def test_sandbox_settings_env_reads(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_DATA_DIR", str(tmp_path / "data"))
+    for var in ("ADA_SANDBOX", "ADA_SANDBOX_IMAGE", "ADA_SANDBOX_NET",
+                "ADA_SANDBOX_ALLOW_NETWORK"):
+        monkeypatch.delenv(var, raising=False)
+    s = Settings.load(overlay=False)
+    assert (s.sandbox, s.sandbox_image, s.sandbox_allow_network) == ("subprocess", "", False)
+    monkeypatch.setenv("ADA_SANDBOX", "container")
+    monkeypatch.setenv("ADA_SANDBOX_IMAGE", "python:3.13-slim")
+    monkeypatch.setenv("ADA_SANDBOX_NET", "1")  # legacy var: exactly "1" means allow
+    s = Settings.load(overlay=False)
+    assert (s.sandbox, s.sandbox_image, s.sandbox_allow_network) == (
+        "container", "python:3.13-slim", True)
+    monkeypatch.setenv("ADA_SANDBOX_NET", "true")  # anything else stays off
+    assert Settings.load(overlay=False).sandbox_allow_network is False
+    # the console-aligned name works too, and wins over the legacy var
+    monkeypatch.setenv("ADA_SANDBOX_ALLOW_NETWORK", "true")
+    assert Settings.load(overlay=False).sandbox_allow_network is True
+
+
 def test_adaptive_replan_defaults_on(tmp_path, monkeypatch):
     # Self-heal is the default: without env/overlay, failed subtasks get a bounded repair.
     monkeypatch.setenv("ADA_DATA_DIR", str(tmp_path / "data"))
@@ -222,6 +242,31 @@ def test_patch_validates_and_persists_and_updates_live_base(tmp_path):
     assert c.app.state.base_settings.agent_max_turns == 7
     run_settings = _settings_for(c.app.state.base_settings, None, None)
     assert run_settings.agent_max_turns == 7 and run_settings.trace is False
+
+
+def test_sandbox_fields_listed_and_patch_round_trips(tmp_path):
+    c = _client(tmp_path)
+    body = c.get("/api/settings").json()
+    exec_group = next(g for g in body["groups"] if g["name"] == "Execution & Safety")
+    keys = [f["key"] for f in exec_group["fields"]]
+    assert {"sandbox", "sandbox_image", "sandbox_allow_network"} <= set(keys)
+    assert _field(body, "sandbox_image")["type"] == "str"
+    assert _field(body, "sandbox_allow_network")["type"] == "bool"
+    # round-trip: PATCH persists, GET reports the override, live base is rebound
+    r = c.patch("/api/settings", json={"sandbox": "container",
+                                       "sandbox_image": "python:3.13-slim",
+                                       "sandbox_allow_network": True})
+    assert r.status_code == 200
+    on_disk = config.load_overrides(c.app.state.settings.data_dir)
+    assert on_disk == {"sandbox": "container", "sandbox_image": "python:3.13-slim",
+                       "sandbox_allow_network": True}
+    body = c.get("/api/settings").json()
+    for key, value in on_disk.items():
+        f = _field(body, key)
+        assert f["value"] == value and f["source"] == "override"
+    base = c.app.state.base_settings
+    assert (base.sandbox, base.sandbox_image, base.sandbox_allow_network) == (
+        "container", "python:3.13-slim", True)
 
 
 def test_patch_coerces_string_inputs(tmp_path):

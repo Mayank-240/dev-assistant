@@ -142,6 +142,27 @@ async def test_full_pipeline_offline(tmp_path):
     assert ("s1", "assigned_to", "researcher") in rels
 
 
+async def test_run_binds_sandbox_settings(tmp_path):
+    """Run start calls execution.configure_sandbox with this run's settings, so
+    every command spawned below picks up the tier/image/network policy."""
+    import ai_dev_assistant.execution as execution
+
+    settings = dataclasses.replace(_settings(tmp_path), sandbox="container",
+                                   sandbox_image="custom:img", sandbox_allow_network=True)
+    engine = Engine(settings)
+    fake = FakeProvider()
+    engine.provider = fake
+    engine.orchestrator._provider = fake
+    engine.reviewer._provider = fake
+    try:
+        await engine.run("Bind the sandbox", on_event=lambda _e: None)
+        assert execution._SANDBOX_CONFIG == {
+            "backend": "container", "image": "custom:img", "allow_network": True}
+    finally:
+        await engine.aclose()
+        execution._SANDBOX_CONFIG = None  # don't leak this run's policy into other tests
+
+
 async def test_budget_stops_run(tmp_path):
     settings = dataclasses.replace(_settings(tmp_path), budget_usd=3.0)  # each agent call costs 5
     engine = Engine(settings)

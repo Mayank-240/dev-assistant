@@ -283,6 +283,12 @@ class Engine:
         self.last_run_workspace = run_ws
         self._tracer = Tracer(self.settings.docs_dir / rid / "trace.jsonl", enabled=self.settings.trace)
         self._audit = AuditLog(self.settings.docs_dir / rid / "audit.jsonl", enabled=self.settings.audit_log)
+        # Bind the command sandbox to this run's settings (S5): every
+        # run_command(_sync) below — tools, verification, workspace tests —
+        # picks up the tier/image/network policy without threading it through.
+        from .execution import configure_sandbox
+        configure_sandbox(self.settings.sandbox, self.settings.sandbox_image,
+                          self.settings.sandbox_allow_network)
 
         # ---- R1: resuming an interrupted run reuses its workspace + persisted plan ----
         if resume and task_id and plan is None:

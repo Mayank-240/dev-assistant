@@ -169,6 +169,37 @@ than relying only on the inner rlimits:
 limits remain configurable via `ADA_SANDBOX_CPU_SECONDS` (default 60) and
 `ADA_SANDBOX_MEM_MB` (default 1024), and `ADA_BUDGET_USD` caps LLM spend.
 
+## Command sandboxing
+
+The shell commands agents run (test suites, `run_command`, verification) go
+through `execution.py`, which supports three isolation tiers selected by the
+**Sandbox backend** setting (settings console → Execution & Safety, or
+`ADA_SANDBOX`):
+
+- **subprocess** (default) — scrubbed environment (no secrets inherited),
+  CPU/memory rlimits, process-group kill on timeout. No filesystem or network
+  isolation: a command can still read world-readable files and reach the
+  network.
+- **bwrap** — additionally wraps each command in bubblewrap (Linux only):
+  read-only system dirs, only the workspace writable, private `/tmp`, and no
+  network unless **Sandbox network** (`ADA_SANDBOX_NET=1`) allows it. Does not
+  defend against kernel exploits or protect files inside the workspace itself.
+- **container** — runs each command in a throwaway Docker container with only
+  the workspace mounted and `--network=none` unless allowed; the image comes
+  from **Sandbox image** (`ADA_SANDBOX_IMAGE`), defaulting per command to
+  `python:3.12-slim` / `debian:stable-slim`. Strongest tier, but the Docker
+  daemon itself is a privileged host service — protect its socket.
+
+If the chosen tier's binary (`bwrap`/`docker`) is missing, execution falls
+back to the subprocess tier with a one-time warning — the guarantee degrades,
+it never blocks the run. Settings-console changes are bound at run start, so
+they apply to **new runs**, not commands already in flight.
+
+Note the scope: this sandboxes only the shell commands agents spawn. The
+Claude Agent SDK model loop itself stays on the host process and keeps using
+your Claude Code login — no API key is involved, and nothing about it moves
+into bwrap or Docker.
+
 ## Inner sandbox backends inside the container
 
 `ADA_SANDBOX` selects the per-subprocess isolation tier: `subprocess`

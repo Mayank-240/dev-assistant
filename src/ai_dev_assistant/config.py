@@ -114,7 +114,12 @@ class Settings:
     protected_paths: tuple[str, ...] = ()  # globs agents' write tools must refuse (policy-driven)
 
     # --- Sandbox / execution safety (Tier 2/5) ---
-    sandbox: str = "subprocess"     # "subprocess" (scrubbed env + rlimits) | "none"
+    # Isolation tier for the shell commands agents run (execution.py consumes
+    # these via configure_sandbox at run start; the ADA_SANDBOX* env vars remain
+    # the fallback for bare callers).
+    sandbox: str = "subprocess"     # "subprocess" | "bwrap" | "container" | "none"
+    sandbox_image: str = ""         # container-tier image ("" = per-command default)
+    sandbox_allow_network: bool = False  # bwrap/container commands may reach the network
     sandbox_cpu_seconds: int = 60   # CPU-time rlimit for sandboxed commands
     sandbox_mem_mb: int = 1024      # address-space rlimit (MB) for sandboxed commands
     allow_run_command: bool = True  # expose the run_command/install_packages agent tools
@@ -190,6 +195,11 @@ class Settings:
             protected_paths=tuple(p.strip() for p in _get("ADA_PROTECTED_PATHS", "").split(",")
                                   if p.strip()),
             sandbox=_get("ADA_SANDBOX", "subprocess"),
+            sandbox_image=_get("ADA_SANDBOX_IMAGE", ""),
+            # New name first; legacy ADA_SANDBOX_NET=1 (exact execution.py
+            # semantics: only "1" means allow) stays honored as the fallback.
+            sandbox_allow_network=_bool("ADA_SANDBOX_ALLOW_NETWORK",
+                                        os.getenv("ADA_SANDBOX_NET") == "1"),
             sandbox_cpu_seconds=_int("ADA_SANDBOX_CPU_SECONDS", 60),
             sandbox_mem_mb=_int("ADA_SANDBOX_MEM_MB", 1024),
             allow_run_command=_bool("ADA_ALLOW_RUN_COMMAND", True),
@@ -335,9 +345,23 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "max_retries", "group": "Guardrails & Budget", "label": "Max review retries",
      "help": "How many times a failed subtask is retried after review.", "type": "int"},
     # --- Execution & Safety ---
-    {"key": "sandbox", "group": "Execution & Safety", "label": "Sandbox",
-     "help": "How agent commands are isolated when they run.", "type": "choice",
+    {"key": "sandbox", "group": "Execution & Safety", "label": "Sandbox backend",
+     "help": "Isolation tier for the shell commands agents run: subprocess scrubs the "
+             "environment and applies rlimits; bwrap adds filesystem/network namespaces "
+             "(Linux, needs bubblewrap); container runs each command in a throwaway Docker "
+             "container; none disables sandboxing. If bwrap/docker is missing, commands fall "
+             "back to the subprocess tier with a one-time warning. This sandboxes commands "
+             "only — the Claude Agent SDK model loop stays on the host and keeps using your "
+             "Claude Code login (no API key involved).", "type": "choice",
      "choices": ["subprocess", "bwrap", "container", "none"]},
+    {"key": "sandbox_image", "group": "Execution & Safety", "label": "Sandbox image",
+     "help": "Docker image for the container tier — blank picks a per-command default "
+             "(python:3.12-slim for Python commands, debian:stable-slim otherwise).",
+     "type": "str"},
+    {"key": "sandbox_allow_network", "group": "Execution & Safety", "label": "Sandbox network",
+     "help": "Let bwrap/container-sandboxed commands reach the network — off means "
+             "--unshare-net / --network=none. The subprocess tier never blocks the network.",
+     "type": "bool"},
     {"key": "sandbox_cpu_seconds", "group": "Execution & Safety", "label": "Sandbox CPU seconds",
      "help": "CPU-time rlimit for sandboxed commands.", "type": "int"},
     {"key": "sandbox_mem_mb", "group": "Execution & Safety", "label": "Sandbox memory (MB)",

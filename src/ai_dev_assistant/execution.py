@@ -4,8 +4,12 @@ Detects a test command in the workspace (pytest, ``npm test``, ``go test``,
 ``cargo test``, Maven/Gradle, rspec/rake) and runs it with a timeout. Both async
 (engine) and sync (agent tool) entry points share the same detection + result shape.
 
-Isolation comes in three tiers, selected by the ``ADA_SANDBOX`` env var (the
-``sandbox: bool`` parameter stays the on/off switch):
+Isolation comes in three tiers. The engine selects one per run via
+``configure_sandbox()`` from ``Settings`` (``sandbox`` / ``sandbox_image`` /
+``sandbox_allow_network``); until that is called the module falls back to the
+``ADA_SANDBOX`` / ``ADA_SANDBOX_IMAGE`` / ``ADA_SANDBOX_NET`` env vars, so bare
+callers behave exactly as before (the ``sandbox: bool`` parameter stays the
+on/off switch):
 
 - ``subprocess`` (default): scrubbed environment (no API keys leak), POSIX rlimits
   (CPU/address-space, plus process count on Linux), and a new process group that is
@@ -14,10 +18,10 @@ Isolation comes in three tiers, selected by the ``ADA_SANDBOX`` env var (the
   cannot see the parent's secrets or outlive its timeout.
 - ``bwrap``: additionally wraps the command in bubblewrap (Linux) — read-only system
   dirs, the workspace bound read-write, a private ``/tmp``, and no network unless
-  ``ADA_SANDBOX_NET=1``. Real filesystem + network containment.
+  allowed. Real filesystem + network containment.
 - ``container``: runs the command in a throwaway Docker container
-  (``--network=none`` unless ``ADA_SANDBOX_NET=1``) with only the workspace mounted;
-  image via ``ADA_SANDBOX_IMAGE`` (python-ish commands default to ``python:3.12-slim``).
+  (``--network=none`` unless network is allowed) with only the workspace mounted;
+  image is configurable (python-ish commands default to ``python:3.12-slim``).
 
 If the chosen backend's binary is missing, execution falls back to the ``subprocess``
 tier with a one-time warning — the guarantee degrades, it never blocks the run.
@@ -130,9 +134,11 @@ def _spawn_kwargs(sandbox: bool, cpu_seconds: int, mem_mb: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Isolation backends (S5). ADA_SANDBOX selects the tier; the sandbox: bool param
-# on run_command(_sync) stays the on/off switch. Missing binaries fall back to
-# the subprocess tier with a one-time warning.
+# Isolation backends (S5). configure_sandbox() (called by the engine once per
+# run, from Settings) selects the tier; the sandbox: bool param on
+# run_command(_sync) stays the on/off switch. Until configured, the ADA_SANDBOX*
+# env vars apply unchanged. Missing binaries fall back to the subprocess tier
+# with a one-time warning.
 # ---------------------------------------------------------------------------
 
 _FALLBACK_WARNED: set[str] = set()
@@ -140,9 +146,41 @@ _fallback_lock = threading.Lock()
 
 _PYTHONISH = ("python", "python3", "pytest", "pip", "pip3")
 
+# Settings-driven sandbox selection — a plain module global set once per run
+# (same pattern as _FALLBACK_WARNED). None = never configured, use the env vars.
+_SANDBOX_CONFIG: dict | None = None
+
+
+def configure_sandbox(backend: str, image: str = "", allow_network: bool = False) -> None:
+    """Bind the isolation backend/image/network policy for subsequent commands.
+
+    The engine calls this at run start from its Settings; once called, these
+    values take precedence over the ADA_SANDBOX / ADA_SANDBOX_IMAGE /
+    ADA_SANDBOX_NET environment variables for the rest of the process."""
+    global _SANDBOX_CONFIG
+    _SANDBOX_CONFIG = {
+        "backend": (backend or "subprocess").strip().lower(),
+        "image": image or "",
+        "allow_network": bool(allow_network),
+    }
+
 
 def _sandbox_mode() -> str:
+    if _SANDBOX_CONFIG is not None:
+        return _SANDBOX_CONFIG["backend"]
     return (os.environ.get("ADA_SANDBOX") or "subprocess").strip().lower()
+
+
+def _sandbox_image() -> str:
+    if _SANDBOX_CONFIG is not None:
+        return _SANDBOX_CONFIG["image"]
+    return os.environ.get("ADA_SANDBOX_IMAGE") or ""
+
+
+def _sandbox_net_allowed() -> bool:
+    if _SANDBOX_CONFIG is not None:
+        return _SANDBOX_CONFIG["allow_network"]
+    return os.environ.get("ADA_SANDBOX_NET") == "1"
 
 
 def _warn_fallback_once(backend: str, reason: str) -> None:
@@ -168,17 +206,17 @@ def _wrap_bwrap(command: list[str], cwd: Path) -> list[str]:
         if os.path.exists(sysdir):
             wrapped += ["--ro-bind", sysdir, sysdir]
     wrapped += ["--bind", str(cwd), str(cwd), "--chdir", str(cwd)]
-    if os.environ.get("ADA_SANDBOX_NET") != "1":
+    if not _sandbox_net_allowed():
         wrapped += ["--unshare-net"]
     return wrapped + list(command)
 
 
 def _wrap_container(command: list[str], cwd: Path) -> list[str]:
     pythonish = _looks_pythonish(command)
-    image = os.environ.get("ADA_SANDBOX_IMAGE") or (
+    image = _sandbox_image() or (
         "python:3.12-slim" if pythonish else "debian:stable-slim")
     wrapped = ["docker", "run", "--rm", "-v", f"{cwd}:/w", "-w", "/w"]
-    if os.environ.get("ADA_SANDBOX_NET") != "1":
+    if not _sandbox_net_allowed():
         wrapped += ["--network=none"]
     inner = list(command)
     if pythonish and Path(inner[0]).name.startswith("python"):
@@ -189,11 +227,12 @@ def _wrap_container(command: list[str], cwd: Path) -> list[str]:
 def _apply_sandbox_backend(command: list[str], cwd: Path) -> list[str]:
     """Rewrite ``command`` for the configured isolation backend, if any.
 
-    Returns the command unchanged for the default ``subprocess`` tier, an unknown
+    Returns the command unchanged for the default ``subprocess`` tier (and the
+    settings choice ``none`` — the on/off decision is the caller's), an unknown
     mode, or when the chosen backend's binary is missing (one-time warning).
     """
     mode = _sandbox_mode()
-    if mode in ("", "subprocess"):
+    if mode in ("", "subprocess", "none"):
         return command
     if mode == "bwrap":
         if shutil.which("bwrap") is None:
