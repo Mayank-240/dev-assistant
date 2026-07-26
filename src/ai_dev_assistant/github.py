@@ -7,7 +7,10 @@ Pure, offline-testable building blocks for the GitHub flow:
 - turn an issue into a clean task prompt (``issue_to_prompt``);
 - after a run completes, push the task branch (``push_branch``) and open a PR
   whose body carries the brief + verification evidence (``pr_body``,
-  ``GitHubClient.open_pr``).
+  ``GitHubClient.open_pr``);
+- watch the assistant's own open PRs (``list_open_prs`` + ``is_own_pr``) for
+  reviewer feedback (``list_pr_comments``) and turn it into a follow-up task on
+  the existing branch (``comments_to_followup`` -> ``FollowUp``).
 
 The server wiring (poll loop, run triggering, dedupe store) lives elsewhere;
 ``seen_marker`` provides the dedupe key it persists.
@@ -41,6 +44,8 @@ from typing import Any, Callable
 logger = logging.getLogger("ada.github")
 
 API_ROOT = "https://api.github.com"
+OWN_BRANCH_PREFIX = "ada/"  # head-branch prefix of assistant-authored PRs
+                            # (vcs.task_branch / Settings.git_branch_prefix)
 _TIMEOUT = 10.0            # seconds, per HTTP request
 _PER_PAGE = 100            # GitHub's maximum page size
 _MAX_PAGES = 10            # safety cap on issue pagination
@@ -126,6 +131,7 @@ class GitHubClient:
     def __init__(self, cfg: GitHubConfig, transport: Transport | None = None) -> None:
         self.cfg = cfg
         self._transport: Transport = transport or _default_transport
+        self._login: str | None = None  # cached GET /user login; None = not fetched
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -210,6 +216,118 @@ class GitHubClient:
         logger.warning("open_pr(%s, %s -> %s) failed: HTTP %s %s", repo, head, base, status, detail)
         return None
 
+    def list_open_prs(self, repo: str) -> list[dict]:
+        """Open PRs on ``repo``.
+
+        Returns ``[{"repo", "number", "title", "head", "body"}, ...]`` where
+        ``head`` is the head branch name. The assistant's own PRs carry the
+        ``ada/`` head-branch prefix — filter with :func:`is_own_pr`.
+        [] on any error.
+        """
+        results: list[dict] = []
+        for page in range(1, _MAX_PAGES + 1):
+            url = (f"{API_ROOT}/repos/{repo}/pulls"
+                   f"?state=open&per_page={_PER_PAGE}&page={page}")
+            status, data = self._request("GET", url)
+            if status != 200 or not isinstance(data, list):
+                if page == 1:
+                    logger.warning("list_open_prs(%s) failed: HTTP %s", repo, status)
+                break
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                head = item.get("head")
+                results.append({
+                    "repo": repo,
+                    "number": item.get("number"),
+                    "title": str(item.get("title") or ""),
+                    "head": str(head.get("ref") or "") if isinstance(head, dict) else "",
+                    "body": str(item.get("body") or ""),
+                })
+            if len(data) < _PER_PAGE:
+                break
+        return results
+
+    # -- reviewer feedback --------------------------------------------------
+
+    def _own_login(self) -> str:
+        """Login of the token's user (GET /user), fetched once and cached on
+        the client. "" when unavailable; failures are not cached, so a later
+        call may retry. Never raises."""
+        if self._login is not None:
+            return self._login
+        status, data = self._request("GET", f"{API_ROOT}/user")
+        if status == 200 and isinstance(data, dict):
+            self._login = str(data.get("login") or "")
+            return self._login
+        logger.warning("GET /user failed: HTTP %s (self-comment filter degraded)", status)
+        return ""
+
+    def _fetch_comments(self, repo: str, number: int, kind: str) -> list[dict]:
+        """One comment stream, normalized. ``kind`` is "issues" (issue-style
+        conversation comments) or "pulls" (line-anchored review comments)."""
+        results: list[dict] = []
+        for page in range(1, _MAX_PAGES + 1):
+            url = (f"{API_ROOT}/repos/{repo}/{kind}/{number}/comments"
+                   f"?per_page={_PER_PAGE}&page={page}")
+            status, data = self._request("GET", url)
+            if status != 200 or not isinstance(data, list):
+                if page == 1:
+                    logger.warning("%s comments for %s#%s failed: HTTP %s",
+                                   kind, repo, number, status)
+                break
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                user = item.get("user")
+                line = item.get("line")
+                if not isinstance(line, int):
+                    line = item.get("original_line")
+                results.append({
+                    "id": item.get("id"),
+                    "author": str(user.get("login") or "") if isinstance(user, dict) else "",
+                    "body": str(item.get("body") or ""),
+                    "path": str(item["path"]) if item.get("path") else None,
+                    "line": line if isinstance(line, int) else None,
+                    "created_at": str(item.get("created_at") or ""),
+                })
+            if len(data) < _PER_PAGE:
+                break
+        return results
+
+    def list_pr_comments(self, repo: str, number: int,
+                         since: str | None = None) -> list[dict]:
+        """Reviewer feedback on a PR: issue-style comments (issues/{n}/comments)
+        AND review comments (pulls/{n}/comments), merged.
+
+        Each comment is normalized to ``{"id", "author", "body", "path",
+        "line", "created_at"}`` — ``path``/``line`` are None for issue-style
+        comments — and the merge is ordered oldest-first by ``created_at``
+        (id as tiebreak). ``since`` (ISO-8601 UTC, e.g. "2026-07-01T00:00:00Z")
+        keeps only comments created strictly after it, so callers can pass the
+        last-seen timestamp without re-seeing that comment.
+
+        Dropped: comments by the token's own user (GET /user, cached — the
+        assistant must not react to itself), bot comments ("[bot]" login
+        suffix), and comments with no attributable author or empty body.
+        [] on any error.
+        """
+        own = self._own_login()
+        out: list[dict] = []
+        for kind in ("issues", "pulls"):
+            for c in self._fetch_comments(repo, number, kind):
+                author = c["author"]
+                if not author or author == own or author.endswith("[bot]"):
+                    continue
+                if not c["body"].strip():
+                    continue
+                if since and c["created_at"] <= since:
+                    continue
+                out.append(c)
+        out.sort(key=lambda c: (c["created_at"],
+                                c["id"] if isinstance(c["id"], int) else 0))
+        return out
+
 
 # ---------------------------------------------------------------------------
 # Flow helpers (pure functions)
@@ -292,6 +410,79 @@ def pr_body(run_summary: dict) -> str:
     except Exception as exc:  # defensive: a PR must still open with a stub body
         logger.warning("pr_body rendering failed: %s", exc)
         return "## Summary\n\n_Run summary unavailable._\n"
+
+
+def _head_ref(pr: Any) -> str:
+    """Head branch of a PR dict — accepts both the :meth:`GitHubClient.list_open_prs`
+    shape (``head`` is the ref string) and the raw API shape (``head`` is a dict)."""
+    if not isinstance(pr, dict):
+        return ""
+    head = pr.get("head")
+    if isinstance(head, dict):
+        head = head.get("ref")
+    return str(head or "")
+
+
+def is_own_pr(pr: Any) -> bool:
+    """True when the PR's head branch carries the assistant's ``ada/`` prefix —
+    i.e. the PR was opened from a branch this assistant pushed. Never raises."""
+    try:
+        return _head_ref(pr).startswith(OWN_BRANCH_PREFIX)
+    except Exception:
+        return False
+
+
+@dataclass(frozen=True)
+class FollowUp:
+    """A reviewer-feedback follow-up on one of the assistant's PRs, ready for
+    the server to enqueue as a new run on the PR's existing branch."""
+
+    repo: str        # "owner/repo"
+    pr_number: int
+    branch: str      # existing head branch to continue on (ada/<task_id>)
+    task_hint: str   # short human-readable label (PR title)
+    prompt: str      # comments_to_followup() text — sent to the LLM as a NEW prompt
+
+
+def comments_to_followup(pr: dict, comments: list[dict]) -> str:
+    """Render reviewer comments on one of our PRs into a follow-up task prompt.
+
+    Header with the PR title and branch, one bullet per comment
+    ("- <author> on <path>:<line> — <body>" when line-anchored, else
+    "- <author> — <body>"), then an instruction to address the feedback on the
+    existing branch. This text is sent to the LLM as a NEW prompt (existing
+    cassette prompts are untouched). Capped at 10k chars. "" for junk input or
+    when no comment renders. Never raises.
+    """
+    try:
+        if not isinstance(pr, dict):
+            return ""
+        bullets: list[str] = []
+        for c in comments or []:
+            if not isinstance(c, dict):
+                continue
+            author = str(c.get("author") or "").strip()
+            body = re.sub(r"\s+", " ", str(c.get("body") or "")).strip()
+            if not author or not body:
+                continue
+            path = str(c.get("path") or "").strip()
+            line = c.get("line")
+            loc = ""
+            if path:
+                loc = f" on {path}:{line}" if isinstance(line, int) else f" on {path}"
+            bullets.append(f"- {author}{loc} — {body}")
+        if not bullets:
+            return ""
+        title = str(pr.get("title") or "").strip()
+        branch = _head_ref(pr)
+        number = pr.get("number")
+        lines = [f'Address reviewer feedback on PR #{number} "{title}" (branch `{branch}`).',
+                 "", "Reviewer comments:", *bullets, "",
+                 f"Address this feedback with changes on the existing branch "
+                 f"`{branch}` — do not create a new branch or open a new PR."]
+        return "\n".join(lines)[:_MAX_PROMPT]
+    except Exception:  # defensive: this feeds an automated loop
+        return ""
 
 
 def push_branch(repo_root: Path, branch: str, remote: str = "origin") -> dict:

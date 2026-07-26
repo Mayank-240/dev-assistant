@@ -24,6 +24,7 @@ from .vector import VectorStore
 
 _HALF_LIFE_S = 14 * 24 * 3600.0  # recall relevance halves after ~two weeks
 _DEFAULT_MAX_ENTRIES = 5000      # growth cap per store; override via ADA_MEMORY_MAX_ENTRIES
+_LIST_CAP = 1000                 # hard page-size ceiling for curation listings
 
 
 def _max_entries() -> int:
@@ -195,6 +196,92 @@ class MemoryStore:
         ).fetchall()
         return [self._row_to_entry(r) for r in rows]
 
+    # ---- curation (list / update / delete for a memory-management UI) ----
+    def list_memories(self, *, scope: str | None = None, limit: int = 200,
+                      offset: int = 0) -> list[dict[str, Any]]:
+        """Newest-first listing of raw memory rows for curation.
+
+        Each row: ``{id, scope, key, content, metadata, created_at}`` — ``id`` is
+        the SQLite primary key and round-trips through ``update_memory`` /
+        ``delete_memory``; ``scope`` is the memory's kind (e.g. "longterm" or a
+        task scope). ``scope=None`` lists every scope. ``limit`` (clamped to
+        [1, 1000]) and ``offset`` paginate.
+        """
+        limit = max(1, min(int(limit), _LIST_CAP))
+        offset = max(0, int(offset))
+        sql = "SELECT id, scope, key, content, metadata, created_at FROM memory"
+        args: tuple[Any, ...] = ()
+        if scope:
+            sql += " WHERE scope = ?"
+            args = (scope,)
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        rows = self._conn.execute(sql, (*args, limit, offset)).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                meta = json.loads(r["metadata"] or "{}")
+            except json.JSONDecodeError:
+                meta = {}
+            out.append({
+                "id": int(r["id"]), "scope": r["scope"], "key": r["key"],
+                "content": r["content"], "metadata": meta,
+                "created_at": float(r["created_at"]),
+            })
+        return out
+
+    def update_memory(self, mem_id: int, content: str) -> bool:
+        """Rewrite a memory's text by id, re-embedding its stored vector.
+
+        Returns False when the id is unknown. If re-embedding fails (embedder
+        down), the text is still updated everywhere it is read — the memory row
+        AND the vector row's ``text`` column (which the lexical search leg uses)
+        — and the stale vector is kept so the entry stays recallable.
+        """
+        mem_id = int(mem_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT scope FROM memory WHERE id = ?", (mem_id,)).fetchone()
+            if row is None:
+                return False
+            self._conn.execute(
+                "UPDATE memory SET content = ? WHERE id = ?", (content, mem_id))
+            self._conn.commit()
+        namespace = f"memory:{row['scope']}"
+        try:
+            self.vectors.add(namespace, str(mem_id), content)  # re-embed
+        except Exception:  # noqa: BLE001 — embedder down: refresh the lexical text only
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE vectors SET text = ? WHERE namespace = ? AND ref_id = ?",
+                    (content, namespace, str(mem_id)))
+                self._conn.commit()
+        return True
+
+    def delete_memory(self, mem_id: int) -> bool:
+        """Delete a memory by id, dropping its vector too so recall/search can
+        never resurface a dangling ref. Returns False when the id is unknown."""
+        mem_id = int(mem_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT scope FROM memory WHERE id = ?", (mem_id,)).fetchone()
+            if row is None:
+                return False
+            self._conn.execute("DELETE FROM memory WHERE id = ?", (mem_id,))
+            self._conn.execute(
+                "DELETE FROM vectors WHERE namespace = ? AND ref_id = ?",
+                (f"memory:{row['scope']}", str(mem_id)))
+            self._conn.commit()
+        return True
+
+    def count_memories(self, scope: str | None = None) -> int:
+        """Number of stored memories, optionally restricted to one scope/kind."""
+        if scope:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM memory WHERE scope = ?", (scope,)).fetchone()
+        else:
+            row = self._conn.execute("SELECT COUNT(*) FROM memory").fetchone()
+        return int(row[0])
+
     # ---- blackboard ----
     def blackboard_put(self, key: str, value: str, author: str = "") -> None:
         with self._lock:
@@ -307,3 +394,86 @@ class ScopedMemory:
     def close(self) -> None:
         self.project.close()
         self.glob.close()
+
+
+# ---------------------------------------------------------------------------
+# Per-project curation helpers (module-level, for the web/API layer)
+#
+# global_search memory hits carry ``{project, ref: {id}}`` — these functions
+# accept exactly that pair, opening ``projects_dir/<project>/memory.db``
+# writable for the duration of one call. A missing database (unknown slug,
+# project without memories yet) is never created as a side effect: list/count
+# return empty/zero and update/delete return False. For the shared global
+# store, use ``MemoryStore(settings, db_path=settings.global_db_path)`` and
+# the store methods directly.
+# ---------------------------------------------------------------------------
+
+def _open_project_store(settings: Settings, project: str) -> MemoryStore | None:
+    """Writable store over an EXISTING project database, else None."""
+    path = settings.projects_dir / (project or "default") / "memory.db"
+    if not path.is_file():
+        return None
+    return MemoryStore(settings, db_path=path)
+
+
+def list_project_memories(settings: Settings, project: str, *,
+                          scope: str | None = None, limit: int = 200,
+                          offset: int = 0) -> list[dict[str, Any]]:
+    """Newest-first curation listing for one project's memories.
+
+    Row shape is ``MemoryStore.list_memories`` (``{id, scope, key, content,
+    metadata, created_at}``) plus ``project`` — the slug, echoed so rows from
+    several projects can be concatenated. Missing database -> ``[]``.
+    """
+    store = _open_project_store(settings, project)
+    if store is None:
+        return []
+    try:
+        rows = store.list_memories(scope=scope, limit=limit, offset=offset)
+    finally:
+        store.close()
+    for row in rows:
+        row["project"] = project
+    return rows
+
+
+def update_project_memory(settings: Settings, project: str, mem_id: int,
+                          content: str) -> bool:
+    """Rewrite one memory's text (re-embedding it) in a project's store.
+
+    Returns False for an unknown project or id — see ``MemoryStore.update_memory``.
+    """
+    store = _open_project_store(settings, project)
+    if store is None:
+        return False
+    try:
+        return store.update_memory(mem_id, content)
+    finally:
+        store.close()
+
+
+def delete_project_memory(settings: Settings, project: str, mem_id: int) -> bool:
+    """Delete one memory (and its vector) from a project's store.
+
+    Returns False for an unknown project or id — see ``MemoryStore.delete_memory``.
+    """
+    store = _open_project_store(settings, project)
+    if store is None:
+        return False
+    try:
+        return store.delete_memory(mem_id)
+    finally:
+        store.close()
+
+
+def count_project_memories(settings: Settings, project: str, *,
+                           scope: str | None = None) -> int:
+    """How many memories a project's store holds (0 for a missing database),
+    optionally restricted to one scope/kind."""
+    store = _open_project_store(settings, project)
+    if store is None:
+        return 0
+    try:
+        return store.count_memories(scope)
+    finally:
+        store.close()

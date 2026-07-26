@@ -441,6 +441,79 @@ def cherry_pick_in_checkout(repo: Path, sha: str) -> dict:
             "commit": _git(["rev-parse", "HEAD"], repo).stdout.strip()}
 
 
+def revert_merge(repo: Path, sha: str, into: str) -> dict:
+    """Revert ONE commit on ``into`` without touching any existing checkout.
+
+    Rollback of an accepted subtask for in-place projects: the revert lands on
+    the review target (e.g. ``ada/integration``) via a temporary worktree — the
+    user's checked-out branch and working tree are never mutated. ``into`` must
+    already exist (a rollback target must already hold the accept commit; this
+    never creates branches). Uses ``revert -m 1`` for merge commits. Same
+    refusal (target checked out anywhere), temp-worktree and conflict-abort
+    semantics as :func:`cherry_pick_merge`; returns ``{"reverted", "conflict"}``
+    plus ``"commit"`` on success, ``"files"`` on conflict or ``"error"``.
+    """
+    repo = Path(repo).resolve()
+    if into in _checked_out_branches(repo):
+        return {"reverted": False, "conflict": False, "error": "target branch is checked out"}
+    if not _branch_exists(repo, into):
+        return {"reverted": False, "conflict": False, "error": f"branch does not exist: {into}"}
+    parents = _git(["rev-list", "--parents", "-n", "1", sha], repo)
+    if parents.returncode != 0:
+        return {"reverted": False, "conflict": False,
+                "error": f"cannot resolve commit {sha}: {(parents.stderr or parents.stdout).strip()[:200]}"}
+    is_merge_commit = len(parents.stdout.split()) > 2
+    try:
+        with _temp_worktree(repo, into) as wt:
+            args = ["revert", "--no-edit", *(["-m", "1"] if is_merge_commit else []), sha]
+            res = _git([*_IDENT, *args], wt)
+            if res.returncode != 0:
+                files = _unmerged_files(wt)
+                if _op_in_progress(wt, "REVERT_HEAD"):
+                    _git(["revert", "--abort"], wt)
+                else:
+                    _git(["reset", "--merge"], wt)
+                if files:
+                    return {"reverted": False, "conflict": True, "files": files}
+                return {"reverted": False, "conflict": False,
+                        "error": (res.stderr or res.stdout).strip()[:300]}
+            commit = _git(["rev-parse", "HEAD"], wt).stdout.strip()
+            return {"reverted": True, "conflict": False, "commit": commit}
+    except RuntimeError as exc:
+        return {"reverted": False, "conflict": False, "error": str(exc)[:300]}
+
+
+def revert_in_checkout(repo: Path, sha: str) -> dict:
+    """Revert one commit directly in ``repo``'s working tree (must be clean).
+
+    For checkouts the assistant OWNS: rollback moves the checked-out branch and
+    its working tree back together. On conflict the revert is aborted so the
+    checkout is left clean. Same return shape as :func:`revert_merge`.
+    Never used on in-place user repos.
+    """
+    repo = Path(repo).resolve()
+    if _git(["status", "--porcelain"], repo).stdout.strip():
+        return {"reverted": False, "conflict": False, "error": "checkout has uncommitted changes"}
+    parents = _git(["rev-list", "--parents", "-n", "1", sha], repo)
+    if parents.returncode != 0:
+        return {"reverted": False, "conflict": False,
+                "error": f"cannot resolve commit {sha}: {(parents.stderr or parents.stdout).strip()[:200]}"}
+    args = ["revert", "--no-edit"] + (["-m", "1"] if len(parents.stdout.split()) > 2 else []) + [sha]
+    res = _git([*_IDENT, *args], repo)
+    if res.returncode != 0:
+        files = _unmerged_files(repo)
+        if _op_in_progress(repo, "REVERT_HEAD"):
+            _git(["revert", "--abort"], repo)
+        else:  # revert died before recording REVERT_HEAD; restore the tree anyway
+            _git(["reset", "--merge"], repo)
+        if files:
+            return {"reverted": False, "conflict": True, "files": files}
+        return {"reverted": False, "conflict": False,
+                "error": (res.stderr or res.stdout).strip()[:300]}
+    return {"reverted": True, "conflict": False,
+            "commit": _git(["rev-parse", "HEAD"], repo).stdout.strip()}
+
+
 def finalize(dest: Path, *, branch: str, message: str) -> dict[str, str]:
     """Commit everything in the workspace on a new branch. Returns {"branch","commit"}."""
     ensure_repo(dest)

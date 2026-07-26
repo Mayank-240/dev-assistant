@@ -456,6 +456,91 @@ def accept_commit(settings: Settings, slug: str, sha: str) -> dict:
     return vcs.cherry_pick_merge(root, sha, target)
 
 
+def accept_subtask(settings: Settings, slug: str, task_id: str, subtask_id: str) -> dict:
+    """Accept one subtask AND record the commit the acceptance created.
+
+    ``accept_commit`` alone returns the new cherry-pick commit but persists
+    nothing; this wrapper looks up the subtask's merge commit in the run store,
+    accepts it, and stores decision "accepted" + ``accepted_commit`` on
+    subtask_reviews — which is what ``rollback_accept`` reverts later.
+    Same return shape as ``accept_commit``.
+    """
+    from .orchestration.run_store import RunStore
+
+    store = RunStore(settings.data_dir / "runs.db")
+    try:
+        st = store.get_subtask_states(task_id).get(subtask_id) or {}
+        sha = str(st.get("merge_commit") or "").strip()
+        if not sha:
+            return {"merged": False, "conflict": False,
+                    "error": "subtask has no merge commit to accept"}
+        res = accept_commit(settings, slug, sha)
+        if res.get("merged"):
+            store.set_subtask_review(task_id, subtask_id, "accepted", "",
+                                     accepted_commit=str(res.get("commit") or ""))
+        return res
+    finally:
+        store.close()
+
+
+def rollback_accept(settings: Settings, slug: str, task_id: str, subtask_id: str) -> dict:
+    """Revert a previously accepted subtask's commit on the review target.
+
+    Finds the ``accepted_commit`` recorded at acceptance time and reverts exactly
+    that commit. Owned checkouts with the target checked out and clean: revert
+    directly in the checkout (working tree moves back with the branch). In-place
+    projects (and any other case): the revert lands on the review target
+    (``ada/integration``) via a temporary worktree — the user's checked-out
+    branch and working tree are never touched, mirroring how acceptance flows.
+
+    Only the requested subtask's commit is reverted; if git cannot revert it
+    cleanly (e.g. later accepts depend on it) the operation aborts, the repo is
+    left clean, and ``{"ok": False, "error": ...}`` is returned — never forced.
+    Success records decision "rolled_back" + ``rollback_commit`` in
+    subtask_reviews and returns ``{"ok": True, "reverted": sha,
+    "rollback_commit": sha}``.
+    """
+    from . import vcs
+    from .orchestration.run_store import RunStore
+
+    p = get_project(settings, slug)
+    if not p or not p.get("root"):
+        return {"ok": False, "error": "project has no repository"}
+    store = RunStore(settings.data_dir / "runs.db")
+    try:
+        review = store.get_subtask_reviews(task_id).get(subtask_id) or {}
+        sha = str(review.get("accepted_commit") or "").strip()
+        if not sha:
+            return {"ok": False,
+                    "error": "no recorded accept commit for this subtask — nothing to roll back"}
+        decision = str(review.get("decision") or "")
+        if decision != "accepted":
+            return {"ok": False,
+                    "error": f"subtask is not in an accepted state (decision: {decision or 'none'})"}
+        root = Path(p["root"])
+        target = review_target(settings, slug)
+        res: dict | None = None
+        if p.get("origin") != "local":
+            st = project_status(settings, slug)
+            if st.get("branch") == target and not st.get("dirty"):
+                res = vcs.revert_in_checkout(root, sha)
+        if res is None:
+            res = vcs.revert_merge(root, sha, target)
+        if not res.get("reverted"):
+            err = res.get("error") or (
+                "revert conflict — later accepted commits may depend on this one"
+                if res.get("conflict") else "revert failed")
+            out = {"ok": False, "error": err, "conflict": bool(res.get("conflict"))}
+            if res.get("files"):
+                out["files"] = res["files"]
+            return out
+        commit = str(res.get("commit") or "")
+        store.set_subtask_rollback(task_id, subtask_id, commit)
+        return {"ok": True, "reverted": sha, "rollback_commit": commit, "target": target}
+    finally:
+        store.close()
+
+
 def deliver_branch(settings: Settings, slug: str, branch: str, *, message: str = "") -> dict:
     """Deliver a whole task branch into the project's review target ("Accept all").
 

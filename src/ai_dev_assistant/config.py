@@ -135,10 +135,18 @@ class Settings:
     record_dir: str = ""           # if set, record provider calls as replay cassettes here
     replay_dir: str = ""           # if set, server provider calls from cassettes here (offline)
 
-    # --- Notifications (web server builds NotifyConfig from these at event time) ---
+    # --- Notifications (web server builds NotifyConfig from these at event time;
+    # the SMTP password is ENV-ONLY: ADA_SMTP_PASSWORD, read by notify.py at send
+    # time — it is deliberately not a Settings field) ---
     notify_webhook: str = ""        # JSON POST target for ask/permission/done/error pings
+    notify_slack_webhook: str = ""  # Slack incoming-webhook URL ({"text": ...} payloads)
     notify_desktop: bool = False    # macOS banner via osascript (darwin only)
     notify_events: str = ""         # csv of event types; blank = ask,permission,done,error
+    notify_email_to: str = ""       # recipient address; blank disables the email channel
+    notify_smtp_host: str = ""      # SMTP server; blank disables the email channel
+    notify_smtp_port: int = 587
+    notify_smtp_user: str = ""      # SMTP login (also the From address when set)
+    notify_smtp_starttls: bool = True
 
     # --- GitHub poller (token is ENV-ONLY: ADA_GITHUB_TOKEN / GITHUB_TOKEN) ---
     github_repos: str = ""          # "owner/repo=project-slug,..." mapping the poller watches
@@ -211,8 +219,14 @@ class Settings:
             record_dir=_get("ADA_RECORD_DIR", ""),
             replay_dir=_get("ADA_REPLAY_DIR", ""),
             notify_webhook=_get("ADA_NOTIFY_WEBHOOK", ""),
+            notify_slack_webhook=_get("ADA_NOTIFY_SLACK_WEBHOOK", ""),
             notify_desktop=_bool("ADA_NOTIFY_DESKTOP", False),
             notify_events=_get("ADA_NOTIFY_EVENTS", ""),
+            notify_email_to=_get("ADA_NOTIFY_EMAIL_TO", ""),
+            notify_smtp_host=_get("ADA_NOTIFY_SMTP_HOST", ""),
+            notify_smtp_port=_int("ADA_NOTIFY_SMTP_PORT", 587),
+            notify_smtp_user=_get("ADA_NOTIFY_SMTP_USER", ""),
+            notify_smtp_starttls=_bool("ADA_NOTIFY_SMTP_STARTTLS", True),
             github_repos=_get("ADA_GITHUB_REPOS", ""),
             github_label=_get("ADA_GITHUB_LABEL", "ada"),
             embeddings_backend=_get("ADA_EMBEDDINGS_BACKEND", "fastembed"),
@@ -294,7 +308,8 @@ class Settings:
 # the single source of truth for what the console may list and set.
 #
 # Deliberately EXCLUDED (never listed, never settable via the overlay):
-# anthropic_api_key and any tokens, data_dir/docs_dir/workspace_dir,
+# anthropic_api_key and any tokens/passwords (the SMTP password is env-only
+# ADA_SMTP_PASSWORD and not even a Settings field), data_dir/docs_dir/workspace_dir,
 # llm_backend, record_dir/replay_dir, protected_paths (project-level policy),
 # git_branch_prefix.
 # ===========================================================================
@@ -415,9 +430,27 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "notify_desktop", "group": "Notifications", "label": "Desktop notifications",
      "help": "Show a macOS desktop banner on notify events (macOS only; ignored elsewhere).",
      "type": "bool"},
+    {"key": "notify_slack_webhook", "group": "Notifications", "label": "Slack webhook URL",
+     "help": "Slack incoming-webhook URL — posts a Slack-formatted message on notify "
+             "events; blank disables the Slack channel.", "type": "str"},
     {"key": "notify_events", "group": "Notifications", "label": "Notify events",
      "help": "Comma-separated event types to notify on (ask, permission, done, error) — "
              "blank means all four.", "type": "str"},
+    {"key": "notify_email_to", "group": "Notifications", "label": "Email to",
+     "help": "Send a plain-text email to this address on notify events — blank disables "
+             "the email channel (an SMTP host is required too).", "type": "str"},
+    {"key": "notify_smtp_host", "group": "Notifications", "label": "SMTP host",
+     "help": "SMTP server for the email channel — blank disables it.", "type": "str"},
+    {"key": "notify_smtp_port", "group": "Notifications", "label": "SMTP port",
+     "help": "SMTP server port (587 is the usual STARTTLS submission port).",
+     "type": "int"},
+    {"key": "notify_smtp_user", "group": "Notifications", "label": "SMTP user",
+     "help": "SMTP login, also used as the From address. The password is never set "
+             "here — it comes only from the ADA_SMTP_PASSWORD environment variable.",
+     "type": "str"},
+    {"key": "notify_smtp_starttls", "group": "Notifications", "label": "SMTP STARTTLS",
+     "help": "Upgrade the SMTP connection with STARTTLS before authenticating.",
+     "type": "bool"},
     # --- GitHub ---
     {"key": "github_repos", "group": "GitHub", "label": "Repo mapping",
      "help": "Comma-separated owner/repo=project-slug pairs the issue poller watches, "

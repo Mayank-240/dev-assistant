@@ -398,3 +398,291 @@ def test_client_never_raises_on_malformed_responses():
     assert client.open_pr("o/r", head="h", base="b", title="t", body="") is None
     client, _ = _client([(0, None)])
     assert client.comment("o/r", 1, "x") is False
+
+
+# ---------------------------------------------------------------------------
+# list_open_prs / is_own_pr
+# ---------------------------------------------------------------------------
+
+def _pr_item(number, title="feat: add caching", head="ada/task-42", body="evidence"):
+    """Raw API pull-request item (head is a dict, as GitHub returns it)."""
+    return {"number": number, "title": title, "head": {"ref": head}, "body": body}
+
+
+def test_list_open_prs_shapes_and_request():
+    items = [_pr_item(12), _pr_item(13, head="feature/manual"), "junk-not-a-dict"]
+    client, transport = _client([(200, items)])
+    out = client.list_open_prs("o/r")
+    assert out == [
+        {"repo": "o/r", "number": 12, "title": "feat: add caching",
+         "head": "ada/task-42", "body": "evidence"},
+        {"repo": "o/r", "number": 13, "title": "feat: add caching",
+         "head": "feature/manual", "body": "evidence"},
+    ]
+    method, url, headers, body = transport.calls[0]
+    assert method == "GET" and body is None
+    assert url.startswith("https://api.github.com/repos/o/r/pulls?")
+    assert "state=open" in url and "per_page=100" in url and "page=1" in url
+    assert headers["Authorization"] == f"Bearer {TOKEN}"
+
+
+def test_list_open_prs_paginates_on_full_page():
+    page1 = [_pr_item(i) for i in range(1, 101)]
+    client, transport = _client([(200, page1), (200, [_pr_item(200)])])
+    assert len(client.list_open_prs("o/r")) == 101
+    assert len(transport.calls) == 2
+    assert "page=2" in transport.calls[1][1]
+
+
+def test_list_open_prs_error_paths():
+    client, _ = _client([(500, {"message": "boom"})])
+    assert client.list_open_prs("o/r") == []
+    client, _ = _client([(200, {"not": "a list"})])
+    assert client.list_open_prs("o/r") == []
+    cfg = GitHubConfig(token=TOKEN, repo_map={"o/r": "p"})
+    assert GitHubClient(cfg, transport=_raising_transport).list_open_prs("o/r") == []
+
+
+def test_list_open_prs_tolerates_missing_head():
+    item = _pr_item(7)
+    item["head"] = None
+    client, _ = _client([(200, [item])])
+    assert client.list_open_prs("o/r")[0]["head"] == ""
+
+
+def test_is_own_pr():
+    assert gh.is_own_pr({"head": "ada/task-1"}) is True          # normalized shape
+    assert gh.is_own_pr({"head": {"ref": "ada/x"}}) is True      # raw API shape
+    assert gh.is_own_pr({"head": "feature/manual"}) is False
+    assert gh.is_own_pr({"head": "adafruit/x"}) is False         # prefix incl. slash
+    assert gh.is_own_pr({"head": ""}) is False
+    assert gh.is_own_pr({}) is False
+    assert gh.is_own_pr(None) is False
+    assert gh.is_own_pr("not a dict") is False
+
+
+# ---------------------------------------------------------------------------
+# list_pr_comments
+# ---------------------------------------------------------------------------
+
+class RoutedTransport:
+    """Routes responses by URL substring (first match wins); records calls."""
+
+    def __init__(self, routes):
+        self.routes = list(routes)  # [(url_substring, status, json), ...]
+        self.calls: list[tuple[str, str, dict, dict | None]] = []
+
+    def __call__(self, method, url, headers, body):
+        self.calls.append((method, url, dict(headers), body))
+        for substr, status, data in self.routes:
+            if substr in url:
+                return status, data
+        return 200, []
+
+    def urls(self, substr):
+        return [u for _, u, _, _ in self.calls if substr in u]
+
+
+def _routed_client(routes):
+    cfg = GitHubConfig(token=TOKEN, label="ada", repo_map={"o/r": "proj"})
+    transport = RoutedTransport(routes)
+    return GitHubClient(cfg, transport=transport), transport
+
+
+ME = {"login": "ada-bot-user"}
+
+
+def _issue_comment(cid, author="alice", body="please fix", created="2026-07-01T10:00:00Z"):
+    return {"id": cid, "user": {"login": author}, "body": body, "created_at": created}
+
+
+def _review_comment(cid, author="bob", body="rename this", path="src/cache.py",
+                    line=40, created="2026-07-01T09:00:00Z", **extra):
+    item = {"id": cid, "user": {"login": author}, "body": body, "path": path,
+            "line": line, "created_at": created}
+    item.update(extra)
+    return item
+
+
+def test_list_pr_comments_merges_normalizes_and_orders():
+    client, transport = _routed_client([
+        ("/user", 200, ME),
+        ("/issues/5/comments", 200, [_issue_comment(2, created="2026-07-01T10:00:00Z")]),
+        ("/pulls/5/comments", 200, [_review_comment(1, created="2026-07-01T09:00:00Z")]),
+    ])
+    out = client.list_pr_comments("o/r", 5)
+    # Oldest first: the review comment (09:00) precedes the issue comment (10:00).
+    assert out == [
+        {"id": 1, "author": "bob", "body": "rename this", "path": "src/cache.py",
+         "line": 40, "created_at": "2026-07-01T09:00:00Z"},
+        {"id": 2, "author": "alice", "body": "please fix", "path": None,
+         "line": None, "created_at": "2026-07-01T10:00:00Z"},
+    ]
+    # Both endpoints were hit, with auth.
+    assert len(transport.urls("/issues/5/comments")) == 1
+    assert len(transport.urls("/pulls/5/comments")) == 1
+    for _, _, headers, _ in transport.calls:
+        assert headers["Authorization"] == f"Bearer {TOKEN}"
+
+
+def test_list_pr_comments_created_at_tiebreak_by_id():
+    same = "2026-07-01T10:00:00Z"
+    client, _ = _routed_client([
+        ("/user", 200, ME),
+        ("/issues/", 200, [_issue_comment(9, created=same), _issue_comment(3, created=same)]),
+        ("/pulls/", 200, []),
+    ])
+    assert [c["id"] for c in client.list_pr_comments("o/r", 5)] == [3, 9]
+
+
+def test_list_pr_comments_review_line_falls_back_to_original_line():
+    item = _review_comment(1, line=None, original_line=17)
+    client, _ = _routed_client([("/user", 200, ME), ("/issues/", 200, []),
+                                ("/pulls/", 200, [item])])
+    assert client.list_pr_comments("o/r", 5)[0]["line"] == 17
+
+
+def test_list_pr_comments_since_filter_is_strictly_after():
+    client, _ = _routed_client([
+        ("/user", 200, ME),
+        ("/issues/", 200, [
+            _issue_comment(1, created="2026-07-01T09:00:00Z"),   # before — dropped
+            _issue_comment(2, created="2026-07-01T10:00:00Z"),   # equal — dropped
+            _issue_comment(3, created="2026-07-01T11:00:00Z"),   # after — kept
+        ]),
+        ("/pulls/", 200, []),
+    ])
+    out = client.list_pr_comments("o/r", 5, since="2026-07-01T10:00:00Z")
+    assert [c["id"] for c in out] == [3]
+
+
+def test_list_pr_comments_filters_self_bots_and_junk():
+    client, _ = _routed_client([
+        ("/user", 200, ME),
+        ("/issues/", 200, [
+            _issue_comment(1, author="ada-bot-user", body="ADA started task t1"),  # self
+            _issue_comment(2, author="github-actions[bot]", body="CI passed"),     # bot
+            _issue_comment(3, author="", body="ghost"),                            # no author
+            _issue_comment(4, body="   "),                                         # empty body
+            {"id": 5, "user": "not-a-dict", "body": "x", "created_at": "z"},       # bad user
+            "junk-not-a-dict",
+            _issue_comment(6, author="alice", body="real feedback"),
+        ]),
+        ("/pulls/", 200, []),
+    ])
+    assert [c["id"] for c in client.list_pr_comments("o/r", 5)] == [6]
+
+
+def test_list_pr_comments_caches_own_user_lookup():
+    client, transport = _routed_client([
+        ("/user", 200, ME),
+        ("/issues/", 200, [_issue_comment(1)]),
+        ("/pulls/", 200, []),
+    ])
+    client.list_pr_comments("o/r", 5)
+    client.list_pr_comments("o/r", 6)
+    assert len(transport.urls("api.github.com/user")) == 1  # fetched once, cached
+
+
+def test_list_pr_comments_survives_user_endpoint_failure():
+    # /user failing degrades the self-filter but must not lose others' comments.
+    client, transport = _routed_client([
+        ("/user", 401, {"message": "bad credentials"}),
+        ("/issues/", 200, [_issue_comment(1, author="alice")]),
+        ("/pulls/", 200, []),
+    ])
+    assert [c["id"] for c in client.list_pr_comments("o/r", 5)] == [1]
+    # Failure is not cached: the next call retries /user.
+    client.list_pr_comments("o/r", 5)
+    assert len(transport.urls("api.github.com/user")) == 2
+
+
+def test_list_pr_comments_error_paths():
+    cfg = GitHubConfig(token=TOKEN, repo_map={"o/r": "p"})
+    assert GitHubClient(cfg, transport=_raising_transport).list_pr_comments("o/r", 5) == []
+    client, _ = _routed_client([("/user", 200, ME),
+                                ("/issues/", 500, {"message": "boom"}),
+                                ("/pulls/", 200, {"not": "a list"})])
+    assert client.list_pr_comments("o/r", 5) == []
+
+
+# ---------------------------------------------------------------------------
+# comments_to_followup / FollowUp
+# ---------------------------------------------------------------------------
+
+FOLLOWUP_PR = {"repo": "o/r", "number": 12, "title": "feat: add caching",
+               "head": "ada/task-42", "body": "evidence"}
+
+FOLLOWUP_COMMENTS = [
+    {"id": 1, "author": "bob", "body": "Rename this\nvariable, please.",
+     "path": "src/cache.py", "line": 40, "created_at": "2026-07-01T09:00:00Z"},
+    {"id": 2, "author": "carol", "body": "Typo in the docstring.",
+     "path": "README.md", "line": None, "created_at": "2026-07-01T09:30:00Z"},
+    {"id": 3, "author": "alice", "body": "Add a test for eviction.",
+     "path": None, "line": None, "created_at": "2026-07-01T10:00:00Z"},
+]
+
+
+def test_comments_to_followup_snapshot():
+    expected = (
+        'Address reviewer feedback on PR #12 "feat: add caching" (branch `ada/task-42`).\n'
+        "\n"
+        "Reviewer comments:\n"
+        "- bob on src/cache.py:40 — Rename this variable, please.\n"
+        "- carol on README.md — Typo in the docstring.\n"
+        "- alice — Add a test for eviction.\n"
+        "\n"
+        "Address this feedback with changes on the existing branch `ada/task-42` "
+        "— do not create a new branch or open a new PR."
+    )
+    assert gh.comments_to_followup(FOLLOWUP_PR, FOLLOWUP_COMMENTS) == expected
+
+
+def test_comments_to_followup_accepts_raw_head_shape():
+    pr = dict(FOLLOWUP_PR, head={"ref": "ada/task-42"})
+    out = gh.comments_to_followup(pr, FOLLOWUP_COMMENTS)
+    assert "`ada/task-42`" in out
+
+
+def test_comments_to_followup_caps_length():
+    comments = [{"id": i, "author": "a", "body": "x" * 500} for i in range(50)]
+    assert len(gh.comments_to_followup(FOLLOWUP_PR, comments)) == 10_000
+
+
+def test_comments_to_followup_empty_and_junk():
+    assert gh.comments_to_followup(FOLLOWUP_PR, []) == ""
+    assert gh.comments_to_followup(FOLLOWUP_PR, None) == ""
+    assert gh.comments_to_followup(None, FOLLOWUP_COMMENTS) == ""
+    assert gh.comments_to_followup("not a dict", FOLLOWUP_COMMENTS) == ""
+    # Comments that render no bullet (junk, empty body/author) yield "".
+    junk = ["nope", {"id": 1, "author": "", "body": "x"},
+            {"id": 2, "author": "a", "body": "   "}]
+    assert gh.comments_to_followup(FOLLOWUP_PR, junk) == ""
+
+
+def test_followup_dataclass_fields():
+    fu = gh.FollowUp(repo="o/r", pr_number=12, branch="ada/task-42",
+                     task_hint="feat: add caching", prompt="do it")
+    assert (fu.repo, fu.pr_number, fu.branch, fu.task_hint, fu.prompt) == \
+        ("o/r", 12, "ada/task-42", "feat: add caching", "do it")
+
+
+# ---------------------------------------------------------------------------
+# no-token behavior (client disabled)
+# ---------------------------------------------------------------------------
+
+def test_no_token_client_disabled_and_no_auth_header():
+    cfg = GitHubConfig(token="", label="ada", repo_map={"o/r": "proj"})
+    assert cfg.enabled is False  # server gates the poll loop on this
+    transport = RoutedTransport([
+        ("/user", 401, {"message": "requires authentication"}),
+        ("/pulls?", 200, [_pr_item(1)]),
+        ("/issues/", 200, [_issue_comment(1)]),
+        ("/pulls/", 200, []),
+    ])
+    client = GitHubClient(cfg, transport=transport)
+    # Methods still degrade gracefully (never raise) and never send auth.
+    assert client.list_open_prs("o/r") != []
+    assert [c["id"] for c in client.list_pr_comments("o/r", 5)] == [1]
+    for _, _, headers, _ in transport.calls:
+        assert "Authorization" not in headers

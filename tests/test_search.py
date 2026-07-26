@@ -210,3 +210,76 @@ def test_limit_caps_and_scores_descend(env):
     assert len(hits) == 3
     scores = [h["score"] for h in hits]
     assert scores == sorted(scores, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Semantic blending (memory + kb) and lexical degradation
+# ---------------------------------------------------------------------------
+
+class _SynonymEmbedder:
+    """Deterministic stub with real 'semantics': related words share an axis, so
+    cosine can match stored text that has zero token overlap with the query."""
+
+    _AXES = {"postgres": 0, "failover": 1, "resilience": 1, "standby": 1}
+    dim = 3
+
+    def embed(self, texts):
+        from ai_dev_assistant.memory.embeddings import _tokenize
+
+        out = []
+        for text in texts:
+            vec = [0.0, 0.0, 0.0]
+            for tok in _tokenize(text):
+                axis = self._AXES.get(tok)
+                if axis is not None:
+                    vec[axis] += 1.0
+            norm = sum(x * x for x in vec) ** 0.5
+            out.append([x / norm for x in vec] if norm else [0.0, 0.0, 1.0])
+        return out
+
+
+class _ExplodingEmbedder:
+    dim = 256
+
+    def embed(self, texts):
+        raise RuntimeError("embedder down")
+
+
+def _patch_embedder(monkeypatch, embedder) -> None:
+    """Swap the embedder at every site global_search reaches (seed + query time)."""
+    for site in ("ai_dev_assistant.memory.store.get_embedder",
+                 "ai_dev_assistant.knowledge.combine.get_embedder",
+                 "ai_dev_assistant.search.get_embedder"):
+        monkeypatch.setattr(site, lambda _settings: embedder)
+
+
+def test_semantic_hit_lexical_scoring_would_miss(tmp_path, monkeypatch):
+    _patch_embedder(monkeypatch, _SynonymEmbedder())
+    settings = _settings(tmp_path)
+    _seed_project(
+        settings, "proj-sem",
+        memories=[("longterm", "restore postgres from nightly dumps before failover drills")],
+        kb_docs=[("repo:docs/dr.md", "practice failover on the postgres standby weekly")],
+    )
+    # "resilience" appears NOWHERE in the stored text — lexical scoring alone
+    # would return nothing; the cosine leg maps it onto the failover axis.
+    hits = search.global_search(settings, "resilience", kinds=("memory", "kb"))
+    by_kind = {h["kind"]: h for h in hits}
+    assert "failover" in by_kind["memory"]["snippet"]
+    assert "failover" in by_kind["kb"]["snippet"]
+    assert by_kind["kb"].get("semantic") is True  # score came from the cosine leg
+
+
+def test_lexical_fallback_when_embedder_raises(env, monkeypatch):
+    # Seeded vectors exist (env fixture used the real hash embedder); now the
+    # query-time embedder is broken — both vector modalities must degrade to
+    # their lexical leg instead of raising or going dark.
+    _patch_embedder(monkeypatch, _ExplodingEmbedder())
+    hits = search.global_search(env, "postgres", kinds=("memory", "kb"))
+    by_kind: dict[str, set[str]] = {}
+    for h in hits:
+        assert {"kind", "project", "title", "snippet", "score", "ref"} <= set(h)
+        assert not h.get("semantic")  # no cosine leg -> nothing may claim semantic
+        by_kind.setdefault(h["kind"], set()).add(h["project"])
+    for kind in ("memory", "kb"):
+        assert {"proj-a", "proj-b"} <= by_kind.get(kind, set()), kind

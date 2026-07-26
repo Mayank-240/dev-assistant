@@ -125,6 +125,13 @@ class RunStore:
                 self._conn.execute(f"ALTER TABLE subtask_states ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError:
                 pass
+        # additive: acceptance bookkeeping — the commit an accept created on the
+        # review target (rollback reverts exactly that), and the revert commit.
+        for col, decl in (("accepted_commit", "TEXT"), ("rollback_commit", "TEXT")):
+            try:
+                self._conn.execute(f"ALTER TABLE subtask_reviews ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError:
+                pass
         self._conn.commit()
 
     def start(self, run_id: str, prompt: str, title: str | None = None,
@@ -228,11 +235,30 @@ class RunStore:
 
     # ---- per-subtask review decisions (F4/decision #5) ----
     def set_subtask_review(self, run_id: str, subtask_id: str, decision: str,
-                           comment: str = "") -> None:
+                           comment: str = "", accepted_commit: str | None = None) -> None:
+        # UPSERT, never REPLACE: re-deciding a subtask must not wipe the recorded
+        # accepted_commit/rollback_commit (rollback needs the accept commit hash).
         self._conn.execute(
-            "INSERT OR REPLACE INTO subtask_reviews(run_id, subtask_id, decision, comment, "
-            "created_at) VALUES (?, ?, ?, ?, ?)",
-            (run_id, subtask_id, decision, comment, time.time()),
+            "INSERT INTO subtask_reviews(run_id, subtask_id, decision, comment, created_at, "
+            "accepted_commit) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(run_id, subtask_id) DO UPDATE SET decision=excluded.decision, "
+            "comment=excluded.comment, created_at=excluded.created_at, "
+            "accepted_commit=COALESCE(excluded.accepted_commit, subtask_reviews.accepted_commit)",
+            (run_id, subtask_id, decision, comment, time.time(), accepted_commit),
+        )
+        self._conn.commit()
+
+    def set_subtask_rollback(self, run_id: str, subtask_id: str, rollback_commit: str) -> None:
+        """Mark an accepted subtask as rolled back (decision 'rolled_back').
+
+        Keeps the original accepted_commit for history; records the revert commit
+        so the UI can show what landed on the review target."""
+        self._conn.execute(
+            "INSERT INTO subtask_reviews(run_id, subtask_id, decision, comment, created_at, "
+            "rollback_commit) VALUES (?, ?, 'rolled_back', '', ?, ?) "
+            "ON CONFLICT(run_id, subtask_id) DO UPDATE SET decision='rolled_back', "
+            "created_at=excluded.created_at, rollback_commit=excluded.rollback_commit",
+            (run_id, subtask_id, time.time(), rollback_commit),
         )
         self._conn.commit()
 

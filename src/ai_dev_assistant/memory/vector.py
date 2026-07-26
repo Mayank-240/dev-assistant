@@ -7,7 +7,9 @@ Hardening:
   - writes are guarded by a lock (parallel subtasks share one connection),
   - a dimension mismatch (e.g. a fastembed→hash fallback mid-project) is skipped instead
     of crashing the dot product,
-  - ``min_score`` lets callers drop weak matches rather than always returning top_k.
+  - ``min_score`` lets callers drop weak matches rather than always returning top_k,
+  - hybrid search never raises on a broken embedder: if the query can't be embedded,
+    the cosine leg is skipped and the lexical leg alone ranks.
 
 Retrieval comes in two flavors:
   - ``search``:        pure cosine (kept score-stable for dedup thresholds like 0.92),
@@ -91,13 +93,31 @@ class VectorStore:
         return scored[:top_k]
 
     def search_hybrid(self, namespace: str, query: str, top_k: int = 5,
-                      min_score: float = 0.0) -> list[tuple[str, float, str]]:
+                      min_score: float = 0.0,
+                      query_vec: np.ndarray | None = None) -> list[tuple[str, float, str]]:
         """Cosine + lexical retrieval fused by reciprocal-rank fusion.
 
         The lexical leg scores each stored text by idf-weighted coverage of the query's
         tokens (a normalized BM25-ish overlap in [0, 1]). Ranking fuses both legs via
         RRF; the *reported* score is ``max(cosine, lexical)`` so it stays comparable to
         the cosine-scale ``min_score`` thresholds callers already use.
+
+        ``query_vec`` lets a caller sweeping several stores embed the query ONCE and
+        reuse it. When the query can't be embedded (embedder down), the cosine leg is
+        skipped and the lexical leg alone ranks — retrieval never raises.
+        """
+        return [(ref, score, text) for ref, score, text, _semantic in
+                self.search_hybrid_detail(namespace, query, top_k=top_k,
+                                          min_score=min_score, query_vec=query_vec)]
+
+    def search_hybrid_detail(self, namespace: str, query: str, top_k: int = 5,
+                             min_score: float = 0.0, query_vec: np.ndarray | None = None,
+                             ) -> list[tuple[str, float, str, bool]]:
+        """``search_hybrid`` plus a per-hit ``semantic`` flag.
+
+        The flag is True when the cosine leg supplied the reported score (semantic
+        similarity strictly beat the lexical evidence) — such a hit may share no
+        tokens with the query at all. Same contract otherwise.
         """
         rows = self._conn.execute(
             "SELECT ref_id, vector, dim, text FROM vectors WHERE namespace = ?", (namespace,)
@@ -105,8 +125,14 @@ class VectorStore:
         if not rows:
             return []
 
-        q = np.asarray(self._embedder.embed([query])[0], dtype="float32")
-        q_norm = float(np.linalg.norm(q)) or 1.0
+        if query_vec is not None:
+            q = np.asarray(query_vec, dtype="float32")
+        else:
+            try:
+                q = np.asarray(self._embedder.embed([query])[0], dtype="float32")
+            except Exception:  # noqa: BLE001 — embedder down: degrade, don't break search
+                q = None
+        q_norm = (float(np.linalg.norm(q)) or 1.0) if q is not None else 1.0
 
         texts: dict[str, str] = {}
         cos: dict[str, float] = {}
@@ -115,7 +141,8 @@ class VectorStore:
             ref = row["ref_id"]
             texts[ref] = row["text"] or ""
             doc_tokens[ref] = set(_tokenize(texts[ref]))
-            if int(row["dim"]) == q.shape[0]:  # dim mismatch → lexical leg only
+            # No query vector or dim mismatch → lexical leg only for this row.
+            if q is not None and int(row["dim"]) == q.shape[0]:
                 vec = np.frombuffer(row["vector"], dtype="float32")
                 denom = (float(np.linalg.norm(vec)) or 1.0) * q_norm
                 cos[ref] = float(np.dot(vec, q) / denom)
@@ -151,4 +178,5 @@ class VectorStore:
                 fused.append((rrf, combined, ref))
 
         fused.sort(key=lambda item: (-item[0], -item[1], item[2]))
-        return [(ref, combined, texts[ref]) for _rrf, combined, ref in fused[:top_k]]
+        return [(ref, combined, texts[ref], cos.get(ref, 0.0) > lex.get(ref, 0.0))
+                for _rrf, combined, ref in fused[:top_k]]

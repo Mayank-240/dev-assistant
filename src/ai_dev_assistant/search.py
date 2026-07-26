@@ -4,11 +4,20 @@ Modalities:
 - ``task``:   run rows in ``data_dir/runs.db`` — substring/token match over
               prompt + title + summary, recency-boosted;
 - ``memory``: each project's memory store, via the same hybrid recall a single
-              project uses (``knowledge.combine.combined_memory_search``);
-- ``kb``:     the "kb" namespace of each project's vectors table (cosine search);
+              project uses (``knowledge.combine.combined_memory_search``) —
+              semantic cosine blended with lexical scoring;
+- ``kb``:     the "kb" namespace of each project's vectors table, via the same
+              hybrid cosine+lexical search (the query is embedded ONCE and
+              reused across projects — chunk vectors are persisted at ingest);
 - ``file``:   file NAME/PATH matches (never content — too slow) over each
               project's checkout and its task worktrees
               (``workspace/<slug>/worktrees/<task-id>``).
+
+For both vector-backed modalities the reported score is ``max(cosine, lexical)``,
+so with the hash embeddings backend (or when the embedder fails — hybrid search
+degrades to its lexical leg instead of raising) results never rank worse than
+pure lexical scoring. Hits whose score came from semantic similarity rather than
+token overlap carry an optional ``"semantic": True`` flag.
 
 Strictly read-only everywhere: every database is opened with SQLite ``mode=ro``
 (the knowledge/combine.py technique), the project registry is read WITHOUT the
@@ -34,12 +43,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from . import projects as _projects
 from .config import Settings
 from .knowledge import combine as _combine
 from .knowledge.base import _KB_NAMESPACE
 from .knowledge.combine import _connect_ro, _open_store_ro
-from .memory.embeddings import _tokenize
+from .memory.embeddings import _tokenize, get_embedder
 from .memory.store import _near_duplicate
 
 # Slight kind weights: an equally strong match is worth a bit more as a task
@@ -73,6 +84,8 @@ def global_search(settings: Settings, query: str, *,
     carries enough for a UI to open it: task -> {task_id}, memory -> {id},
     kb -> {ref_id}, file -> {task | None, path} (path relative to the checkout
     or worktree root; ``task`` names the worktree's task, None for the checkout).
+    Vector-backed hits (kb) additionally carry ``semantic: True`` when semantic
+    similarity, not lexical overlap, produced the score.
     """
     q = (query or "").strip().lower()
     if not q:
@@ -163,7 +176,12 @@ def _search_tasks(settings: Settings, q: str, qtokens: list[str],
 
 def _search_memories(settings: Settings, query: str, slugs: list[str],
                      cap: int) -> list[dict[str, Any]]:
-    """Hybrid recall per project via combine (read-only stores, deduped, tagged)."""
+    """Hybrid recall per project via combine (read-only stores, deduped, tagged).
+
+    Each hit's score is already ``max(cosine, lexical)`` (VectorStore.search_hybrid),
+    so semantic matches surface even with zero token overlap, and a failing embedder
+    degrades to lexical scoring inside the hybrid search instead of raising.
+    """
     out: list[dict[str, Any]] = []
     for h in _combine.combined_memory_search(settings, slugs, query, top_k=cap):
         score = max(0.0, min(1.0, float(h.get("score") or 0.0)))
@@ -180,28 +198,49 @@ def _search_memories(settings: Settings, query: str, slugs: list[str],
 
 def _search_kb(settings: Settings, query: str, slugs: list[str],
                cap: int) -> list[dict[str, Any]]:
-    """Vector search over each project's "kb" namespace (same read-only stores)."""
+    """Hybrid (cosine + lexical) search over each project's "kb" namespace.
+
+    The query is embedded ONCE and reused across projects (chunk vectors are
+    persisted at ingest time, so nothing else is embedded per query); when the
+    embedder is unavailable, ``query_vec`` stays None and each store's hybrid
+    search degrades to its lexical leg. Same read-only stores as before.
+    """
+    query_vec = _embed_query(settings, query)
     out: list[dict[str, Any]] = []
     for slug in slugs:
         store = _open_store_ro(settings, settings.projects_dir / slug / "memory.db")
         if store is None:
             continue  # project without a memory.db yet — skip quietly
         try:
-            vec_hits = store.vectors.search(
-                _KB_NAMESPACE, query, top_k=cap, min_score=_MIN_VEC_SCORE)
+            vec_hits = store.vectors.search_hybrid_detail(
+                _KB_NAMESPACE, query, top_k=cap, min_score=_MIN_VEC_SCORE,
+                query_vec=query_vec)
         except sqlite3.Error:
             vec_hits = []  # partial/foreign schema — contribute nothing
         finally:
             store.close()
-        for ref_id, score, text in vec_hits:
-            out.append({
+        for ref_id, score, text, semantic in vec_hits:
+            hit = {
                 "kind": "kb", "project": slug,
                 "title": str(ref_id).split("#", 1)[0],
                 "snippet": _clip(text or "", 200),
                 "score": max(0.0, min(1.0, float(score))),
                 "ref": {"ref_id": ref_id},
-            })
+            }
+            if semantic:
+                hit["semantic"] = True
+            out.append(hit)
     return out
+
+
+def _embed_query(settings: Settings, query: str) -> np.ndarray | None:
+    """The query's embedding, or None when the embedder is unavailable —
+    callers then fall back to lexical scoring instead of failing the search."""
+    try:
+        vec = np.asarray(get_embedder(settings).embed([query])[0], dtype="float32")
+    except Exception:  # noqa: BLE001 — embedding must never break search
+        return None
+    return vec if vec.size else None
 
 
 def _search_files(settings: Settings, q: str, qtokens: list[str],
