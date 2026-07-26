@@ -1,7 +1,10 @@
 # AI Dev Assistant — Feature Plan: the Project-Level Assistant
 
-Status: **all three slices implemented** (see §4 Build order); this document is
-kept as the design record, decision history in §5 intact.
+Status: **HISTORICAL — all three slices shipped** (see §4 Build order), and the
+system has since grown well past this plan (workspaces, custom agents, GitHub
+follow-ups, named users, …). This document is kept as the design record —
+decision history in §5 intact. For what the assistant does **today**, see
+[FEATURES.md](FEATURES.md), the living inventory.
 
 Originally drafted for decision when nothing below was built. The assistant was
 not deployed anywhere, so this plan assumed a clean break: no migrations, no

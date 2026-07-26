@@ -1,5 +1,11 @@
 # Improvement Plan
 
+Status: **HISTORICAL — everything below shipped.** All items from the original
+review and both remediation passes (and the third-pass residuals) are
+implemented; the status tables inside record what landed and how. This file is
+kept as the review/remediation record. For what the assistant does **today**,
+see [FEATURES.md](FEATURES.md), the living inventory.
+
 A full-codebase review (2026-07-25, ~6,200 lines of `src/`, 973 lines of tests) surfaced
 the improvements below. Each item cites the code it refers to, explains the problem, and
 proposes a fix. Severity/leverage is ranked within each section; the overall sequencing

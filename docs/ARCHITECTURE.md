@@ -1,122 +1,136 @@
 # Architecture & Capabilities
 
-This document maps the system's capabilities, organized by the five tiers they were built
-in. Each tier builds on the last: reliability first (so runs finish and report the truth),
-then real-repo capability, then trustworthy verification, then cross-run learning, then
-observability/eval/security/deploy.
+How the system fits together at HEAD. It was built reliability-first — runs finish and
+report the truth, then real-repo capability, trustworthy verification, cross-run
+learning, and observability/security on top — and is now **project-first**: projects own
+durable checkouts and knowledge, workspaces group projects, and every surface (CLI, web,
+API) goes through them. [FEATURES.md](FEATURES.md) is the feature inventory; this file
+is the structural map.
+
+## Module map
+
+```
+engine.py           wires a run together: workspace setup, plan, schedule, finalize
+projects.py         project registry — checkouts (greenfield/clone/in-place), policy,
+                    indexing state, review targets, deliver/accept plumbing
+workspaces.py       named project groups + default dependency maps → fan-out run specs
+orchestration/      task DAG + soft-success, rolling scheduler, session pool, run store
+                    (SQLite), run control (pause/steer/answer), fanout (cross-project
+                    children + waves), schedules (interval/cron), events, trace, bus
+agents/             BaseAgent, orchestrator (plan/refine/replan), reviewer, reflector,
+                    registry (19 built-in specs), custom.py (operator-defined agents)
+tools/registry.py   the agent toolbox — files/patch/grep/symbols, run_command, git,
+                    messaging, delegate — path-confined, policy-enforced, audited
+llm/                provider interface + claude_sdk/anthropic backends, resilience,
+                    pricing, jsonout repair, record/replay cassettes, schemas
+memory/             SQLite memory store (dedup/decay), embeddings, vector store
+knowledge/          KB, layered graph (graph.py), distill.py (consolidation), repo_map,
+                    combine.py (read-only multi-project views), extract
+verification.py     objective signals (file contents, scoped tests, lint) → verdicts
+execution.py        sandbox tiers for spawned commands: subprocess/bwrap/container
+vcs.py              git plumbing: worktrees, branches, cherry-pick/revert, merges
+gc.py               workspace GC — reclaim finished worktrees + delivered ada/* branches
+github.py           issues→runs→PRs, PR-comment follow-ups (pure, poll-based core)
+analytics.py        read-only spend/outcome aggregation over the run store
+search.py           global search across tasks/memories/KB/files
+playbooks.py        7 task templates · notify.py  webhook/Slack/email/desktop channels
+evals/              golden harness, graders, replay_eval, ab, history (benchmarks.jsonl)
+security/           secret redaction, untrusted envelopes
+web/server.py       FastAPI app (~100 endpoints), auth middleware, pollers (schedules,
+                    GitHub), landing at / and console at /app (static/)
+web/users.py        named multi-user tokens (sha256-only) over the owner ADA_API_TOKEN
+docs/writer.py      per-task plan/report/brief/activity docs + task index
+cli.py              run · project · resume · server · eval
+```
 
 ## The run, end to end
 
 ```
-ada run "<task>"
-  └─ (optional) materialize a real repo into workspace/<id>/        [Tier 2]
-  └─ orchestrator.make_plan  ← repo map + prior lessons + agent track record   [Tier 2/4]
-  └─ run.validate()  — reject cycles / dup ids / dangling deps        [Tier 3]
-  └─ scheduler.run(run)                                                [Tier 1]
-        for each ready batch (deps satisfied incl. soft-success):
-          execute subtask  → sandboxed agent w/ real file/exec/git tools   [Tier 2]
-          verify subtask   → LLM reads file CONTENTS, then objective gate   [Tier 3]
-                              (failing tests hard-fail; green tests override nitpicks)
-          on exhausted retries with real output → PASSED_WITH_CAVEATS  [Tier 1]
-        transient LLM errors retried with backoff (not a review retry)  [Tier 1]
-        (optional) adaptive replan injects a repair subtask             [Tier 3]
-  └─ run whole-workspace tests · enrich KG · git branch+commit          [Tier 2/3]
-  └─ summarize · reflect (outcome-aware lessons) · index artifacts into KB   [Tier 4]
-  └─ record agent outcomes · compute quality score · write docs+events+trace [Tier 4/5]
-  └─ honest rollup status: completed / partial / failed                 [Tier 1]
+ada run -p <slug> "<task>"          (or web composer / queue / schedule / GitHub issue)
+  └─ workspace: git worktree off the project checkout, branch ada/<task-id>
+     (persists after the run — review, files, continue, resume all read it)
+  └─ orchestrator.make_plan  ← repo map + lessons + feedback + agent track record
+       └─ optional interactive refine loop (plain-English instructions → revised DAG)
+  └─ validate: cycles / dup ids / dangling deps / size cap; policy snapshot emitted
+  └─ scheduler.run — rolling: a subtask starts the moment its deps are satisfied
+        execute  → agent from the session pool, per-subtask git worktree
+                   (worktree_per_subtask, on by default) merged back conflict-aware;
+                   toolbox path-confined + policy-enforced; every step streamed as
+                   agent_step events (live transcripts)
+        attention → an agent can ask/request permission: the run emits the event,
+                   notifies (Slack/email/webhook/desktop), and waits (bounded) for
+                   the operator's answer via the steer channel
+        verify   → reviewer reads actual file contents; objective gate runs scoped
+                   tests + lint vs the pre-run baseline (failing tests hard-fail,
+                   green tests override an LLM nitpick); per-criterion verdicts
+        self-heal → a FAILED subtask gets a bounded repair subtask (debugger) via
+                   the replan hook (adaptive_replan, on by default); retries with
+                   real output degrade to PASSED_WITH_CAVEATS so dependents run
+  └─ finalize: workspace test run · KG enrichment · delivery (branch kept for review,
+     or auto-merge when git_mode=merge and the run fully passed) · summarize · reflect
+     (outcome-aware lessons) · index artifacts into the KB · agent track records ·
+     quality score · docs + events + trace + audit · honest rollup status
+  └─ afterwards: per-subtask accept (cherry-pick to the review target) / reject /
+     rollback (revert the accepted sha), deliver-all, feedback, re-engage, GC
 ```
 
-## Tier 1 — Reliability: runs finish and report the truth
+Cross-project runs wrap this: `fanout.run_cross_project` spawns one child run per
+project (own worktree/baseline/branch, split budget), honoring a dependency map as
+topological waves with upstream summaries injected into dependent prompts. Workspaces
+expand to exactly that payload via `workspace_run_spec`.
 
-- **Degrade-on-partial** (`scheduler.py`, `task.py`): a subtask that produced real output
-  but failed review becomes `PASSED_WITH_CAVEATS`. It satisfies dependencies (so dependents
-  run) and tags the result with a caveat. This kills the dominant `0/3`/`1/3` cascade where
-  one strict-review miss `BLOCKED`ed the whole downstream subtree.
-- **Honest status rollup** (`engine.py`, `run_store.py`): the run's terminal status is
-  derived from subtask outcomes — `completed` (all passed) / `partial` / `failed` — and
-  web/LLM errors mark the run `failed` instead of stranding it `running`.
-- **JSON self-repair** (`jsonout.py`): `repair_json` recovers a valid object from prose,
-  mid-text fences, trailing commas, and smart quotes, so a slightly-malformed plan/verdict
-  no longer aborts the run.
-- **Provider resilience** (`resilience.py`, `client.py`): every LLM HTTP call has a timeout
-  and bounded exponential backoff (honoring `Retry-After`); persistent transient failures
-  raise `TransientLLMError`, which the scheduler retries with backoff **without** consuming
-  the substantive review-retry budget.
-- **Concurrency safety**: locks around the shared SQLite connection, the NetworkX graph, and
-  an atomic `UsageTotals`.
-- **SDK fixes**: the Claude SDK backend now honors the per-call `model` argument.
+## Reliability spine
 
-## Tier 2 — Real-repo capability + safe execution
+- **Degrade-on-partial** (`scheduler.py`): a real-but-unverified subtask becomes
+  `PASSED_WITH_CAVEATS`, satisfying dependents — no `0/3` cascades.
+- **Honest rollup** (`engine.py`, `run_store.py`): terminal status derived from subtask
+  outcomes (completed/partial/failed); crashes never strand a run `running`; startup
+  cleanup marks orphaned runs interrupted.
+- **JSON self-repair** (`llm/jsonout.py`) recovers plans/verdicts from malformed output;
+  **provider resilience** (`llm/resilience.py`) bounds timeouts/backoff and keeps
+  transient retries separate from review retries.
+- **Durability**: plan + subtask checkpoints in SQLite (`resume`), persistent queue,
+  deep cancellation (per-run process-group kill tags).
 
-- **Repository binding** (`vcs.py`, `engine.py`): `ADA_REPO_URL` clones, `ADA_REPO_PATH`
-  copies a working tree into the sandbox (never mutated in place). The agent toolbox is
-  rooted at the workspace (fixing the old `read_file`-reads-the-assistant's-own-tree bug).
-- **Real file tools** (`tools/registry.py`): `write_file`, `edit_file`, `apply_patch`,
-  `list_dir`, `grep`, `git_status`, `git_diff` — plus a hardened `read_file` with a
-  secret-file denylist and symlink-escape guard.
-- **Sandboxed execution** (`execution.py`): `run_command`/`install_packages` run with a
-  scrubbed environment (no API keys leak), POSIX rlimits (CPU/address-space), and a new
-  process group killed as a whole on timeout. The SDK built-in tool allowlist denies `Bash`
-  and web access by default.
-- **Codebase onboarding** (`knowledge/repo_map.py`): a token-bounded repo map feeds the
-  planner, and source is indexed into the KB (so `kb_search` goes live) and KG.
-- **Delivery** (`ADA_GIT_FINALIZE`): commit the workspace on an `ada/<run-id>` branch.
+## Learning & knowledge
 
-## Tier 3 — Trustworthy verification & smarter decomposition
+- Per-project memory (hybrid semantic+lexical recall, dedup, decay) + KB + a **layered
+  knowledge graph**: `domain`-layer edges are agent knowledge, `run`-layer edges are
+  engine bookkeeping; weights and provenance merge on save. `knowledge/distill.py`
+  consolidates the domain layer (near-duplicate merges, stale-edge pruning) with pure
+  heuristics + local embeddings — no LLM calls — via CLI, API, or the console.
+- Reflection writes outcome-aware DO/AVOID/ROUTING lessons; human feedback and
+  per-agent pass rates feed the next plan. Workspace siblings contribute bounded,
+  attributed, read-only context (`combine.py`).
+- `evals/history.py` tracks suite scores per git SHA in `benchmarks.jsonl` so
+  prompt/agent changes are measurable commit-over-commit.
 
-- **Objective-gated verdicts** (`verification.py`): the reviewer reads actual file contents
-  (not just names); the gate runs the subtask's tests + lint. Failing tests **hard-fail**
-  regardless of the LLM's opinion; green tests downgrade an LLM nitpick to a soft pass.
-- **Per-criterion verdicts** (`schemas.py`): `Verdict.criteria` gives an evidence-backed
-  breakdown of which acceptance criterion failed.
-- **DAG + plan validation** (`task.py`, `orchestrator.py`): Kahn topo-sort rejects cycles,
-  duplicate ids, and dangling deps before scheduling; empty acceptance criteria are
-  backfilled so the reviewer is never ungrounded.
-- **Interactive plan mode** (`orchestrator.refine_plan`, `/api/plan/refine`, `run -i`):
-  propose a plan, then refine it with natural-language instructions ("add a security review
-  step", "merge steps 2 and 3") — the orchestrator returns a revised, re-validated DAG — and
-  loop until you approve. Works in the web plan panel and the CLI.
-- **Re-engage a completed task** (`engine.run(continue_from=...)`, `run --continue`, web
-  "↻ Re-engage"): a finished task can be continued — its workspace is carried forward (copied
-  into the new run), its prompt + outcome frame the new plan, and the run is linked to its
-  parent (`runs.parent_id`). Each follow-up is its own run that builds on the last.
-- **Adaptive replanning** (`engine.py`, `scheduler.py`): a bounded hook injects a repair
-  subtask for a failed one (`ADA_ADAPTIVE_REPLAN`).
-- **Token-budgeted context** (`context.py`): the agent prompt is assembled to a budget
-  instead of unbounded concatenation.
+## Web, auth & users
 
-## Tier 4 — Cross-run learning that actually improves
+- `web/server.py` serves the landing page (`/`), the console (`/app`), and the API;
+  WebSockets stream live events per task. Background loops tick schedules (60s) and
+  poll GitHub.
+- Auth: bearer `ADA_API_TOKEN` (forced on for non-loopback binds, auto-generated if
+  unset) exchanged for an HttpOnly session cookie at `POST /api/login`. `web/users.py`
+  layers **named users** on top: owner-only create/list/revoke, sha256-only token
+  storage in `users.json`, identities stamped onto the runs they start; `local` is the
+  pseudo-identity when auth is off. See [DEPLOYMENT.md](DEPLOYMENT.md).
 
-- **Outcome-aware reflection** (`agents/reflector.py`): one structured call distills typed
-  `what_worked` / `what_to_avoid` / `routing_notes` lessons conditioned on the real pass
-  ratio — no more writing happy-path lessons for a failed run.
-- **Memory hygiene** (`memory/`): relevance-thresholded recall, recency **decay**,
-  `remember_unique` dedup, and a vector **dimension guard** so a fastembed→hash fallback can
-  no longer crash planning.
-- **Live KB** (`engine._index_artifacts`): briefs + produced source are re-indexed each run.
-- **Human feedback** (`run_store.py`, web): rate / accept / comment a finished run — the
-  highest-signal learning input.
-- **Learned routing**: per-agent pass rates are recorded and surfaced to the planner.
+## Security, cost, deploy
 
-## Tier 5 — Observability, evaluation, cost, security, deploy
-
-- **Eval harness** (`evals/`, `ada eval`): golden tasks graded by deterministic graders
-  (`file_exists`, `ast_defines`, `tests_pass`) into a scorecard (pass/fail, cost, wall-time).
-- **Record/replay** (`llm/record_replay.py`): capture real provider responses to cassettes
-  and replay them offline for deterministic regression of the LLM/JSON-repair layer.
-- **Cost attribution** (`llm/pricing.py`, `usage.py`): a pricing table populates `cost_usd`
-  on the API backend (so the budget guardrail trips), with per-subtask cost deltas.
-- **Quality score + dashboard**: a 0-100 score per run, plus a web Dashboard with total cost,
-  average quality, status breakdown, and per-agent track record.
-- **Durable telemetry**: `events.jsonl` (replayable event log), `trace.jsonl` (per-phase
-  spans), and `audit.jsonl` (every tool dispatch) under `docs/<id>/`.
-- **In-run control**: pause/resume between batches and steer the next subtask from the UI.
-- **Defense in depth** (`security/redaction.py`): secret redaction on tool output/docs/
-  memory, an `<untrusted>` envelope for external content, and an audit log.
-- **Deploy**: a working multi-stage `Dockerfile` (runs the real app as an unprivileged user)
-  with `/healthz` and `/readyz`.
+- Defense in depth: SDK built-ins deny-hooked, toolbox path confinement + protected
+  paths (DENIED-audited), secret redaction at every durable boundary, untrusted
+  envelopes, audit log. Spawned commands run under `execution.py`'s selected tier
+  (subprocess rlimits / bwrap / throwaway container) — the container deployment is the
+  real isolation boundary.
+- Cost: pricing table → `cost_usd` per call, budget guardrails (run cap, per-turn stop,
+  SDK tool-gate starvation), per-subtask cost deltas, analytics rollups.
+- Deploy: hardened multi-stage image (non-root, read-only rootfs compose, `/healthz` +
+  `/readyz`, HEALTHCHECK).
 
 ## Configuration
 
-Every capability above is gated by an `ADA_*` environment variable — see
-[`.env.example`](../.env.example) for the full list and defaults.
+Every knob is an `ADA_*` env var (see [`.env.example`](../.env.example)); 52 of them are
+console-editable at runtime through the settings overlay (`config.SETTINGS_SCHEMA` is
+the single source of truth for what the console may touch — secrets and paths are
+deliberately excluded).
