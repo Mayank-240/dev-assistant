@@ -137,7 +137,14 @@ def _deny(reason: str) -> dict[str, Any]:
     }
 
 
-def _clip(s: Any, n: int = 240) -> str:
+# Transcript step clip limits. Generous on purpose: the full per-subtask transcript
+# (events.jsonl -> /api/runs/{task}/transcript/{subtask}) is the durable record, and the
+# UI truncates for the compact card ticker itself. Only pathological blobs are cut.
+_STEP_CLIP = 4000
+_TOOL_INPUT_CLIP = 2000
+
+
+def _clip(s: Any, n: int = _STEP_CLIP) -> str:
     s = str(s or "")
     return s if len(s) <= n else s[:n] + "…"
 
@@ -151,6 +158,23 @@ def _short_input(inp: Any) -> str:
         return json.dumps(inp)
     except Exception:
         return str(inp)
+
+
+def _tool_result_text(content: Any) -> str:
+    """Flatten a ToolResultBlock's content (str | list of text blocks/dicts) to plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict):
+                parts.append(str(c.get("text", "") or ""))
+            else:
+                parts.append(str(getattr(c, "text", "") or ""))
+        return "\n".join(p for p in parts if p)
+    return str(content)
 
 
 class ClaudeSdkProvider:
@@ -236,11 +260,14 @@ class ClaudeSdkProvider:
         sdk = self._sdk
         result: str | None = None
         last_assistant = ""
+        tool_names: dict[str, str] = {}  # tool_use_id -> tool name, so results can be attributed
         try:
             async for msg in sdk.query(prompt=prompt, options=options):
                 if isinstance(msg, sdk.ResultMessage):
                     result = getattr(msg, "result", None) or result
                     self._record_usage(msg, model=model)
+                    if on_step and result:
+                        on_step({"kind": "result", "text": _clip(result)})
                 elif isinstance(msg, sdk.AssistantMessage):
                     text_parts = []
                     for b in getattr(msg, "content", []):
@@ -248,9 +275,12 @@ class ClaudeSdkProvider:
                             if on_step:
                                 on_step({"kind": "thinking", "text": _clip(b.thinking)})
                         elif getattr(b, "name", None):  # ToolUseBlock
+                            if getattr(b, "id", None):
+                                tool_names[str(b.id)] = str(b.name)
                             if on_step:
                                 on_step({"kind": "tool", "tool": str(b.name),
-                                         "input": _clip(_short_input(getattr(b, "input", None)), 120)})
+                                         "input": _clip(_short_input(getattr(b, "input", None)),
+                                                        _TOOL_INPUT_CLIP)})
                         elif getattr(b, "text", None):
                             text_parts.append(b.text)
                             if on_step:
@@ -258,6 +288,20 @@ class ClaudeSdkProvider:
                     joined = "".join(text_parts).strip()
                     if joined:
                         last_assistant = joined
+                elif isinstance(msg, sdk.UserMessage) and on_step:
+                    # Tool results come back to the model as user-side ToolResultBlocks —
+                    # surface them so the per-subtask transcript shows what each tool said.
+                    content = getattr(msg, "content", None)
+                    for b in (content if isinstance(content, list) else []):
+                        tid = getattr(b, "tool_use_id", None)
+                        if tid is None and not (isinstance(b, dict) and b.get("type") == "tool_result"):
+                            continue
+                        if isinstance(b, dict):
+                            tid, raw, err = b.get("tool_use_id"), b.get("content"), b.get("is_error")
+                        else:
+                            raw, err = getattr(b, "content", None), getattr(b, "is_error", None)
+                        on_step({"kind": "tool_result", "tool": tool_names.get(str(tid), ""),
+                                 "text": _clip(_tool_result_text(raw)), "is_error": bool(err)})
         except Exception as exc:  # auth, transport, CLI not found, etc.
             # Hitting the per-agent turn limit isn't fatal: the agent has usually already
             # written files to the workspace. Keep the partial output so the subtask is

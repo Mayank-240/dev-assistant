@@ -811,6 +811,17 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     async def get_trace(task_id: str) -> JSONResponse:
         return JSONResponse(_read_jsonl(settings.docs_dir / task_id / "trace.jsonl"))
 
+    # Full per-subtask agent transcript: every agent_step event (thinking / text / tool /
+    # tool_result / result) for one subtask, in emission order, straight from the durable
+    # event log. Unknown task or subtask -> empty transcript (not an error).
+    @app.get("/api/runs/{task_id}/transcript/{subtask_id}")
+    async def get_transcript(task_id: str, subtask_id: str) -> JSONResponse:
+        steps = [ev["data"] for ev in _read_jsonl(settings.docs_dir / task_id / "events.jsonl")
+                 if ev.get("type") == "agent_step"
+                 and (ev.get("data") or {}).get("id") == subtask_id]
+        agent = next((s.get("agent", "") for s in steps if s.get("agent")), "")
+        return JSONResponse({"agent": agent, "count": len(steps), "steps": steps})
+
     # ---- W5: diff viewer — what the run actually changed in its workspace ----
     @app.get("/api/tasks/{task_id}/diff")
     async def get_diff(task_id: str) -> JSONResponse:

@@ -58,6 +58,11 @@ specified in [PLAN.md](PLAN.md) and not yet built.
   browser, run comparison, dashboard + quality trend, queue management,
   pause/steer, feedback, resume, project selector, memory/KG views, token-auth,
   accessibility (dialogs, keyboard, contrast, reduced motion).
+- Full per-subtask agent transcripts: every step an agent takes — thinking, text,
+  tool calls, tool results (error-flagged) and the final result — is persisted
+  (~4k chars per step) as `agent_step` events in the task's `events.jsonl` and
+  served via `GET /api/runs/{task_id}/transcript/{subtask_id}`. The agent detail
+  modal's "Full transcript" action opens a kind-styled, live-following viewer.
 
 ## CLI · evals · CI
 - `ada run` (`-i`, `--continue`, `--ingest`) · `ada resume` · `ada server` ·

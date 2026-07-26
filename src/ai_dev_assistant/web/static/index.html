@@ -671,7 +671,10 @@
           <span id="am-agent" class="ac-agent"></span>
           <span id="am-status" class="pill"></span>
         </div>
-        <button id="agent-modal-close" type="button" class="ghost" aria-label="Close dialog">✕</button>
+        <div class="modal-head-actions">
+          <button id="am-transcript" type="button" class="ghost-btn" title="Full step-by-step transcript, including tool results">☰ Full transcript</button>
+          <button id="agent-modal-close" type="button" class="ghost" aria-label="Close dialog">✕</button>
+        </div>
       </div>
       <div class="am-body">
         <h3 id="am-title" class="am-title"></h3>
@@ -682,6 +685,21 @@
         <span class="kicker">Activity</span>
         <div id="am-stream" class="ac-stream am-stream"></div>
       </div>
+    </div>
+  </div>
+
+  <!-- Full per-subtask agent transcript -->
+  <div id="transcript-modal" class="modal hidden">
+    <div class="modal-box tr-box" role="dialog" aria-modal="true" aria-label="Full agent transcript" tabindex="-1">
+      <div class="modal-head">
+        <div class="am-headline">
+          <span id="tr-id" class="chip"></span>
+          <span id="tr-agent" class="ac-agent"></span>
+          <span id="tr-count" class="pill"></span>
+        </div>
+        <button id="transcript-modal-close" type="button" class="ghost" aria-label="Close dialog">✕</button>
+      </div>
+      <div id="tr-body" class="tr-body"></div>
     </div>
   </div>
 

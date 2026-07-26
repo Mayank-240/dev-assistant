@@ -22,6 +22,12 @@ def _text_of(resp: Any) -> str:
     return "\n".join(p for p in parts if p).strip()
 
 
+# Transcript step clip limits — mirror claude_sdk_provider: the full transcript is the
+# durable record; the UI truncates for the compact ticker itself.
+_STEP_CLIP = 4000
+_TOOL_INPUT_CLIP = 2000
+
+
 class AnthropicProvider:
     name = "anthropic"
 
@@ -67,11 +73,12 @@ class AnthropicProvider:
                 for b in resp.content:
                     bt = getattr(b, "type", None)
                     if bt == "text" and getattr(b, "text", None):
-                        on_step({"kind": "text", "text": b.text[:240]})
+                        on_step({"kind": "text", "text": b.text[:_STEP_CLIP]})
                     elif bt == "thinking" and getattr(b, "thinking", None):
-                        on_step({"kind": "thinking", "text": b.thinking[:240]})
+                        on_step({"kind": "thinking", "text": b.thinking[:_STEP_CLIP]})
                     elif bt == "tool_use":
-                        on_step({"kind": "tool", "tool": b.name, "input": str(dict(b.input or {}))[:120]})
+                        on_step({"kind": "tool", "tool": b.name,
+                                 "input": str(dict(b.input or {}))[:_TOOL_INPUT_CLIP]})
             if resp.stop_reason == "tool_use":
                 results: list[dict[str, Any]] = []
                 for block in resp.content:
@@ -85,8 +92,13 @@ class AnthropicProvider:
                         results.append(
                             {"type": "tool_result", "tool_use_id": block.id, "content": output}
                         )
+                        if on_step:  # transcript: what the tool actually returned
+                            on_step({"kind": "tool_result", "tool": block.name,
+                                     "text": str(output or "")[:_STEP_CLIP], "is_error": False})
                 messages.append({"role": "user", "content": results})
                 continue
+            if on_step and last_text:
+                on_step({"kind": "result", "text": last_text[:_STEP_CLIP]})
             return last_text
         return last_text or "(agent reached its iteration limit without a final answer)"
 

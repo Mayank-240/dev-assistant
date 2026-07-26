@@ -4,6 +4,7 @@ const $ = (id) => document.getElementById(id);
 const {
   escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine,
   makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
+  clipText, transcriptLineModel, transcriptViewModel,
   computeBudgetMeter, timelineRows, compareRowModel, isResumable,
   projectStatusLine, activityStripModel,
   projectTaglineModel, deliveryControlModel, filterTasksByProject, projectHomeHeaderModel,
@@ -464,9 +465,66 @@ function renderAgentModal(a) {
     }
   } else {
     stream.innerHTML = a.steps.map(s =>
-      `<div class="as-${escapeAttr(s.kind || "text")}">${escapeHtml(formatStepLine(s))}</div>`).join("");
+      `<div class="as-${escapeAttr(s.kind || "text")}">${escapeHtml(clipText(formatStepLine(s), 400))}</div>`).join("");
     stream.scrollTop = stream.scrollHeight;
   }
+}
+
+// ---- full per-subtask transcript panel ----
+// Fetches the durable transcript (every agent step, unclipped) from
+// /api/runs/{task}/transcript/{subtask}; live steps for the open subtask are
+// appended by handleEvent's agent_step case while the run streams.
+async function openTranscript(id) {
+  const a = state.agentData[id] || {};
+  state.transcriptId = id;
+  state.transcriptCount = 0;
+  const st = agentStyle(a.agent || "");
+  $("tr-id").textContent = id;
+  $("tr-agent").innerHTML =
+    `<span class="ac-dot" style="background:${st.color}"></span>${escapeHtml(a.agent || "")}`;
+  $("tr-count").textContent = "…";
+  $("tr-body").innerHTML = `<div class="muted">Loading transcript…</div>`;
+  openModalEl("transcript-modal");
+  const tid = state.docsId || state.taskId;
+  let data = null;
+  if (tid) {
+    try { data = await (await fetch(`/api/runs/${tid}/transcript/${id}`)).json(); } catch (e) { data = null; }
+  }
+  if (state.transcriptId !== id) return;  // closed (or switched) while fetching
+  // Fall back to the steps already aggregated from the live stream if the fetch failed.
+  renderTranscript(data && Array.isArray(data.steps) ? data : { agent: a.agent, steps: a.steps || [] });
+}
+function renderTranscript(data) {
+  const vm = transcriptViewModel(data);
+  if (vm.agent) {
+    const st = agentStyle(vm.agent);
+    $("tr-agent").innerHTML =
+      `<span class="ac-dot" style="background:${st.color}"></span>${escapeHtml(vm.agent)}`;
+  }
+  $("tr-count").textContent = vm.countLabel;
+  state.transcriptCount = vm.count;
+  const body = $("tr-body");
+  body.innerHTML = vm.lines.length
+    ? vm.lines.map(l => `<div class="${escapeAttr(l.cls)}">${escapeHtml(l.prefix + l.text)}</div>`).join("")
+    : `<div class="muted">No transcript recorded for this subtask.</div>`;
+  body.scrollTop = body.scrollHeight;
+}
+function appendTranscriptStep(d) {
+  const body = $("tr-body");
+  if (!body) return;
+  if (!state.transcriptCount) body.innerHTML = "";  // replace the empty/loading notice
+  const l = transcriptLineModel(d);
+  const div = document.createElement("div");
+  div.className = l.cls;
+  div.textContent = l.prefix + l.text;
+  body.appendChild(div);
+  state.transcriptCount = (state.transcriptCount || 0) + 1;
+  $("tr-count").textContent = state.transcriptCount + (state.transcriptCount === 1 ? " step" : " steps");
+  body.scrollTop = body.scrollHeight;
+}
+function closeTranscript() {
+  closeModalEl("transcript-modal");
+  state.transcriptId = null;
 }
 
 // ---- controls / toasts / timeline ----
@@ -1022,13 +1080,16 @@ function handleEvent(ev) {
       break;
     case "agent_step": {
       if (state.openAgentId === d.id) renderAgentModal(state.agentData[d.id]);
+      // live-follow: the full-transcript panel appends steps for its open subtask
+      if (state.transcriptId === d.id && !$("transcript-modal").classList.contains("hidden"))
+        appendTranscriptStep(d);
       const card = $("agent-" + d.id);
       if (!card) break;
       const stream = card.querySelector(".ac-stream");
       if (!stream) break;
       const line = document.createElement("div");
       line.className = "as-" + (d.kind || "text");
-      line.textContent = formatStepLine(d);
+      line.textContent = clipText(formatStepLine(d), 300);
       stream.appendChild(line);
       while (stream.childElementCount > 6) stream.removeChild(stream.firstChild);
       stream.scrollTop = stream.scrollHeight;
@@ -3791,6 +3852,10 @@ $("modal-close").onclick = () => closeModalEl("modal");
 $("modal").onclick = (e) => { if (e.target === $("modal")) closeModalEl("modal"); };
 $("agent-modal-close").onclick = closeAgentModal;
 $("agent-modal").onclick = (e) => { if (e.target === $("agent-modal")) closeAgentModal(); };
+// full per-subtask transcript panel (opens on top of the agent modal)
+$("am-transcript").onclick = () => { if (state.openAgentId) openTranscript(state.openAgentId); };
+$("transcript-modal-close").onclick = closeTranscript;
+$("transcript-modal").onclick = (e) => { if (e.target === $("transcript-modal")) closeTranscript(); };
 // F4: Reviews & Permissions panel + project settings
 $("review-btn").onclick = openReviewPanel;
 $("review-modal-close").onclick = closeReviewPanel;
@@ -3810,6 +3875,7 @@ document.addEventListener("keydown", (e) => {
   else if (!$("project-modal").classList.contains("hidden")) closeProjectModal();
   else if (!$("review-modal").classList.contains("hidden")) closeReviewPanel();
   else if (!$("roster-modal").classList.contains("hidden")) closeRosterModal();
+  else if (!$("transcript-modal").classList.contains("hidden")) closeTranscript();
   else if (!$("agent-modal").classList.contains("hidden")) closeAgentModal();
   else if (!$("modal").classList.contains("hidden")) closeModalEl("modal");
   else if (knowVisible("graph")) clearGraphFocus();   // node-focus mode: Esc clears
@@ -3822,7 +3888,7 @@ document.addEventListener("keydown", (e) => {
     else closePalette();
   }
 });
-["modal", "agent-modal", "roster-modal", "project-modal", "review-modal",
+["modal", "agent-modal", "transcript-modal", "roster-modal", "project-modal", "review-modal",
  "playbook-modal", "palette-modal"].forEach(id =>
   $(id).addEventListener("keydown", (e) => _trapModalTab($(id), e)));
 document.querySelectorAll("#modal .tab").forEach(t => t.onclick = () => selectTab(t.dataset.doc));

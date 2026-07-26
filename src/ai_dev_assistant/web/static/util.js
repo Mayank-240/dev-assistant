@@ -179,7 +179,8 @@
       }
       case "agent_step": {
         const a = state.agentData[d.id];
-        if (a) a.steps.push({ kind: d.kind || "text", tool: d.tool, input: d.input, text: d.text });
+        if (a) a.steps.push({ kind: d.kind || "text", tool: d.tool, input: d.input,
+                              text: d.text, is_error: !!d.is_error });
         break;
       }
       case "subtask_review": {
@@ -243,8 +244,50 @@
   function formatStepLine(s) {
     s = s || {};
     if (s.kind === "tool") return "→ " + (s.tool || "") + (s.input ? " " + s.input : "");
+    if (s.kind === "tool_result") return "↳ " + (s.tool ? s.tool + ": " : "") + (s.text || "");
     if (s.kind === "thinking") return "… " + (s.text || "");
     return s.text || "";
+  }
+
+  // Display clip for compact stream lines (steps are persisted unclipped-ish at ~4k chars;
+  // the card ticker and modal activity list only show the head — the full-transcript
+  // panel shows everything).
+  function clipText(s, n) {
+    s = String(s == null ? "" : s);
+    n = n || 300;
+    return s.length <= n ? s : s.slice(0, n) + "…";
+  }
+
+  // ===========================================================
+  // Full per-subtask transcript panel (GET /api/runs/{task}/transcript/{subtask}).
+  // ===========================================================
+
+  // One transcript step -> render model {cls, prefix, text}. Text is plain — the
+  // caller escapes before injecting into HTML.
+  function transcriptLineModel(s) {
+    s = s || {};
+    const kind = s.kind || "text";
+    if (kind === "tool")
+      return { cls: "tl-tool", prefix: "▸ ", text: (s.tool || "?") + (s.input ? " " + s.input : "") };
+    if (kind === "tool_result")
+      return { cls: "tl-tool-result" + (s.is_error ? " tl-err" : ""), prefix: "↳ ",
+               text: (s.tool ? s.tool + " → " : "") + (s.text || "") };
+    if (kind === "thinking") return { cls: "tl-thinking", prefix: "", text: s.text || "" };
+    if (kind === "result") return { cls: "tl-final", prefix: "", text: s.text || "" };
+    return { cls: "tl-text", prefix: "", text: s.text || "" };
+  }
+
+  // Endpoint payload {agent, count, steps} -> view model for the panel.
+  function transcriptViewModel(data) {
+    data = data || {};
+    const steps = Array.isArray(data.steps) ? data.steps : [];
+    const count = data.count != null ? Number(data.count) : steps.length;
+    return {
+      agent: data.agent || "",
+      count,
+      countLabel: count + (count === 1 ? " step" : " steps"),
+      lines: steps.map(transcriptLineModel),
+    };
   }
 
   // ---- W5: cost-vs-budget meter model ----
@@ -1260,6 +1303,7 @@
     notifCenterModel, playbookFormModel, tourStepsModel,
     authGate, loginFormModel, loginErrorMessage,
     makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
+    clipText, transcriptLineModel, transcriptViewModel,
     computeBudgetMeter, timelineRows, compareRowModel, RESUMABLE_STATUSES, isResumable,
     projectStatusLine, activityStripModel,
     projectTaglineModel, deliveryControlModel, filterTasksByProject, projectHomeHeaderModel,
