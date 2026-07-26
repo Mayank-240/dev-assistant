@@ -10,10 +10,13 @@ one-line entry. ``when_to_use`` is what the orchestrator reads to route, so keep
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from ..config import Settings
 from .base import AgentProfile, BaseAgent
+
+logger = logging.getLogger("ada.agents")
 
 _COLLAB = (
     "You work in a team of agents coordinated by an orchestrator. Use your tools to: pull "
@@ -255,6 +258,14 @@ _SPECS: list[_Spec] = [
 def build_agents(settings: Settings) -> dict[str, BaseAgent]:
     model = settings.agent_model
     effort = settings.agent_effort
+    # Per-role routing (role_models, e.g. "documenter=claude-haiku-4-5"): a mapped role
+    # gets its own model; unmapped roles keep the single default. "reviewer" is a valid
+    # key too but is consumed by agents/reviewer.py, not the routable roster.
+    role_models = settings.role_models_map
+    known = {spec.name for spec in _SPECS} | {"reviewer"}
+    for role in role_models.keys() - known:
+        logger.warning("role_models: unknown role %r ignored (valid roles: %s)",
+                       role, ", ".join(sorted(known)))
     agents: dict[str, BaseAgent] = {}
     for spec in _SPECS:
         tools = _READONLY_TOOLS if spec.readonly else _FULL_TOOLS
@@ -268,7 +279,7 @@ def build_agents(settings: Settings) -> dict[str, BaseAgent]:
                 effort=effort,
             ),
             system_prompt=prompt,
-            model=model,
+            model=role_models.get(spec.name, model),
         )
     return agents
 

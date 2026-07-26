@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,8 @@ from typing import Any
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger("ada.config")
 
 
 def _get(name: str, default: str) -> str:
@@ -67,6 +70,12 @@ class Settings:
     orchestrator_effort: str = "high"
     agent_effort: str = "medium"
     reviewer_effort: str = "high"
+    # Per-role model routing: "role=model,role=model" overrides the model for individual
+    # agent roles (e.g. route documenter/test_engineer to a cheaper model). Blank keeps
+    # every role on the single default. Parsed by parse_role_models(); malformed pairs
+    # are skipped with a warning. Works on both backends — on the claude_sdk backend the
+    # values are Claude Code model ids.
+    role_models: str = ""
 
     # --- LLM resilience (Tier 1) ---
     request_timeout: float = 120.0  # per-LLM-call HTTP timeout (seconds)
@@ -183,6 +192,7 @@ class Settings:
             orchestrator_effort=_get("ADA_ORCHESTRATOR_EFFORT", "high"),
             agent_effort=_get("ADA_AGENT_EFFORT", "medium"),
             reviewer_effort=_get("ADA_REVIEWER_EFFORT", "high"),
+            role_models=_get("ADA_ROLE_MODELS", ""),
             request_timeout=_float("ADA_REQUEST_TIMEOUT", 120.0),
             llm_max_retries=_int("ADA_LLM_MAX_RETRIES", 3),
             max_concurrent_runs=_int("ADA_MAX_CONCURRENT_RUNS", 1),
@@ -251,6 +261,11 @@ class Settings:
         return bool(self.anthropic_api_key)
 
     @property
+    def role_models_map(self) -> dict[str, str]:
+        """The parsed per-role model mapping (see parse_role_models)."""
+        return parse_role_models(self.role_models)
+
+    @property
     def repo_backed(self) -> bool:
         """True when this run should operate on a real checked-out repository."""
         return bool(self.repo_url or self.repo_path)
@@ -306,6 +321,30 @@ class Settings:
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
 
 
+def parse_role_models(raw: str) -> dict[str, str]:
+    """Parse the ``role_models`` setting ("role=model,role=model") into a dict.
+
+    Same comma-separated mapping format as ``github_repos``. Role names are
+    lower-cased; whitespace around either side is stripped; a later duplicate
+    role wins. Malformed pairs (no '=', empty role, empty model) are skipped
+    with a logged warning — a bad mapping never breaks startup. Whether a role
+    name actually exists is checked at the construction site (agents/registry),
+    which knows the roster.
+    """
+    mapping: dict[str, str] = {}
+    for pair in (raw or "").split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        role, sep, model = pair.partition("=")
+        role, model = role.strip().lower(), model.strip()
+        if not sep or not role or not model:
+            logger.warning("role_models: skipping malformed pair %r (want role=model)", pair)
+            continue
+        mapping[role] = model
+    return mapping
+
+
 # ===========================================================================
 # Global settings console — JSON overlay + editable whitelist.
 #
@@ -334,6 +373,15 @@ SETTINGS_SCHEMA: list[dict] = [
      "help": "Model the orchestrator plans and reviews with (API backend).", "type": "str"},
     {"key": "agent_model", "group": "LLM & Models", "label": "Agent model",
      "help": "Model the specialist agents execute subtasks with (API backend).", "type": "str"},
+    {"key": "role_models", "group": "LLM & Models", "label": "Per-role models",
+     "help": "Comma-separated role=model pairs that override the model per agent role — "
+             "blank keeps the single default for every role. Route cheap roles to a cheaper "
+             "model while quality-critical roles stay on the default, e.g. "
+             "'documenter=claude-haiku-4-5,test_engineer=claude-sonnet-4-6'. 'reviewer=...' "
+             "overrides the verdict reviewer too; other roles use the agent roster names. "
+             "Works with the Claude SDK backend's model ids (haiku/sonnet/opus family) as "
+             "well as API model ids; unknown role names are ignored with a warning.",
+     "type": "str"},
     {"key": "orchestrator_effort", "group": "LLM & Models", "label": "Orchestrator effort",
      "help": "Reasoning effort for planning and review.", "type": "choice",
      "choices": _EFFORT_CHOICES},

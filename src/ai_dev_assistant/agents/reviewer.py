@@ -17,6 +17,9 @@ class Reviewer:
     def __init__(self, settings: Settings, provider: LLMProvider) -> None:
         self._settings = settings
         self._provider = provider
+        # Per-role routing: "reviewer=<model>" in role_models overrides the reviewer's
+        # model; otherwise it stays governed by orchestrator_model as before.
+        self._model = settings.role_models_map.get("reviewer") or settings.orchestrator_model
 
     async def verify(
         self,
@@ -58,7 +61,7 @@ class Reviewer:
             system=REVIEWER_SYSTEM,
             user=user,
             schema=Verdict,
-            model=self._settings.orchestrator_model,
+            model=self._model,
             effort=self._settings.reviewer_effort,
             max_tokens=2000,
         )
