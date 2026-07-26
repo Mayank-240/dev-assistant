@@ -4,11 +4,20 @@ Each entry defines a routable specialist the operator wrote themselves:
 
     {"name": "my_agent", "description": "...", "when_to_use": "...",
      "system_prompt": "...", "tools": ["read_file", ...],
-     "effort": "", "model": ""}
+     "effort": "", "model": "", "project": ""}
 
 ``effort`` and ``model`` are optional overrides; blank means "inherit the
 defaults" (``settings.agent_effort`` / ``settings.agent_model``), and the
 ``role_models`` console setting routes customs exactly like built-ins.
+
+``project`` scopes the agent: "" (the default) means global — the agent joins
+every run's roster — while a project slug limits it to runs of that project
+(``load_custom_specs`` returns globals plus the active ``settings.project``'s
+specs, so ``build_agents`` scopes naturally). The slug must name an existing
+project: save rejects unknown slugs with ``ValueError``; load skips them with
+a warning. All entries live in the single ``custom_agents.json`` file and
+names are globally unique across it (a project-scoped name may shadow neither
+built-ins nor globals nor another project's custom).
 
 The store is defensive: a missing or corrupt file yields no customs, and every
 invalid entry (bad name, collision with a built-in, unknown tool, bad effort)
@@ -42,8 +51,9 @@ class CustomSpec:
     when_to_use: str
     system_prompt: str
     tools: list[str] = field(default_factory=list)
-    effort: str = ""  # "" = inherit settings.agent_effort
-    model: str = ""   # "" = inherit settings.agent_model (role_models still wins)
+    effort: str = ""   # "" = inherit settings.agent_effort
+    model: str = ""    # "" = inherit settings.agent_model (role_models still wins)
+    project: str = ""  # "" = global; else an existing project slug this agent is scoped to
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -66,7 +76,27 @@ def _store_path(settings: Settings) -> Path:
     return Path(settings.data_dir) / CUSTOM_AGENTS_FILENAME
 
 
-def _validate(entry: object, taken: set[str], tool_names: set[str]) -> CustomSpec | str:
+def _known_project_slugs(settings: Settings, raw: list) -> set[str]:
+    """Project slugs for validating ``project`` fields.
+
+    Computed only when some entry actually carries a project scope, so the
+    common all-global path never touches the project registry (and pathless
+    settings used in tests keep working). Defensive: never raises.
+    """
+    if not any(isinstance(e, dict) and str(e.get("project") or "").strip() for e in raw):
+        return set()
+    from ..projects import list_projects  # lazy: avoid a module-load cycle
+
+    try:
+        return {str(p.get("slug", "")) for p in list_projects(settings)}
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("custom agents: cannot list projects (%s); "
+                       "project-scoped entries will be rejected", exc)
+        return set()
+
+
+def _validate(entry: object, taken: set[str], tool_names: set[str],
+              project_slugs: set[str]) -> CustomSpec | str:
     """Return a CustomSpec, or a human-readable rejection reason."""
     if not isinstance(entry, dict):
         return f"entry is not an object: {entry!r}"
@@ -93,6 +123,12 @@ def _validate(entry: object, taken: set[str], tool_names: set[str]) -> CustomSpe
     model = entry.get("model", "") or ""
     if not isinstance(model, str):
         return f"custom agent {name!r}: model must be a string"
+    project = entry.get("project", "") or ""
+    if not isinstance(project, str):
+        return f"custom agent {name!r}: project must be a string"
+    project = project.strip()
+    if project and project not in project_slugs:
+        return f"custom agent {name!r}: unknown project {project!r} (not an existing project slug)"
     return CustomSpec(
         name=name,
         description=entry["description"].strip(),
@@ -101,6 +137,7 @@ def _validate(entry: object, taken: set[str], tool_names: set[str]) -> CustomSpe
         tools=list(tools),
         effort=effort,
         model=model.strip(),
+        project=project,
     )
 
 
@@ -120,17 +157,20 @@ def _read_raw(settings: Settings) -> list:
     return data
 
 
-def load_custom_specs(settings: Settings) -> list[CustomSpec]:
-    """The valid custom agent specs from ``<data_dir>/custom_agents.json``.
+def _all_valid_specs(settings: Settings) -> list[CustomSpec]:
+    """Every valid spec in the store, regardless of project scope.
 
-    Invalid entries are skipped with a logged warning; missing/corrupt file
-    means no customs. Never raises.
+    Invalid entries (including unknown-project scopes and duplicate names —
+    names are globally unique across the file) are skipped with a logged
+    warning; missing/corrupt file means no customs. Never raises.
     """
+    raw = _read_raw(settings)
     tool_names = toolbox_tool_names()
+    project_slugs = _known_project_slugs(settings, raw)
     taken = set(_builtin_names())
     specs: list[CustomSpec] = []
-    for entry in _read_raw(settings):
-        result = _validate(entry, taken, tool_names)
+    for entry in raw:
+        result = _validate(entry, taken, tool_names, project_slugs)
         if isinstance(result, str):
             logger.warning("custom agents: skipping entry — %s", result)
             continue
@@ -139,9 +179,28 @@ def load_custom_specs(settings: Settings) -> list[CustomSpec]:
     return specs
 
 
-def list_custom_agents(settings: Settings) -> list[CustomSpec]:
-    """Alias of load_custom_specs, named for the management (server/UI) surface."""
-    return load_custom_specs(settings)
+def load_custom_specs(settings: Settings) -> list[CustomSpec]:
+    """The custom specs in scope for the active project: globals ("") plus
+    those whose ``project`` equals ``settings.project`` — so ``build_agents``
+    composes exactly the roster the current run should see. Never raises.
+    """
+    return [s for s in _all_valid_specs(settings)
+            if s.project in ("", settings.project)]
+
+
+def list_custom_agents(settings: Settings, project: str | None = None) -> list[CustomSpec]:
+    """The management (server/UI) listing, unscoped by default.
+
+    ``project`` filters the listing: ``None`` (default) returns ALL specs from
+    every scope; ``""`` returns only globals; a slug returns only that
+    project's own specs — deliberately NOT including globals, so the UI can
+    show exactly what a project defines (use ``load_custom_specs`` for the
+    effective roster of a run).
+    """
+    specs = _all_valid_specs(settings)
+    if project is None:
+        return specs
+    return [s for s in specs if s.project == project]
 
 
 def save_custom_agent(settings: Settings, spec: CustomSpec | dict) -> CustomSpec:
@@ -149,8 +208,10 @@ def save_custom_agent(settings: Settings, spec: CustomSpec | dict) -> CustomSpec
     entry = spec.to_dict() if isinstance(spec, CustomSpec) else dict(spec)
     name = str(entry.get("name", "")).strip().lower()
     # Validate against built-ins only: overwriting an existing custom of the same
-    # name is an update, not a collision.
-    result = _validate(entry, _builtin_names(), toolbox_tool_names())
+    # name is an update, not a collision (upsert is keyed on the name alone,
+    # which is what keeps names globally unique across the file).
+    result = _validate(entry, _builtin_names(), toolbox_tool_names(),
+                       _known_project_slugs(settings, [entry]))
     if isinstance(result, str):
         raise ValueError(result)
     raw = [e for e in _read_raw(settings)
