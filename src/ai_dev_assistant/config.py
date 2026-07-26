@@ -174,6 +174,10 @@ class Settings:
     # --- Scoping: memory can be global or per-project; the knowledge graph is per-project only.
     project: str = "default"          # active project slug
     memory_scope: str = "project"     # where new memories are written: "project" | "global"
+    # Sibling recall: when the active project belongs to a workspace, runs may also pull
+    # memories/KB hits from sibling projects (read-only, attributed). Strictly conditional —
+    # a project outside any workspace assembles context exactly as before.
+    workspace_context: bool = True
     # Sandbox for agent file-writes (the Claude SDK's built-in tools run here, not in the
     # project source tree).
     workspace_dir: Path = Path("workspace")
@@ -252,6 +256,7 @@ class Settings:
             docs_dir=Path(_get("ADA_DOCS_DIR", "docs")),
             project=_get("ADA_PROJECT", "default"),
             memory_scope=_get("ADA_MEMORY_SCOPE", "project"),
+            workspace_context=_bool("ADA_WORKSPACE_CONTEXT", True),
             workspace_dir=Path(_get("ADA_WORKSPACE_DIR", "workspace")),
         )
         return apply_overrides(s) if overlay else s
@@ -475,6 +480,11 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "memory_scope", "group": "Memory & Knowledge", "label": "Memory scope",
      "help": "Where new memories are written — recall always reads project + global.",
      "type": "choice", "choices": ["project", "global"]},
+    {"key": "workspace_context", "group": "Memory & Knowledge", "label": "Workspace context",
+     "help": "Sibling recall only when the project is in a workspace: runs also pull "
+             "relevant memories and knowledge-base hits from sibling projects (read-only, "
+             "attributed per project). Projects outside any workspace are unaffected.",
+     "type": "bool"},
     {"key": "embeddings_backend", "group": "Memory & Knowledge", "label": "Embeddings backend",
      "help": "Vector backend for memory recall.", "type": "choice",
      "choices": ["fastembed", "hash"], "restart_required": True},

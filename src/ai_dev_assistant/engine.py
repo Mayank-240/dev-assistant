@@ -36,7 +36,9 @@ from .knowledge.repo_map import build_repo_map, onboard
 from .llm.factory import get_provider
 from .llm.schemas import BriefDoc, Plan, SubTask, Verdict
 from .memory.store import MemoryStore, ScopedMemory
+from .memory.store import _open_project_store as _open_sibling_store  # never-create wrapper
 from .orchestration.events import Event, status
+from .projects import slugify
 from .orchestration.message_bus import MessageBus
 from .orchestration.run_control import RunControl
 from .orchestration.run_store import RunStore
@@ -47,6 +49,7 @@ from .orchestration.trace import Tracer
 from .security.redaction import AuditLog, redact, untrusted
 from .tools.registry import ToolBox, ToolContext
 from .verification import apply_objective_gate, capture_baseline, gather_signals
+from .workspaces import get_workspace, workspace_of
 
 logger = logging.getLogger("ada.engine")
 
@@ -61,6 +64,11 @@ _MAX_REPAIRS = 2  # adaptive-replan safety cap per run
 # Engine-internal dirs inside the run workspace that must never leak into context,
 # diffs, or the reviewer's ground truth (sibling worktrees, vendored deps).
 _INTERNAL_DIRS = {".git", "__pycache__", ".ada_worktrees", ".ada_deps"}
+# Workspace-aware context (sibling recall): caps that keep the borrowed section small
+# and lower-priority than the project's own recall/KB parts.
+_SIBLING_PROJECTS_MAX = 3      # query at most this many sibling projects
+_SIBLING_ITEM_CHARS = 300      # per-item excerpt cap (matches the KB-hit excerpt size)
+_SIBLING_SECTION_CHARS = 1500  # total budget for the whole sibling section
 
 
 @dataclasses.dataclass(frozen=True)
@@ -608,6 +616,60 @@ class Engine:
             parts.append(fb)
         return "\n".join(parts)
 
+    def _workspace_sibling_context(self, query: str) -> tuple[str, str] | None:
+        """One extra context part borrowing memories/KB hits from workspace siblings.
+
+        Strictly conditional: unless ``settings.workspace_context`` is on AND the
+        active project belongs to a workspace with at least one sibling, this
+        returns None and the caller's parts list stays byte-identical to a
+        workspace-less run. Sibling stores are opened through the memory module's
+        never-create wrapper and used read-only, so a sibling without a memory.db
+        contributes nothing and no files are ever created on its behalf.
+        """
+        if not self.settings.workspace_context:
+            return None
+        try:
+            ws_slug = workspace_of(self.settings, self.settings.project)
+            if ws_slug is None:
+                return None
+            ws = get_workspace(self.settings, ws_slug) or {}
+            me = slugify(self.settings.project)
+            siblings = [s for s in ws.get("project_slugs", []) if s != me]
+            if not siblings:
+                return None
+        except Exception as exc:  # a broken workspaces file must not cost the run
+            logger.debug("workspace lookup skipped: %s", exc)
+            return None
+        lines: list[str] = []
+        for slug in siblings[:_SIBLING_PROJECTS_MAX]:
+            store = _open_sibling_store(self.settings, slug)
+            if store is None:  # sibling has no memory store yet — never create one
+                continue
+            try:
+                for hit in store.recall("longterm", query, top_k=2, min_score=0.15,
+                                        decay=True):
+                    lines.append(f"[{slug}] {hit.content[:_SIBLING_ITEM_CHARS]}")
+                for hit in KnowledgeBase(store.vectors).search(query, top_k=2,
+                                                               min_score=0.2):
+                    lines.append(f"[{slug}] {hit.text[:_SIBLING_ITEM_CHARS]}")
+            except Exception as exc:  # one sibling's failure is not the run's problem
+                logger.debug("sibling context from %r skipped: %s", slug, exc)
+            finally:
+                store.close()
+        body: list[str] = []
+        used = 0
+        for line in lines:  # bounded: the whole borrowed section stays small
+            item = f"- {line}"
+            if used + len(item) + 1 > _SIBLING_SECTION_CHARS:
+                break
+            body.append(item)
+            used += len(item) + 1
+        if not body:
+            return None
+        name = str(ws.get("name") or ws_slug)
+        return (f"Related knowledge from workspace '{name}'",
+                untrusted("\n".join(body), source="workspace-sibling"))
+
     def _feedback_text(self, limit: int = 5) -> str:
         """Human feedback is the highest-signal learning input — feed it to the planner (M3)."""
         try:
@@ -971,6 +1033,18 @@ class Engine:
                 if hits:
                     parts.append(("Related knowledge", untrusted(
                         "\n".join(f"- {h.text[:300]}" for h in hits), source="knowledge-base")))
+            except Exception:
+                pass
+            # Workspace-aware context: knowledge borrowed read-only from sibling
+            # projects in the same workspace, attributed per project. Appended AFTER
+            # the project's own recall/KB parts (lower priority under the budget);
+            # absent entirely — byte-identical prompts — when the project is in no
+            # workspace, has no siblings, or the setting is off.
+            try:
+                ws_part = self._workspace_sibling_context(
+                    f"{state.spec.title} {state.spec.description}")
+                if ws_part:
+                    parts.append(ws_part)
             except Exception:
                 pass
             context = assemble_context(
