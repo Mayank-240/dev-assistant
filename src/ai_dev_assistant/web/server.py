@@ -638,10 +638,11 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         return bool(cfg.webhook_url or cfg.slack_webhook_url or cfg.desktop
                     or (cfg.email_to and cfg.smtp_host))
 
-    def _send_push_payload(payload: dict[str, Any]) -> None:
-        """Web Push fan-out of one ``{title, body, tag, url}`` payload. Fire-and-forget:
-        the send runs in a thread and nothing here ever raises — a broken push service
-        must never affect the run path."""
+    def _push_send_sync(payload: dict[str, Any]) -> None:
+        """Guarded synchronous Web Push fan-out of one ``{title, body, tag, url}``
+        payload; never raises. Callers pick the execution mode: the run-event path
+        wraps it fire-and-forget, background ticks await it (deterministic — a task
+        scheduled on a loop that is about to shut down would be cancelled unrun)."""
         try:
             if app.state.push_webpush is None and not push_mod.push_available():
                 return
@@ -649,19 +650,20 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                 return
             kwargs = ({"webpush": app.state.push_webpush}
                       if app.state.push_webpush is not None else {})
+            push_mod.send_push(settings.data_dir, payload, **kwargs)
+        except Exception:  # noqa: BLE001 — belt over send_push's never-raises brace
+            pass
 
-            def _send() -> None:
-                try:
-                    push_mod.send_push(settings.data_dir, payload, **kwargs)
-                except Exception:  # noqa: BLE001 — belt over send_push's never-raises brace
-                    pass
-
+    def _send_push_payload(payload: dict[str, Any]) -> None:
+        """Fire-and-forget wrapper over ``_push_send_sync`` — a broken push service
+        must never affect the run path."""
+        try:
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
-                _send()  # no running loop (tests/teardown)
+                _push_send_sync(payload)  # no running loop (tests/teardown)
                 return
-            loop.create_task(asyncio.to_thread(_send))
+            loop.create_task(asyncio.to_thread(_push_send_sync, payload))
         except Exception:  # noqa: BLE001
             pass
 
@@ -2736,7 +2738,10 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                 cfg = _notify_config(live)
                 await asyncio.to_thread(notify.notify_spend_alert, cfg, alert,
                                         app.state.notify_transport)
-                _send_push_payload({
+                # Awaited (not fire-and-forget): this coroutine is often driven by a
+                # short-lived loop (tests, shutdown-adjacent ticks) whose pending
+                # tasks get cancelled — a scheduled push would silently never send.
+                await asyncio.to_thread(_push_send_sync, {
                     "title": f"[budget] {alert.get('percent', 0)}% of monthly cap",
                     "body": notify.format_spend_alert(alert)[:160],
                     "tag": "spend-alert", "url": "/app",
