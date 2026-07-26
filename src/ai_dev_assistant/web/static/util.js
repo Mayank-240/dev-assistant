@@ -416,6 +416,8 @@
       score: v.score != null ? v.score : null,
       reasons: Array.isArray(v.reasons) ? v.reasons : [],
       suggestions: Array.isArray(v.suggestions) ? v.suggestions : [],
+      // Objective gate note ("static checks: ruff +3 …", test-delta demotions).
+      objectiveNote: String(v.objective_note || s.objective_note || ""),
       criteria,
       changed: Array.isArray(s.changed) ? s.changed : [],
       attempts: s.attempts != null ? s.attempts : null,
@@ -1213,7 +1215,8 @@
   }
 
   // ---- Notification center (session-scope, client-side) ----
-  const _NOTIF_ICON = { ask: "?", permission: "⚠", done: "✓", error: "✗", start: "▶" };
+  const _NOTIF_ICON = { ask: "?", permission: "⚠", done: "✓", error: "✗", start: "▶",
+                        spend_alert: "⚠" };
   // items: [{id, ts (s), kind, text, taskId, read}] -> newest-first rows + badge.
   function notifCenterModel(items, now) {
     const rows = (Array.isArray(items) ? items : []).slice()
@@ -2025,6 +2028,156 @@
     return pts;
   }
 
+  // ============================================================
+  // Mega-wave final UI — pure models: Web Push (settings card +
+  // home hint), maintenance-mode policy editor, backups list.
+  // ============================================================
+
+  // VAPID applicationServerKey: base64url string -> Uint8Array (the shape
+  // pushManager.subscribe requires). atob in the browser, Buffer under Node.
+  function urlBase64ToUint8Array(s) {
+    const b64 = String(s || "").replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const raw = typeof atob === "function"
+      ? atob(padded)
+      : Buffer.from(padded, "base64").toString("binary");
+    const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+
+  // GET /api/push/status body (+ whether THIS device holds a subscription)
+  // -> the Push notifications card model.
+  function pushStatusModel(status, subscribed) {
+    status = status || {};
+    const available = !!status.available;
+    const n = Number(status.subscriptions) || 0;
+    return {
+      available,
+      reason: available ? "" : String(status.reason || "Web Push is not available on this server."),
+      publicKey: String(status.public_key || ""),
+      subscribed: !!subscribed,
+      countLabel: n + " subscribed device" + (n === 1 ? "" : "s"),
+      canTest: available && n > 0,
+      buttonLabel: subscribed ? "Disable on this device" : "Enable on this device",
+    };
+  }
+
+  // POST /api/push/test result {sent, failed, gone} -> one status line.
+  function pushTestResultLine(res) {
+    res = res || {};
+    const n = k => Number(res[k]) || 0;
+    return "sent " + n("sent") + " · failed " + n("failed") + " · gone " + n("gone");
+  }
+
+  // Home "get these on your phone" hint: show only while the decision is still
+  // open — permission undecided, server can push, this device not subscribed,
+  // and the user hasn't dismissed it (localStorage).
+  function pushHintModel(o) {
+    o = o || {};
+    return {
+      show: o.permission === "default" && !!o.available && !o.subscribed && !o.dismissed,
+      text: "Get these on your phone — enable push in Settings",
+    };
+  }
+
+  // Maintenance task ids (mirrors maintenance.MAINTENANCE_TASKS) + display copy.
+  const MAINTENANCE_TASKS = [
+    { id: "dependency-refresh", label: "Dependency refresh",
+      desc: "bump safe patch/minor versions and prove the tests still pass" },
+    { id: "security-audit", label: "Security audit",
+      desc: "scan dependencies and code for known-vulnerable patterns" },
+    { id: "doc-drift", label: "Doc drift",
+      desc: "spot README/docs claims the code no longer backs and fix them" },
+    { id: "dead-code", label: "Dead code",
+      desc: "remove provably unreferenced code, keeping the suite green" },
+  ];
+
+  const MAINT_CADENCE_HINT =
+    "hours (e.g. 24) or 5-field cron — " + CRON_HINT.replace(/ — e\.g\..*$/, "") + ", e.g. 0 6 * * 1";
+
+  // GET /api/projects/{slug}/maintenance policy -> editor form model.
+  function maintenancePolicyModel(policy, now) {
+    policy = policy || {};
+    const chosen = (Array.isArray(policy.tasks) ? policy.tasks : []).map(String);
+    const budget = Number(policy.budget_usd) || 0;
+    const last = policy.last_run_at != null && isFinite(Number(policy.last_run_at))
+      ? Number(policy.last_run_at) : null;
+    return {
+      enabled: !!policy.enabled,
+      cadence: policy.cadence == null ? "" : String(policy.cadence),
+      cadenceHint: MAINT_CADENCE_HINT,
+      budgetValue: budget > 0 ? String(budget) : "",
+      tasks: MAINTENANCE_TASKS.map(t => ({ ...t, checked: chosen.includes(t.id) })),
+      lastRunLabel: last != null
+        ? "Last maintenance run started " + fmtRelTime(last, now)
+        : "No maintenance run yet.",
+    };
+  }
+
+  // Editor form values -> {ok, errors, payload} for PUT .../maintenance.
+  // The cadence input takes either a number of hours or a 5-field cron line.
+  function maintenancePayload(f) {
+    f = f || {};
+    const errors = [];
+    const enabled = !!f.enabled;
+    let cadence = null;
+    const raw = String(f.cadence == null ? "" : f.cadence).trim().replace(/\s+/g, " ");
+    if (raw) {
+      if (/^\d+(\.\d+)?$/.test(raw)) {
+        cadence = parseFloat(raw);
+        if (!(cadence > 0)) errors.push("cadence hours must be > 0");
+      } else if (raw.split(" ").length === 5) {
+        cadence = raw;
+      } else {
+        errors.push("cadence must be " + MAINT_CADENCE_HINT);
+      }
+    } else if (enabled) {
+      errors.push("enabled maintenance needs a cadence — " + MAINT_CADENCE_HINT);
+    }
+    let budget = 0;
+    const braw = String(f.budget == null ? "" : f.budget).trim();
+    if (braw) {
+      budget = Number(braw);
+      if (!isFinite(budget) || budget < 0) { errors.push("budget must be a number ≥ 0"); budget = 0; }
+    }
+    const tasks = (Array.isArray(f.tasks) ? f.tasks : []).map(String);
+    if (enabled && !tasks.length) errors.push("select at least one maintenance task");
+    return {
+      ok: !errors.length, errors,
+      payload: { enabled, cadence, budget_usd: budget, tasks },
+    };
+  }
+
+  // Archive sizes: bytes -> the closest sane unit (backups reach GB; the
+  // 2-unit fmtSize used for file trees stops at KB).
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + " MB";
+    return (n / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+  }
+
+  // GET /api/backups rows [{path, size, created}] -> list model, newest first.
+  function backupsModel(list) {
+    const rows = (Array.isArray(list) ? list : []).map(b => {
+      b = b || {};
+      const path = String(b.path || "");
+      const created = String(b.created || "");
+      return {
+        path,
+        name: path.split("/").pop() || path,
+        sizeLabel: fmtBytes(b.size),
+        created,
+        dateLabel: created ? created.slice(0, 16).replace("T", " ") + " UTC" : "—",
+        href: "/api/backup/download?path=" + encodeURIComponent(path),
+      };
+    });
+    rows.sort((a, b) => (a.created < b.created ? 1 : a.created > b.created ? -1 : 0));
+    return { rows, empty: !rows.length };
+  }
+
   const AdaUtil = {
     escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine,
     fmtRelTime, paletteResultsModel, scheduleRowModel, scheduleFormModel,
@@ -2053,6 +2206,9 @@
     benchModel, distillReportModel, distillResultModel,
     userChipModel, usersListModel, userCreateModel,
     wsRecentTasksModel, agentToolsModel, backendLabel, seedLayout,
+    urlBase64ToUint8Array, pushStatusModel, pushTestResultLine, pushHintModel,
+    MAINTENANCE_TASKS, maintenancePolicyModel, maintenancePayload,
+    fmtBytes, backupsModel,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = AdaUtil;

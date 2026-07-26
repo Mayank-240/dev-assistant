@@ -8,6 +8,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="manifest" href="/static/manifest.webmanifest" />
+  <meta name="theme-color" content="#16130f" />
   <script>
     /* set theme before first paint to avoid flash */
     (function () {
@@ -428,6 +430,29 @@
                 <p id="gc-error" class="pm-error hidden" role="alert"></p>
               </div>
 
+              <!-- Maintenance mode: unattended upkeep playbooks on a cadence -->
+              <div class="card settings-card" id="maint-card">
+                <h3 class="section-label">Maintenance mode</h3>
+                <p class="muted">Autonomous upkeep — runs selected playbooks on a cadence; work appears as normal tasks and only delivers when something needed fixing.</p>
+                <div class="ph-policy">
+                  <label class="maint-enabled-row" for="maint-enabled">
+                    <input id="maint-enabled" type="checkbox" /> Enabled
+                  </label>
+                  <label class="pm-label" for="maint-cadence">Cadence</label>
+                  <input id="maint-cadence" class="title-input" type="text"
+                         placeholder="24  ·  0 6 * * 1" />
+                  <p id="maint-cadence-hint" class="hint"></p>
+                  <label class="pm-label" for="maint-budget">Budget $ per maintenance run</label>
+                  <input id="maint-budget" class="title-input" type="number" min="0" step="0.5" placeholder="no cap" />
+                  <div id="maint-tasks" class="maint-tasks"></div>
+                  <p id="maint-last" class="muted maint-last"></p>
+                  <p id="maint-error" class="pm-error hidden" role="alert"></p>
+                  <div class="pe-actions">
+                    <button id="maint-save" class="btn-primary" type="button">Save maintenance</button>
+                  </div>
+                </div>
+              </div>
+
               <div class="card settings-card danger-card">
                 <h3 class="section-label">Archive &amp; delete</h3>
                 <p class="muted">Archiving hides the project from composers; deleting removes its data directory and checkout.</p>
@@ -613,6 +638,11 @@
 
             <section id="home-attn" class="home-attn card" aria-label="Needs you">
               <div id="home-attn-head" class="home-attn-head">Needs you</div>
+              <p id="home-push-hint" class="hint home-push-hint hidden">
+                Get these on your phone —
+                <button type="button" id="home-push-link" class="link-btn">enable push in Settings</button>
+                <button type="button" id="home-push-dismiss" class="link-btn home-push-dismiss" aria-label="Dismiss push hint">✕</button>
+              </p>
               <div id="home-attn-list" class="attn-list"><p class="muted home-quiet">Nothing needs you.</p></div>
             </section>
 
@@ -924,6 +954,18 @@
             </div>
             <div class="card gs-info" id="gs-info" aria-label="Read-only environment info"></div>
             <div id="gs-groups" class="gs-groups"><p class="muted">Loading…</p></div>
+            <div class="card gs-card" id="push-card">
+              <h3 class="section-label">Push notifications</h3>
+              <p class="muted">Task events — questions, permission asks, finishes, budget alerts — delivered to this device even with the console closed.</p>
+              <div id="push-status" class="push-status muted">Checking…</div>
+              <div class="pe-actions">
+                <button id="push-enable" class="btn-primary" type="button" disabled>Enable on this device</button>
+                <button id="push-test" class="ghost-btn" type="button" disabled
+                        title="Send a test notification to every subscribed device">Send test notification</button>
+              </div>
+              <p id="push-result" class="hint hidden" role="status" aria-live="polite"></p>
+              <p id="push-error" class="pm-error hidden" role="alert"></p>
+            </div>
             <div class="card gs-card" id="users-card">
               <h3 class="section-label">Users — named sign-ins for this server</h3>
               <p class="muted users-note">Each user signs in with a personal token, shown once at creation. Managing users is owner-only.</p>
@@ -935,6 +977,16 @@
               </div>
               <div id="user-token-box" class="user-token-box hidden" role="status" aria-live="polite"></div>
               <p id="users-error" class="pm-error hidden" role="alert"></p>
+            </div>
+            <div class="card gs-card" id="backup-card">
+              <h3 class="section-label">Backups</h3>
+              <p class="muted">Snapshot the whole data directory — projects, runs, memory, settings — into <code>backups/</code> inside the data dir.</p>
+              <div class="pe-actions">
+                <button id="backup-create" class="btn-primary" type="button">Create backup</button>
+              </div>
+              <div id="backup-list" class="backup-list"><p class="muted">Loading…</p></div>
+              <p class="muted">Restore is CLI-only: <code>ada backup restore &lt;archive&gt;</code> (stop the server first).</p>
+              <p id="backup-error" class="pm-error hidden" role="alert"></p>
             </div>
           </div>
 

@@ -25,6 +25,8 @@ const {
   benchModel, distillReportModel, distillResultModel,
   userChipModel, usersListModel, userCreateModel,
   wsRecentTasksModel, agentToolsModel, backendLabel, seedLayout,
+  urlBase64ToUint8Array, pushStatusModel, pushTestResultLine, pushHintModel,
+  maintenancePolicyModel, maintenancePayload, backupsModel,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -2116,6 +2118,7 @@ async function loadHome() {
     return;
   }
   renderHome(homeModel(data));
+  maybeShowPushHint();   // "get these on your phone" one-liner in the attention card
 }
 
 function _homeTaskLi(r, onOpen) {
@@ -2135,6 +2138,40 @@ function _homeTaskLi(r, onOpen) {
     proj + extra + `</div>`;
   makeActivatable(li, onOpen, `Open task ${r.title}`);
   return li;
+}
+
+// Home push hint — one dismissible line inside the "Needs you" card, shown only
+// while enabling push is still a meaningful choice on this device.
+const PUSH_HINT_KEY = "ada-push-hint-dismissed";
+let _pushHintStatus;   // cached /api/push/status promise (availability rarely changes)
+
+async function maybeShowPushHint() {
+  const el = $("home-push-hint");
+  if (!el) return;
+  const dismissed = !!localStorage.getItem(PUSH_HINT_KEY);
+  if (!_pushSupported() || dismissed || Notification.permission !== "default") {
+    el.classList.add("hidden");
+    return;
+  }
+  if (!_pushHintStatus) {
+    _pushHintStatus = fetch("/api/push/status")
+      .then(r => (r.ok ? r.json() : null))
+      .catch(() => null);
+  }
+  const status = await _pushHintStatus;
+  const sub = await _pushSubscription();
+  const m = pushHintModel({
+    permission: Notification.permission,
+    available: !!(status && status.available),
+    subscribed: !!sub,
+    dismissed: !!localStorage.getItem(PUSH_HINT_KEY),
+  });
+  el.classList.toggle("hidden", !m.show);
+}
+
+function dismissPushHint() {
+  try { localStorage.setItem(PUSH_HINT_KEY, "1"); } catch (e) { /* private mode */ }
+  $("home-push-hint").classList.add("hidden");
 }
 
 function renderHome(m) {
@@ -2573,6 +2610,175 @@ async function loadGlobalSettings() {
   renderGlobalSettings(settingsGroupsModel(data));
   loadGithubStatus();   // status line above the GitHub group's fields
   loadUsers();          // named sign-ins admin card (owner-gated)
+  loadPushCard();       // Web Push subscription card
+  loadBackups();        // data-dir backup archives card
+}
+
+// ---- Web Push: settings card (status + subscribe/unsubscribe + test send) ----
+let _pushStatus = null;   // last GET /api/push/status body (holds the VAPID key)
+
+function _pushSupported() {
+  return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+
+// This device's subscription, if any (null when unsupported/none).
+async function _pushSubscription() {
+  if (!_pushSupported()) return null;
+  try {
+    const reg = await navigator.serviceWorker.getRegistration("/static/sw.js");
+    return reg ? await reg.pushManager.getSubscription() : null;
+  } catch (e) { return null; }
+}
+
+async function loadPushCard() {
+  const box = $("push-status");
+  if (!box) return;
+  let status = null;
+  try {
+    const resp = await fetch("/api/push/status");
+    if (resp.ok) status = await resp.json();
+  } catch (e) { /* fall through */ }
+  if (!status) { box.textContent = "Could not load push status."; return; }
+  _pushStatus = status;
+  const sub = await _pushSubscription();
+  renderPushCard(pushStatusModel(status, !!sub));
+}
+
+function renderPushCard(m) {
+  const box = $("push-status");
+  const enable = $("push-enable"), test = $("push-test");
+  $("push-error").classList.add("hidden");
+  if (!m.available) {
+    box.textContent = m.reason;
+    enable.disabled = true; test.disabled = true;
+    return;
+  }
+  if (!_pushSupported()) {
+    box.textContent = m.countLabel + " · this browser does not support Web Push";
+    enable.disabled = true; test.disabled = !m.canTest;
+    return;
+  }
+  box.textContent = m.countLabel + (m.subscribed ? " · this device is subscribed" : "");
+  enable.disabled = false;
+  enable.textContent = m.buttonLabel;
+  enable.dataset.mode = m.subscribed ? "disable" : "enable";
+  test.disabled = !m.canTest;
+}
+
+function _pushError(msg) {
+  const el = $("push-error");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+
+// Registration must be ACTIVE before pushManager.subscribe.
+function _awaitActive(reg) {
+  return new Promise((resolve) => {
+    if (reg.active) return resolve();
+    const w = reg.installing || reg.waiting;
+    if (!w) return resolve();
+    w.addEventListener("statechange", () => { if (w.state === "activated") resolve(); });
+  });
+}
+
+async function enablePush() {
+  $("push-error").classList.add("hidden");
+  if (!(_pushStatus && _pushStatus.public_key)) { _pushError("No VAPID key from the server."); return; }
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== "granted") { _pushError("Notifications were not allowed by the browser."); return; }
+    const reg = await navigator.serviceWorker.register("/static/sw.js");
+    await _awaitActive(reg);
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(_pushStatus.public_key),
+    });
+    const resp = await fetch("/api/push/subscribe", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subscription: sub.toJSON(), ua: navigator.userAgent }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok || body.error) { _pushError(body.error || ("HTTP " + resp.status)); return; }
+    showToast("Push enabled on this device", "success");
+    maybeShowPushHint();   // the home hint is now moot
+  } catch (e) {
+    _pushError("Subscribe failed: " + e);
+  }
+  loadPushCard();
+}
+
+async function disablePush() {
+  $("push-error").classList.add("hidden");
+  try {
+    const sub = await _pushSubscription();
+    if (sub) {
+      const endpoint = sub.endpoint;
+      await sub.unsubscribe();
+      await fetch("/api/push/subscribe", {
+        method: "DELETE", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ endpoint }),
+      });
+    }
+  } catch (e) { _pushError("Unsubscribe failed: " + e); }
+  loadPushCard();
+}
+
+async function sendPushTest() {
+  const out = $("push-result");
+  out.classList.add("hidden");
+  $("push-error").classList.add("hidden");
+  let resp, body = {};
+  try {
+    resp = await fetch("/api/push/test", { method: "POST" });
+    body = await resp.json().catch(() => ({}));
+  } catch (e) { _pushError("Test send failed: " + e); return; }
+  if (!resp.ok || body.error) { _pushError(body.error || ("HTTP " + resp.status)); return; }
+  out.textContent = "Test notification — " + pushTestResultLine(body);
+  out.classList.remove("hidden");
+  if (body.gone) loadPushCard();   // stale subscriptions were pruned server-side
+}
+
+// ---- Backups: global-settings card (list + create; restore is CLI-only) ----
+async function loadBackups() {
+  const box = $("backup-list");
+  if (!box) return;
+  let rows = null;
+  try {
+    const resp = await fetch("/api/backups");
+    if (resp.ok) rows = await resp.json();
+  } catch (e) { /* fall through */ }
+  if (!Array.isArray(rows)) { box.innerHTML = '<p class="muted">Could not load backups.</p>'; return; }
+  const m = backupsModel(rows);
+  if (m.empty) { box.innerHTML = '<p class="muted">No backups yet.</p>'; return; }
+  box.innerHTML = m.rows.map(r =>
+    `<div class="backup-row">` +
+    `<a class="backup-name" href="${escapeAttr(r.href)}" download title="Download ${escapeAttr(r.name)}">${escapeHtml(r.name)}</a>` +
+    `<span class="backup-meta">${escapeHtml(r.sizeLabel)} · ${escapeHtml(r.dateLabel)}</span>` +
+    `</div>`).join("");
+}
+
+async function createBackup() {
+  const btn = $("backup-create");
+  const err = $("backup-error");
+  err.classList.add("hidden");
+  btn.disabled = true;
+  btn.textContent = "Archiving…";
+  let resp, body = {};
+  try {
+    resp = await fetch("/api/backup", { method: "POST" });
+    body = await resp.json().catch(() => ({}));
+  } catch (e) {
+    body = { error: "request failed: " + e };
+  }
+  btn.disabled = false;
+  btn.textContent = "Create backup";
+  if (!resp || !resp.ok || body.error) {
+    err.textContent = body.error || (resp ? "HTTP " + resp.status : "request failed");
+    err.classList.remove("hidden");
+    return;
+  }
+  showToast("Backup created", "success");
+  loadBackups();
 }
 
 function gsControlHtml(f) {
@@ -2758,7 +2964,79 @@ async function loadSettingsPanel() {
   renderSettingsPolicy(entry);
   renderSettingsDanger(entry);
   loadGcReport();        // QoL: workspace-cleanup card
+  loadMaintenanceCard(); // maintenance-mode policy card
   loadProjectStatus();   // fills the repository card + header chips
+}
+
+// ---- Maintenance mode: per-project policy card (Settings tab) ----
+async function loadMaintenanceCard() {
+  const slug = selectedProject();
+  if (!slug || slug === "multi") return;
+  const card = $("maint-card");
+  if (!card) return;
+  let resp, pol = null;
+  try {
+    resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/maintenance");
+    pol = await resp.json().catch(() => null);
+  } catch (e) { /* fall through */ }
+  if (resp && (resp.status === 404 || resp.status === 501)) { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  const err = $("maint-error");
+  if (!resp || !resp.ok || !pol || pol.error) {
+    err.textContent = (pol && pol.error) || (resp ? "HTTP " + resp.status : "Could not reach the server.");
+    err.classList.remove("hidden");
+    return;
+  }
+  renderMaintenance(maintenancePolicyModel(pol, Date.now() / 1000));
+}
+
+function renderMaintenance(m) {
+  $("maint-enabled").checked = m.enabled;
+  $("maint-cadence").value = m.cadence;
+  $("maint-cadence-hint").textContent = m.cadenceHint;
+  $("maint-budget").value = m.budgetValue;
+  $("maint-tasks").innerHTML = m.tasks.map(t =>
+    `<label class="maint-task">` +
+    `<input type="checkbox" class="maint-task-cb" value="${escapeAttr(t.id)}"${t.checked ? " checked" : ""} />` +
+    `<span class="maint-task-name">${escapeHtml(t.label)}</span>` +
+    `<span class="muted maint-task-desc">${escapeHtml(t.desc)}</span></label>`).join("");
+  $("maint-last").textContent = m.lastRunLabel;
+  $("maint-error").classList.add("hidden");
+}
+
+async function saveMaintenance() {
+  const slug = selectedProject();
+  if (!slug || slug === "multi") return;
+  const err = $("maint-error");
+  err.classList.add("hidden");
+  const m = maintenancePayload({
+    enabled: $("maint-enabled").checked,
+    cadence: $("maint-cadence").value,
+    budget: $("maint-budget").value,
+    tasks: [...document.querySelectorAll("#maint-tasks .maint-task-cb:checked")].map(cb => cb.value),
+  });
+  if (!m.ok) {
+    err.textContent = m.errors.join(" · ");
+    err.classList.remove("hidden");
+    return;
+  }
+  let resp, body = {};
+  try {
+    resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/maintenance", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(m.payload),
+    });
+    body = await resp.json().catch(() => ({}));
+  } catch (e) {
+    body = { error: "request failed: " + e };
+  }
+  if (!resp || !resp.ok || body.error) {   // 400s carry the server's field-naming message
+    err.textContent = body.error || (resp ? "HTTP " + resp.status : "request failed");
+    err.classList.remove("hidden");
+    return;
+  }
+  showToast("Maintenance policy saved", "success");
+  renderMaintenance(maintenancePolicyModel(body, Date.now() / 1000));
 }
 
 // ---- QoL: workspace GC (Settings tab) — dry-run report + explicit cleanup ----
@@ -3099,6 +3377,10 @@ function reviewCardHtml(s) {
         `${c.met === true ? "✓ " : c.met === false ? "✗ " : "· "}${escapeHtml(c.name)}</li>`).join("") + `</ul>` : "";
   const reasons = m.reasons.length
     ? `<ul class="rc-reasons">` + m.reasons.map(r => `<li>${escapeHtml(r)}</li>`).join("") + `</ul>` : "";
+  // Objective gate note (test deltas, "static checks: ruff +3 …") — kept
+  // separate from the reviewer's prose reasons.
+  const objective = m.objectiveNote
+    ? `<p class="rc-objective">${escapeHtml(m.objectiveNote)}</p>` : "";
   const suggestions = m.suggestions.length
     ? `<div class="rc-suggestions"><span class="kicker">Suggestions</span><ul>` +
       m.suggestions.map(r => `<li>${escapeHtml(r)}</li>`).join("") + `</ul></div>` : "";
@@ -3113,7 +3395,7 @@ function reviewCardHtml(s) {
     (m.agent ? `<span class="ac-agent"><span class="ac-dot" style="background:${agentStyle(m.agent).color}"></span>${escapeHtml(m.agent)}</span>` : "") +
     `<span class="pill ${badgeCls}">${escapeHtml(m.badge)}</span>${score}${attempts}${decision}</div>` +
     (m.title ? `<div class="rc-title">${escapeHtml(m.title)}</div>` : "") +
-    criteria + reasons + suggestions +
+    criteria + reasons + objective + suggestions +
     `<span class="kicker">Changed files</span>` + changed + diff +
     `<div class="rc-actions">` +
     `<button type="button" class="rc-accept ghost-btn" data-sid="${escapeAttr(m.id)}"${m.canAccept ? "" : " disabled"} ` +
@@ -5426,6 +5708,14 @@ const _gcKeepInput = () => {   // blank input -> undefined -> the server's defau
 $("gc-refresh").onclick = () => loadGcReport(_gcKeepInput());
 $("gc-keep").addEventListener("change", () => loadGcReport(_gcKeepInput()));
 $("gc-clean").onclick = runGcCleanup;
+// mega-wave: push card, backups, maintenance mode, home push hint
+$("push-enable").onclick = () =>
+  ($("push-enable").dataset.mode === "disable" ? disablePush() : enablePush());
+$("push-test").onclick = sendPushTest;
+$("backup-create").onclick = createBackup;
+$("maint-save").onclick = saveMaintenance;
+$("home-push-link").onclick = () => showGlobalSettings();
+$("home-push-dismiss").onclick = dismissPushHint;
 // QoL: memory-curation "Load more" paging
 $("memc-more").onclick = () => loadMemoryCuration(false);
 $("ab-run").onclick = runAB;
@@ -5455,6 +5745,18 @@ document.querySelectorAll("#fb-stars button").forEach(b => b.onclick = () => {
 function bootApp() {
   if (_appBooted) return;
   _appBooted = true;
+  // PWA: register the push service worker. Scope caveat: /static/sw.js gets the
+  // default "/static/" scope, and widening it to "/" would need a
+  // Service-Worker-Allowed header we don't serve — deliberately left alone,
+  // because the worker only handles push/notificationclick events (no fetch
+  // handler), so page control scope is irrelevant. Registering from /app works
+  // fine: the script URL is same-origin and scope only limits page control.
+  if ("serviceWorker" in navigator) {
+    try {
+      navigator.serviceWorker.register("/static/sw.js")
+        .catch(() => { /* push simply stays unavailable */ });
+    } catch (e) { /* never let PWA plumbing break boot */ }
+  }
   loadConfig();
   loadProjects().then(() => {
     // Home-first landing: the console's entry screen aggregates attention items,

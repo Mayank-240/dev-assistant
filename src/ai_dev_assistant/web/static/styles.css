@@ -1495,3 +1495,24 @@ button.ac-tools-toggle:hover { color:var(--text); border-color:var(--border); }
 .wsl-member { display:flex; align-items:center; gap:8px; padding:7px 4px; font-size:13.5px; cursor:pointer; border-top:1px solid var(--line-soft, rgba(128,128,128,.25)); }
 .wsl-member:hover { color:var(--red); }
 .wsl-dot { color:var(--red); font-size:11px; }
+
+/* ---- mega-wave final UI: push card, backups, maintenance mode, home hint ---- */
+.push-status { font-size:12.5px; margin-top:10px; }
+.backup-list { display:flex; flex-direction:column; margin-top:12px; }
+.backup-row { display:flex; align-items:baseline; gap:12px; padding:7px 2px;
+  border-bottom:1px solid var(--border-soft); }
+.backup-name { font-family:var(--mono); font-size:11.5px; color:var(--text); text-decoration:none; }
+.backup-name:hover { color:var(--accent); }
+.backup-meta { margin-left:auto; font-size:11px; color:var(--muted); white-space:nowrap; }
+.maint-enabled-row { display:flex; align-items:center; gap:8px; font-size:12.5px;
+  font-weight:700; cursor:pointer; }
+.maint-tasks { display:flex; flex-direction:column; margin-top:12px; }
+.maint-task { display:flex; align-items:baseline; gap:10px; padding:7px 2px; font-size:12.5px;
+  cursor:pointer; border-top:1px solid var(--border-soft); }
+.maint-task-name { font-weight:700; white-space:nowrap; }
+.maint-task-desc { font-size:11.5px; }
+.maint-last { margin-top:10px; font-size:11.5px; }
+.rc-objective { margin:8px 0 0; font-family:var(--mono); font-size:11px; color:var(--text-2);
+  border-left:2px solid var(--border-soft); padding-left:10px; }
+.home-push-hint { display:flex; align-items:baseline; gap:6px; margin:10px 0 0; }
+.home-push-dismiss { margin-left:auto; }
