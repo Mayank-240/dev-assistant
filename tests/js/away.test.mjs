@@ -8,7 +8,7 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 const {
-  homeModel, sidebarGroups, wsDepsModel, wsRunPayload,
+  homeModel, sidebarGroups, workspacesViewModel, wsDepsModel, wsRunPayload,
   graph2ViewModel, nodePanelModel,
   agentsListModel, agentFormModel, agentFormValidate,
 } = require("../../src/ai_dev_assistant/web/static/util.js");
@@ -291,4 +291,19 @@ test("agentFormValidate: rejects bad name, empty fields, unknown tools and bad e
   const noTools = agentFormValidate({ name: "ok", description: "d", when_to_use: "w",
                                       system_prompt: "s", tools: [] }, ["read_file"]);
   assert.ok(noTools.errors.some(e => /at least one tool/.test(e)));
+});
+
+test("workspacesViewModel resolves members and ungrouped", () => {
+  const ws = [{ slug: "upskill", name: "Upskill", description: "learn", project_slugs: ["a", "ghost"] }];
+  const projects = [{ slug: "a", name: "Alpha" }, { slug: "b", name: "Beta" }];
+  const m = workspacesViewModel(ws, projects);
+  assert.equal(m.workspaces.length, 1);
+  assert.deepEqual(m.workspaces[0].members, [{ slug: "a", name: "Alpha" }]);
+  assert.equal(m.workspaces[0].countLabel, "1 project");
+  assert.deepEqual(m.ungrouped, [{ slug: "b", name: "Beta" }]);
+});
+
+test("workspacesViewModel empty and null-safe", () => {
+  const m = workspacesViewModel(null, null);
+  assert.deepEqual(m, { workspaces: [], ungrouped: [] });
 });

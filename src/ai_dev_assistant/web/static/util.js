@@ -1536,6 +1536,28 @@
     return { groups, ungrouped };
   }
 
+  // Workspaces tab: /api/workspaces entries + /api/projects list -> cards with
+  // resolved member projects (registry order) and the leftover ungrouped list.
+  function workspacesViewModel(workspaces, projects) {
+    const visible = visibleProjects(projects || []);
+    const bySlug = {};
+    visible.forEach(p => { bySlug[p.slug] = p; });
+    const grouped = new Set();
+    const cards = (Array.isArray(workspaces) ? workspaces : []).map(w => {
+      const members = (w.project_slugs || []).filter(s => bySlug[s]).map(s => {
+        grouped.add(s);
+        return { slug: s, name: bySlug[s].name || s };
+      });
+      return {
+        slug: w.slug, name: w.name || w.slug, description: w.description || "",
+        members, countLabel: members.length === 1 ? "1 project" : members.length + " projects",
+      };
+    });
+    const ungrouped = visible.filter(p => !grouped.has(p.slug))
+      .map(p => ({ slug: p.slug, name: p.name || p.slug }));
+    return { workspaces: cards, ungrouped };
+  }
+
   // Workspace entry {project_slugs, default_deps} -> deps-editor rows: one row
   // per member with the OTHER members as upstream options (selected = current dep).
   function wsDepsModel(entry) {
@@ -1949,7 +1971,7 @@
     renderMarkdown,
     MEMORY_CLAMP_CHARS, memoryRowModel, memoryPageModel,
     gcSummary, gcResultModel, rollbackStateModel, CRON_HINT,
-    homeModel, sidebarGroups, wsDepsModel, wsRunPayload,
+    homeModel, sidebarGroups, workspacesViewModel, wsDepsModel, wsRunPayload,
     graph2ViewModel, nodePanelModel, GRAPH2_TYPES,
     agentsListModel, agentFormModel, agentFormValidate, AGENT_EFFORTS,
     benchModel, distillReportModel, distillResultModel,

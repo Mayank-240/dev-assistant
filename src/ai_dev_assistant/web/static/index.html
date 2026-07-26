@@ -53,6 +53,10 @@
         <div class="sb-divider" aria-hidden="true"></div>
 
         <nav class="sb-global" aria-label="Global views">
+          <button type="button" id="nav-workspaces" class="sb-item">
+            <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2" y="2" width="5" height="5"/><rect x="9" y="2" width="5" height="5"/><rect x="2" y="9" width="5" height="5"/><rect x="9" y="9" width="5" height="5"/></svg>
+            Workspaces
+          </button>
           <button type="button" id="nav-agents" class="sb-item">
             <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="5.5" cy="5" r="2.4"/><path d="M1.5 13.5c0-2.2 1.8-4 4-4s4 1.8 4 4"/><circle cx="11.5" cy="5.5" r="1.9"/><path d="M11 9.6c1.9.2 3.5 1.9 3.5 3.9"/></svg>
             Agents
@@ -638,6 +642,23 @@
             <section class="card home-strip" aria-label="Recent runs">
               <h3 class="section-label">Recent runs</h3>
               <ul id="home-recent" class="task-list"><li class="muted">No finished runs yet.</li></ul>
+            </section>
+          </div>
+
+          <!-- ============ WORKSPACES LIST VIEW ============ -->
+          <div id="view-workspaces" class="view hidden">
+            <div class="view-header">
+              <h1>Workspaces</h1>
+              <p class="muted">Groups of inter-related projects — run one task across a whole group, share knowledge between members.</p>
+            </div>
+            <div id="wsl-list" class="wsl-list"></div>
+            <p id="wsl-empty" class="muted hidden">No workspaces yet — create one to group related projects.</p>
+            <div class="pe-actions">
+              <button id="wsl-new" class="btn-primary" type="button">+ New workspace</button>
+            </div>
+            <section id="wsl-ungrouped-wrap" class="hidden">
+              <h2 class="sect-title">Ungrouped projects</h2>
+              <ul id="wsl-ungrouped" class="wsl-members"></ul>
             </section>
           </div>
 

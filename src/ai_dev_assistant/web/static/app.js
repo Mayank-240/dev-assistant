@@ -19,7 +19,7 @@ const {
   notifCenterModel, playbookFormModel, tourStepsModel,
   authGate, loginFormModel, loginErrorMessage,
   memoryRowModel, memoryPageModel, gcSummary, gcResultModel, rollbackStateModel,
-  homeModel, sidebarGroups, wsDepsModel, wsRunPayload,
+  homeModel, sidebarGroups, workspacesViewModel, wsDepsModel, wsRunPayload,
   graph2ViewModel, nodePanelModel,
   agentsListModel, agentFormModel, agentFormValidate,
   benchModel, distillReportModel, distillResultModel,
@@ -715,6 +715,11 @@ function renderSidebar() {
     if (currentMainView === "agents") navAgents.setAttribute("aria-current", "page");
     else navAgents.removeAttribute("aria-current");
 
+  }
+  const navWorkspaces = $("nav-workspaces");
+  if (navWorkspaces) {
+    if (currentMainView === "workspaces") navWorkspaces.setAttribute("aria-current", "page");
+    else navWorkspaces.removeAttribute("aria-current");
   }
   const navSettings = $("nav-gsettings");
   if (navSettings) {
@@ -1980,7 +1985,7 @@ async function openTask(id, meta) {
 // ---- main views: project (tabs) · task detail · all activity · agents ·
 //      global settings console · empty ----
 const MAIN_VIEWS = {
-  home: "view-home", workspace: "view-workspace",
+  home: "view-home", workspaces: "view-workspaces", workspace: "view-workspace",
   project: "view-project", task: "view-task", activity: "view-activity",
   agents: "view-agents", gsettings: "view-gsettings", empty: "view-empty",
 };
@@ -2205,6 +2210,59 @@ function renderHome(m) {
       ws.appendChild(row);
     });
   }
+}
+
+// ============================================================
+// WORKSPACES LIST VIEW — every workspace with its member projects.
+// ============================================================
+async function showWorkspacesView() {
+  showMainView("workspaces");
+  await loadProjects();   // refreshes workspaceList + projectList
+  const model = workspacesViewModel(workspaceList, projectList);
+  const list = $("wsl-list");
+  list.innerHTML = "";
+  $("wsl-empty").classList.toggle("hidden", model.workspaces.length > 0);
+  model.workspaces.forEach(w => {
+    const card = document.createElement("section");
+    card.className = "wsl-card";
+    const head = document.createElement("div");
+    head.className = "wsl-head";
+    head.innerHTML = `<span class="ws-mark" aria-hidden="true">▦</span><h2></h2>` +
+      `<span class="muted"></span><button type="button" class="link-btn">Open →</button>`;
+    head.querySelector("h2").textContent = w.name;
+    head.querySelector(".muted").textContent = w.countLabel + (w.description ? " · " + w.description : "");
+    head.querySelector("button").onclick = () => openWorkspace(w.slug);
+    card.appendChild(head);
+    const ul = document.createElement("ul");
+    ul.className = "wsl-members";
+    if (!w.members.length) {
+      const li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = "No projects yet — open the workspace to assign some.";
+      ul.appendChild(li);
+    }
+    w.members.forEach(m => {
+      const li = document.createElement("li");
+      li.className = "wsl-member";
+      li.innerHTML = `<span class="wsl-dot" aria-hidden="true">□</span><span></span>`;
+      li.querySelector("span:last-child").textContent = m.name;
+      makeActivatable(li, () => selectProject(m.slug), `Open project ${m.name}`);
+      ul.appendChild(li);
+    });
+    card.appendChild(ul);
+    list.appendChild(card);
+  });
+  $("wsl-ungrouped-wrap").classList.toggle("hidden", !model.ungrouped.length);
+  const ug = $("wsl-ungrouped");
+  ug.innerHTML = "";
+  model.ungrouped.forEach(m => {
+    const li = document.createElement("li");
+    li.className = "wsl-member";
+    li.innerHTML = `<span class="wsl-dot" aria-hidden="true">□</span><span></span>`;
+    li.querySelector("span:last-child").textContent = m.name;
+    makeActivatable(li, () => selectProject(m.slug), `Open project ${m.name}`);
+    ug.appendChild(li);
+  });
 }
 
 // ============================================================
@@ -5154,6 +5212,8 @@ document.querySelectorAll("#know-tabs .ktab").forEach(b => b.onclick = () => sho
 $("nav-home").onclick = showHome;                   // the console's entry screen
 $("nav-activity").onclick = showActivity;
 $("nav-agents").onclick = showAgents;
+$("nav-workspaces").onclick = showWorkspacesView;
+$("wsl-new").onclick = () => { $("new-workspace").click(); };
 $("nav-gsettings").onclick = showGlobalSettings;    // global settings console
 $("gs-refresh").onclick = loadGlobalSettings;
 $("agents-refresh").onclick = () => loadAgents(true);
