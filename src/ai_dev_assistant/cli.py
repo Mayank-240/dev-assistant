@@ -51,6 +51,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_del = projsub.add_parser("delete", help="Delete a project's data (never a local-origin checkout)")
     p_del.add_argument("slug")
     p_del.add_argument("--yes", action="store_true", help="Skip confirmation")
+    p_dist = projsub.add_parser(
+        "distill", help="Consolidate the project's knowledge graph "
+                        "(merge near-duplicate concepts, prune stale edges)")
+    p_dist.add_argument("slug")
+    p_dist.add_argument("--dry-run", action="store_true",
+                        help="Report proposed actions without applying them")
 
     resumep = sub.add_parser("resume", help="Resume an interrupted run from its checkpoints")
     resumep.add_argument("task_id", help="The interrupted run's task id")
@@ -162,9 +168,53 @@ def _project(args: argparse.Namespace) -> int:
                     return 0
             projects.delete_project(settings, args.slug)
             print(f"Deleted '{args.slug}' (local-origin checkouts are never removed).")
+        elif args.pcmd == "distill":
+            return _distill(settings, args)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    return 0
+
+
+def _distill(settings: Settings, args: argparse.Namespace) -> int:
+    """`project distill <slug> [--dry-run]`: consolidate the knowledge graph."""
+    import dataclasses
+
+    from . import projects
+    from .knowledge.distill import distill, distill_report
+    from .knowledge.graph import NetworkXKnowledgeGraph
+
+    if projects.get_project(settings, args.slug) is None:
+        raise ValueError(f"unknown project: {args.slug}")
+    s = dataclasses.replace(settings, project=args.slug)
+    kg = NetworkXKnowledgeGraph(s.graph_path)
+    report = distill_report(kg)
+    before = report["stats_before"]
+    mode = "dry run" if args.dry_run else "apply"
+    print(f"Knowledge-graph distill for '{args.slug}' ({mode}) — "
+          f"{before['nodes']} nodes, {before['edges']} edges")
+    if report.get("reason"):
+        print(f"Nothing to do: {report['reason']}")
+        return 0
+    print(f"  merges:  {len(report['merges'])}")
+    for m in report["merges"]:
+        sim = f", cos {m['similarity']}" if "similarity" in m else ""
+        print(f"    keep {m['keep']}  <-  drop {m['drop']}  ({m['reason']}{sim})")
+    print(f"  prunes:  {len(report['prunes'])} stale edge(s)")
+    for p in report["prunes"]:
+        print(f"    {p['src']} -{p['relation']}-> {p['dst']}  "
+              f"(weight {p['weight']}, {p['age_days']}d old)")
+    print(f"  orphans: {len(report['orphans'])}")
+    for n in report["orphans"]:
+        print(f"    {n}")
+    if args.dry_run:
+        print("Dry run: nothing was changed.")
+        return 0
+    result = distill(kg, report=report)
+    after = result["stats_after"]
+    print(f"Applied: merged {result['merged']}, pruned {result['pruned']}, "
+          f"removed {result['orphans_removed']} orphan(s) — "
+          f"now {after['nodes']} nodes, {after['edges']} edges.")
     return 0
 
 
