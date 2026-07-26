@@ -989,7 +989,8 @@ def _auth_client(tmp_path):
 def test_auth_off_keeps_api_open_and_status_says_so(tmp_path):
     c = _client(tmp_path)  # api_token="" -> auth off, exactly as before
     assert c.get("/api/tasks").status_code == 200
-    assert c.get("/api/auth/status").json() == {"auth_required": False, "authorized": True}
+    assert c.get("/api/auth/status").json() == {
+        "auth_required": False, "authorized": True, "user": "local"}
     # login is refused when there is no token to match (nothing to set a cookie for)
     assert c.post("/api/login", json={"token": "anything"}).status_code == 403
 
@@ -999,9 +1000,10 @@ def test_token_set_requires_credentials_but_status_stays_open(tmp_path):
     assert c.get("/api/tasks").status_code == 401
     assert c.get("/api/tasks", headers={"Authorization": f"Bearer {_TOKEN}"}).status_code == 200
     body = c.get("/api/auth/status").json()  # readable without any credentials
-    assert body == {"auth_required": True, "authorized": False}
+    assert body == {"auth_required": True, "authorized": False, "user": None}
     with_bearer = c.get("/api/auth/status", headers={"Authorization": f"Bearer {_TOKEN}"})
     assert with_bearer.json()["authorized"] is True
+    assert with_bearer.json()["user"] == "owner"  # ADA_API_TOKEN = the owner identity
 
 
 def test_login_sets_cookie_and_cookie_alone_authorizes(tmp_path):
@@ -1600,6 +1602,88 @@ def test_graph2_unknown_project_is_404(tmp_path):
     assert c.get("/api/projects/nope/graph2").status_code == 404
     assert c.get("/api/projects/nope/graph2/search?q=x").status_code == 404
     assert c.get("/api/projects/nope/graph2/node/x").status_code == 404
+    assert c.post("/api/projects/nope/graph2/distill", json={}).status_code == 404
+
+
+# ---- Knowledge distillation endpoint (POST /api/projects/{slug}/graph2/distill) ----
+
+def _seed_distillable_kg(c, slug="default"):
+    """A graph past the small-graph gate with one obvious string-variant merge
+    pair, written to the same per-project file the graph2 endpoints open."""
+    from ai_dev_assistant.knowledge.graph import NetworkXKnowledgeGraph
+    s = dataclasses.replace(c.app.state.settings, project=slug)
+    kg = NetworkXKnowledgeGraph(s.graph_path)
+    for i in range(10):  # clears MIN_DOMAIN_EDGES
+        kg.add_fact(f"pad-src-{i:02d}", "pads", f"pad-dst-{i:02d}")
+    kg.add_fact("auth token", "protects", "api-gateway")
+    kg.add_fact("Auth Tokens", "issued-by", "identity-service")
+    kg.save()
+    return s.graph_path
+
+
+def _kg_node_ids(graph_path):
+    from ai_dev_assistant.knowledge.graph import NetworkXKnowledgeGraph
+    return set(NetworkXKnowledgeGraph(graph_path).node_types())
+
+
+def test_distill_dry_run_reports_without_saving(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_EMBEDDINGS_BACKEND", "hash")  # implicit embedder stays offline
+    c = _client(tmp_path)
+    path = _seed_distillable_kg(c)
+    body = c.post("/api/projects/default/graph2/distill", json={}).json()  # dry_run default
+    assert body["applied"] is False
+    assert {"keep": "auth-token", "drop": "auth-tokens",
+            "reason": "string-variant"} in body["merges"]
+    assert body["stats_before"]["edges"] == 12
+    # dry run touched nothing on disk — the variant pair is still there
+    assert {"auth-token", "auth-tokens"} <= _kg_node_ids(path)
+    # explicit dry_run=true behaves identically
+    again = c.post("/api/projects/default/graph2/distill", json={"dry_run": True}).json()
+    assert again["applied"] is False and again["merges"] == body["merges"]
+
+
+def test_distill_apply_persists_merges(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_EMBEDDINGS_BACKEND", "hash")
+    c = _client(tmp_path)
+    path = _seed_distillable_kg(c)
+    body = c.post("/api/projects/default/graph2/distill", json={"dry_run": False}).json()
+    assert body["applied"] is True and body["merged"] >= 1
+    assert "stats_after" in body
+    # the merge was SAVED to the real per-project graph file
+    ids = _kg_node_ids(path)
+    assert "auth-token" in ids and "auth-tokens" not in ids
+    # and the pass is idempotent: a second dry run proposes nothing
+    report = c.post("/api/projects/default/graph2/distill", json={}).json()
+    assert report["merges"] == [] and report["applied"] is False
+
+
+# ---- Benchmarks endpoint (GET /api/benchmarks) ----
+
+def test_benchmarks_endpoint_with_seeded_history(tmp_path):
+    from ai_dev_assistant.evals.history import history_path
+    c = _client(tmp_path)
+    path = history_path(c.app.state.settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = [
+        {"ts": 1.0, "git_sha": "aaa", "dirty": False, "suite": "golden",
+         "pass_rate": 0.5, "quality_mean": 70.0, "quality_min": 60.0,
+         "cost_usd": 1.0, "duration_s": 5.0, "runs": 2},
+        {"ts": 2.0, "git_sha": "bbb", "dirty": False, "suite": "golden",
+         "pass_rate": 0.75, "quality_mean": 80.0, "quality_min": 65.0,
+         "cost_usd": 0.5, "duration_s": 4.0, "runs": 4},
+    ]
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    body = c.get("/api/benchmarks").json()
+    assert body["latest"]["git_sha"] == "bbb"
+    assert body["delta"]["pass_rate"] == 0.25  # vs the previous same-suite entry
+    assert [pt["sha"] for pt in body["series"]] == ["aaa", "bbb"]
+    assert [h["git_sha"] for h in body["history"]] == ["aaa", "bbb"]  # raw rows, newest-last
+
+
+def test_benchmarks_endpoint_empty_history(tmp_path):
+    c = _client(tmp_path)
+    assert c.get("/api/benchmarks").json() == {
+        "latest": None, "delta": None, "series": [], "history": []}
 
 
 def test_legacy_graph_endpoint_shape_survives_kg_rework(tmp_path):

@@ -87,6 +87,36 @@ or put `ADA_API_TOKEN=...` in the compose `.env` file and reference it as
 with orchestration that can't scrape logs, and keeps the token out of `docker
 logs` entirely.
 
+## Named users
+
+Beyond the single shared token, the server supports named users so a small team
+can share one deployment with per-person tokens and per-run attribution:
+
+- **Identities.** Whoever presents the raw `ADA_API_TOKEN` is the **owner**
+  (the admin identity). Each named user gets their own server-generated token.
+  With auth off entirely (loopback, no token), every request acts as the
+  pseudo-user `local`. `GET /api/auth/status` reports the resolved identity as
+  `user` alongside `auth_required`/`authorized`.
+- **Creating users (owner-only).** `POST /api/users {"name": "<slug>"}`
+  generates a token server-side and returns `{"name", "token"}` — **the only
+  time the raw token is ever shown**. Only its sha256 is stored (in
+  `<data_dir>/users.json`, on the `ada_data` volume), so save it immediately;
+  a lost token means revoking and re-creating the user. Names are slugs
+  (lowercase letters, digits, hyphens); `owner` and `local` are reserved.
+- **Listing / revoking (owner-only).** `GET /api/users` returns
+  `[{name, created_at}]` (never hashes). `DELETE /api/users/<name>` revokes the
+  user; their token — including any live session cookie — stops working
+  immediately. Named users get `403` on these admin endpoints; with auth off
+  they are open (there is only the local operator).
+- **Signing in.** A user token works everywhere the owner token does:
+  `Authorization: Bearer <token>`, `?token=` on WebSockets/downloads, and the
+  UI sign-in screen — `POST /api/login` accepts any valid token and stores it
+  in the HttpOnly `ada_token` cookie as supplied, so each request re-resolves
+  to the same identity.
+- **Attribution.** Runs started by a resolved identity are stamped with it:
+  the queue payload and the task list/detail responses carry an additive
+  `user` field, so the UI can show "by &lt;name&gt;".
+
 ## Remote access & TLS
 
 To reach the assistant from another machine:

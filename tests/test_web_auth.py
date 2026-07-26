@@ -307,6 +307,173 @@ def test_settings_console_endpoints_require_token(tmp_path, monkeypatch):
     assert c.delete("/api/settings/trace", headers=hdr).status_code == 200
 
 
+# ---- Named multi-user auth: users.json on top of the ADA_API_TOKEN owner ----
+
+OWNER_HDR = {"Authorization": f"Bearer {TOKEN}"}
+
+
+def _make_user(c, name: str) -> str:
+    r = c.post("/api/users", json={"name": name}, headers=OWNER_HDR)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["name"] == name and body["token"]
+    return body["token"]
+
+
+def test_named_user_token_authorizes_bad_token_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    utok = _make_user(c, "alice")
+    assert c.get("/api/tasks", headers={"Authorization": f"Bearer {utok}"}).status_code == 200
+    assert c.get(f"/api/tasks?token={utok}").status_code == 200  # query-param path too
+    assert c.get("/api/tasks", headers={"Authorization": "Bearer nope"}).status_code == 401
+
+
+def test_auth_status_reports_resolved_user(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    utok = _make_user(c, "alice")
+    assert c.get("/api/auth/status", headers=OWNER_HDR).json()["user"] == "owner"
+    assert c.get("/api/auth/status",
+                 headers={"Authorization": f"Bearer {utok}"}).json()["user"] == "alice"
+    anon = c.get("/api/auth/status").json()
+    assert anon["authorized"] is False and anon["user"] is None
+
+
+def test_auth_status_user_is_local_when_auth_off(tmp_path):
+    c = _client(tmp_path, api_token="")
+    body = c.get("/api/auth/status").json()
+    assert body == {"auth_required": False, "authorized": True, "user": "local"}
+
+
+def test_login_with_named_user_token_sets_raw_cookie(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    utok = _make_user(c, "bob")
+    assert c.post("/api/login", json={"token": "wrong"}).status_code == 403
+    r = c.post("/api/login", json={"token": utok})
+    assert r.status_code == 204
+    # the cookie stays the RAW supplied token, so later requests re-resolve to bob
+    assert c.cookies.get("ada_token") == utok
+    status = c.get("/api/auth/status").json()  # cookie-only request
+    assert status["authorized"] is True and status["user"] == "bob"
+
+
+def test_user_admin_is_owner_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    utok = _make_user(c, "carol")
+    hdr = {"Authorization": f"Bearer {utok}"}
+    assert c.get("/api/users", headers=hdr).status_code == 403
+    assert c.post("/api/users", json={"name": "eve"}, headers=hdr).status_code == 403
+    assert c.delete("/api/users/carol", headers=hdr).status_code == 403
+    # anonymous requests never even reach the owner gate
+    assert c.get("/api/users").status_code == 401
+
+
+def test_user_create_reveals_token_once_and_stores_only_hash(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    utok = _make_user(c, "dora")
+    rows = c.get("/api/users", headers=OWNER_HDR).json()
+    assert [r["name"] for r in rows] == ["dora"]
+    assert rows[0]["created_at"] and "token" not in rows[0] and "token_sha256" not in rows[0]
+    stored = json.loads((tmp_path / "data" / "users.json").read_text())
+    assert stored[0]["name"] == "dora"
+    assert utok not in json.dumps(stored)  # only the sha256 is persisted
+    assert len(stored[0]["token_sha256"]) == 64
+
+
+def test_user_name_validation_400s(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    for bad in ("Not A Slug", "UPPER", "-lead", "", "owner", "local"):
+        r = c.post("/api/users", json={"name": bad}, headers=OWNER_HDR)
+        assert r.status_code == 400, bad
+    _make_user(c, "erin")
+    dup = c.post("/api/users", json={"name": "erin"}, headers=OWNER_HDR)
+    assert dup.status_code == 400 and "exists" in dup.json()["error"]
+
+
+def test_user_delete_revokes_access(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    utok = _make_user(c, "frank")
+    hdr = {"Authorization": f"Bearer {utok}"}
+    assert c.get("/api/tasks", headers=hdr).status_code == 200
+    assert c.delete("/api/users/frank", headers=OWNER_HDR).json()["ok"] is True
+    assert c.get("/api/tasks", headers=hdr).status_code == 401  # token stopped resolving
+    assert c.post("/api/login", json={"token": utok}).status_code == 403
+    assert c.delete("/api/users/frank", headers=OWNER_HDR).status_code == 404
+
+
+def test_user_admin_open_when_auth_off(tmp_path):
+    c = _client(tmp_path, api_token="")  # local single-operator mode
+    assert c.get("/api/users").json() == []
+    assert c.post("/api/users", json={"name": "solo"}).status_code == 200
+    assert c.delete("/api/users/solo").json()["ok"] is True
+
+
+def test_ws_accepts_named_user_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    utok = _make_user(c, "grace")
+    with pytest.raises(WebSocketDisconnect):
+        with c.websocket_connect("/ws/whatever?token=nope"):
+            pass
+    with c.websocket_connect(f"/ws/whatever?token={utok}") as ws:
+        assert ws.receive_json()["type"] == "error"  # unknown task, but authenticated
+
+
+def test_run_payload_carries_user_and_task_rows_expose_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    utok = _make_user(c, "hana")
+    c.app.state.paused = True  # keep the pump from launching a real engine
+    r = c.post("/api/run", json={"prompt": "ship it"},
+               headers={"Authorization": f"Bearer {utok}"})
+    assert r.status_code == 200
+    tid = r.json()["task_id"]
+    payload = c.app.state.runs.queue_pending()[0]["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    assert payload["user"] == "hana"  # additive attribution in the queue payload
+    row = next(t for t in c.get("/api/tasks", headers=OWNER_HDR).json() if t["id"] == tid)
+    assert row["user"] == "hana"
+    (tmp_path / "docs" / tid).mkdir(parents=True)  # docs dir gates the detail route
+    detail = c.get(f"/api/tasks/{tid}", headers=OWNER_HDR).json()
+    assert detail["meta"]["user"] == "hana"
+
+
+def test_run_payload_not_stamped_when_auth_off(tmp_path):
+    c = _client(tmp_path, api_token="")
+    c.app.state.paused = True
+    tid = c.post("/api/run", json={"prompt": "local task"}).json()["task_id"]
+    payload = c.app.state.runs.queue_pending()[0]["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    assert "user" not in payload  # "local" carries no attribution value
+    row = next(t for t in c.get("/api/tasks").json() if t["id"] == tid)
+    assert row["user"] is None
+
+
+def test_workspace_run_payload_carries_user(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    c.app.state.paused = True
+    a = c.post("/api/projects", json={"name": "Wu A"}, headers=OWNER_HDR).json()["slug"]
+    assert c.post("/api/workspaces", json={"name": "Crew", "projects": [a]},
+                  headers=OWNER_HDR).status_code == 200
+    utok = _make_user(c, "ivan")
+    r = c.post("/api/workspaces/crew/run", json={"prompt": "go"},
+               headers={"Authorization": f"Bearer {utok}"})
+    assert r.status_code == 200, r.text
+    payload = c.app.state.runs.queue_pending()[0]["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    assert payload["user"] == "ivan" and payload["workspace"] == "crew"
+
+
 def test_startup_drops_queue_entries_for_terminal_runs(tmp_path):
     app = create_app(_settings(tmp_path), api_token="")
     app.state.runs.enqueue("done-task", "p", None, {"prompt": "p"})

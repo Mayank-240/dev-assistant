@@ -39,6 +39,7 @@ from ..config import Settings
 from ..evals import history as eval_history
 from ..engine import Engine
 from ..knowledge import combine
+from ..knowledge import distill as kg_distill
 from ..knowledge.base import KnowledgeBase
 from ..knowledge.graph import NetworkXKnowledgeGraph
 from ..llm.errors import LLMError
@@ -55,6 +56,7 @@ from ..orchestration.run_control import RunControl
 from ..orchestration.run_store import RunStore, derive_title
 from ..orchestration.schedules import ScheduleStore, next_run_at
 from ..orchestration.task import new_task_id
+from . import users as users_mod
 
 _STATIC = Path(__file__).parent / "static"
 
@@ -347,6 +349,14 @@ class LoginRequest(BaseModel):
     token: str = ""
 
 
+class UserCreateRequest(BaseModel):
+    name: str
+
+
+class DistillRequest(BaseModel):
+    dry_run: bool = True
+
+
 class WorkspaceCreateRequest(BaseModel):
     name: str
     description: str = ""
@@ -406,18 +416,33 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     app.state.api_token = token
     broker_grace = _env_float("ADA_BROKER_GRACE_SECONDS", 60.0)
 
-    def _authorized(request) -> bool:
-        if not app.state.api_token:
-            return True
+    def _resolve_token(supplied: str) -> str | None:
+        """"owner" | <user name> | None for a raw supplied token (users.json
+        hashes plus the ADA_API_TOKEN owner identity)."""
+        return users_mod.resolve_user(settings.data_dir, supplied, app.state.api_token)
+
+    def _resolve_request_user(request) -> str | None:
         auth = request.headers.get("authorization", "")
-        if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:].strip(), app.state.api_token):
+        if auth.startswith("Bearer "):
+            name = _resolve_token(auth[7:])
+            if name:
+                return name
+        # session cookie set by POST /api/login (how the browser UI authenticates);
+        # it carries the raw token the user signed in with (owner's or their own)
+        name = _resolve_token(request.cookies.get("ada_token", ""))
+        if name:
+            return name
+        return _resolve_token(request.query_params.get("token", ""))
+
+    def _authorized(request) -> bool:
+        # True/False contract unchanged; additionally stashes the resolved identity
+        # on request.state.user — "owner" | <user name> | "local" (auth off) | None.
+        if not app.state.api_token:
+            request.state.user = users_mod.LOCAL
             return True
-        # session cookie set by POST /api/login (how the browser UI authenticates)
-        cookie = request.cookies.get("ada_token", "")
-        if cookie and secrets.compare_digest(cookie, app.state.api_token):
-            return True
-        supplied = request.query_params.get("token", "")
-        return bool(supplied) and secrets.compare_digest(supplied, app.state.api_token)
+        name = _resolve_request_user(request)
+        request.state.user = name
+        return name is not None
 
     # Always-open auth endpoints: the UI must be able to ask whether login is needed
     # and perform it while still unauthorized.
@@ -433,20 +458,24 @@ def create_app(settings: Settings | None = None, host: str | None = None,
 
     @app.get("/api/auth/status")
     async def auth_status(request: Request) -> JSONResponse:
+        ok = _authorized(request)  # also resolves request.state.user
         return JSONResponse({"auth_required": bool(app.state.api_token),
-                             "authorized": _authorized(request)})
+                             "authorized": ok,
+                             "user": getattr(request.state, "user", None)})
 
     @app.post("/api/login")
     async def login(req: LoginRequest) -> Response:
         supplied = (req.token or "").strip()
-        if not (app.state.api_token and supplied
-                and secrets.compare_digest(supplied, app.state.api_token)):
+        # Any valid identity signs in: the owner token or a named user's token.
+        if not (app.state.api_token and supplied and _resolve_token(supplied)):
             await asyncio.sleep(0.3)  # flat delay on every failure — slows brute force
             return JSONResponse({"error": "invalid token"}, status_code=403)
         # HttpOnly session cookie: flows on every fetch/WebSocket automatically and is
         # unreadable from JS. ADA_COOKIE_SECURE=1 marks it HTTPS-only (set behind TLS).
+        # The cookie stays the RAW supplied token, so every later request re-resolves
+        # to the same identity (and revoking a user invalidates their session).
         resp = Response(status_code=204)
-        resp.set_cookie("ada_token", app.state.api_token, httponly=True,
+        resp.set_cookie("ada_token", supplied, httponly=True,
                         samesite="strict", path="/",
                         secure=os.getenv("ADA_COOKIE_SECURE", "").strip() == "1")
         return resp
@@ -457,6 +486,45 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         resp.delete_cookie("ada_token", path="/")
         return resp
 
+    # ---- User admin (owner-only): named users live in <data_dir>/users.json.
+    # With auth off entirely (local loopback use) the endpoints stay open — there
+    # is only the local operator, and tokens minted here become useful the moment
+    # ADA_API_TOKEN is configured.
+    def _owner_gate(request: Request) -> JSONResponse | None:
+        if (app.state.api_token
+                and getattr(request.state, "user", None) != users_mod.OWNER):
+            return JSONResponse({"error": "owner only"}, status_code=403)
+        return None
+
+    @app.get("/api/users")
+    async def list_users(request: Request) -> JSONResponse:
+        gate = _owner_gate(request)
+        if gate is not None:
+            return gate
+        return JSONResponse([{"name": u["name"], "created_at": u.get("created_at")}
+                             for u in users_mod.load_users(settings.data_dir)])
+
+    @app.post("/api/users")
+    async def create_user_endpoint(req: UserCreateRequest, request: Request) -> JSONResponse:
+        gate = _owner_gate(request)
+        if gate is not None:
+            return gate
+        try:
+            entry, token = users_mod.create_user(settings.data_dir, (req.name or "").strip())
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        # The ONLY time the raw token is revealed — only its sha256 is stored.
+        return JSONResponse({"name": entry["name"], "token": token})
+
+    @app.delete("/api/users/{name}")
+    async def delete_user_endpoint(name: str, request: Request) -> JSONResponse:
+        gate = _owner_gate(request)
+        if gate is not None:
+            return gate
+        if not users_mod.delete_user(settings.data_dir, name):
+            return JSONResponse({"error": "unknown user"}, status_code=404)
+        return JSONResponse({"ok": True})
+
     # Explicit CORS policy: same-origin by default (no cross-origin allowed);
     # widen with a comma-separated ADA_CORS_ORIGINS.
     cors_origins = [o.strip() for o in os.getenv("ADA_CORS_ORIGINS", "").split(",") if o.strip()]
@@ -464,6 +532,25 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                        allow_methods=["*"], allow_headers=["*"])
     app.state.tasks = {}  # task_id -> asyncio.Task (for cancellation)
     app.state.runs = RunStore(settings.data_dir / "runs.db")
+
+    # Additive run attribution: task_id -> resolved identity ("owner" or a named
+    # user). A JSON sidecar next to runs.db, so the run store schema stays
+    # untouched this wave; merged into the task list/detail responses below.
+    _run_users_path = settings.data_dir / "run_users.json"
+
+    def _run_users() -> dict[str, str]:
+        try:
+            data = json.loads(_run_users_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return ({str(k): str(v) for k, v in data.items()}
+                if isinstance(data, dict) else {})
+
+    def _remember_run_user(task_id: str, user: str) -> None:
+        m = _run_users()
+        m[task_id] = user
+        _run_users_path.parent.mkdir(parents=True, exist_ok=True)
+        _run_users_path.write_text(json.dumps(m, indent=2) + "\n", encoding="utf-8")
     app.state.runs.interrupt_orphans()  # clean up runs orphaned by a restart
     # Recurring runs: same runs.db file, its own table + connection (schedules contract).
     app.state.schedules = ScheduleStore(settings.data_dir / "runs.db")
@@ -747,7 +834,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         })
 
     @app.post("/api/run")
-    async def start_run(req: RunRequest):
+    async def start_run(req: RunRequest, request: Request):
         # F3: `projects` with 2+ entries fans the task out; 1 entry behaves as `project`.
         slugs: list[str] = []
         for s in (req.projects or []):
@@ -796,6 +883,13 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             }
         if req.workspace:  # additive workspace attribution (never read by _start)
             payload["workspace"] = req.workspace
+        # Additive user attribution: the auth-resolved identity ("owner" or a
+        # named user) stamps the payload and the sidecar map the task list reads.
+        # The "local" pseudo-user (auth off) carries no attribution value.
+        run_user = getattr(request.state, "user", None)
+        if run_user and run_user != users_mod.LOCAL:
+            payload["user"] = run_user
+            _remember_run_user(task_id, run_user)
         plan_title = (req.plan or {}).get("title") if req.plan else None
         app.state.runs.enqueue(task_id, req.prompt, req.title or plan_title, payload)
         _pump()  # auto-run if a slot is free
@@ -1193,6 +1287,16 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             _err("counts", exc)
         return JSONResponse(out)
 
+    # Full benchmark view for the UI: the same trend_report /api/home embeds,
+    # plus the raw recorded entries (newest-last, capped at 50) for a table.
+    @app.get("/api/benchmarks")
+    async def get_benchmarks() -> JSONResponse:
+        def _report() -> dict[str, Any]:
+            return {**eval_history.trend_report(settings),
+                    "history": eval_history.load_history(settings, limit=50)}
+
+        return JSONResponse(await asyncio.to_thread(_report))
+
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
         return JSONResponse({"status": "ok"})
@@ -1286,13 +1390,16 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         # S8: WebSockets can't send an Authorization header from the browser — accept
         # the token as a query param, or the ada_token session cookie (set by
         # /api/login; rides along on the handshake). Reject before it completes.
+        # Any resolved identity (owner or a named user) is accepted.
         if app.state.api_token:
-            supplied = websocket.query_params.get("token", "")
-            cookie = websocket.cookies.get("ada_token", "")
-            if not ((supplied and secrets.compare_digest(supplied, app.state.api_token))
-                    or (cookie and secrets.compare_digest(cookie, app.state.api_token))):
+            name = (_resolve_token(websocket.query_params.get("token", ""))
+                    or _resolve_token(websocket.cookies.get("ada_token", "")))
+            if name is None:
                 await websocket.close(code=4401)
                 return
+            websocket.state.user = name
+        else:
+            websocket.state.user = users_mod.LOCAL
         await websocket.accept()
         broker: Broker | None = app.state.brokers.get(task_id)
         if broker is None:
@@ -1326,6 +1433,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     async def list_tasks() -> JSONResponse:
         rows = app.state.runs.list(limit=100)
         if rows:
+            run_users = _run_users()  # additive "by <name>" attribution
             return JSONResponse([{
                 "id": r["id"], "title": r.get("title") or derive_title(r.get("prompt") or ""),
                 "prompt": r.get("prompt") or "",
@@ -1335,6 +1443,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                 "quality_score": r.get("quality_score"), "run_status": r.get("run_status"),
                 "parent_id": r.get("parent_id"),
                 "project": r.get("project"),  # lets the UI scope recent tasks per project
+                "user": run_users.get(r["id"]),  # who launched it (None pre-feature/local)
             } for r in rows])
         # Fallback: docs dirs from runs that predate the run store.
         docs = settings.docs_dir
@@ -1368,6 +1477,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             "quality_score": r.get("quality_score"), "run_status": r.get("run_status"),
             "parent_id": r.get("parent_id"),
             "project": r.get("project"),  # "multi" marks a cross-project parent (F3)
+            "user": _run_users().get(task_id),  # who launched it (None pre-feature/local)
         }
         return JSONResponse({
             "plan": _read(d / "plan.md"),
@@ -1673,7 +1783,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         return JSONResponse(entry)
 
     @app.post("/api/workspaces/{ws}/run")
-    async def run_workspace(ws: str, req: WorkspaceRunRequest):
+    async def run_workspace(ws: str, req: WorkspaceRunRequest, request: Request):
         try:
             spec = workspaces_mod.workspace_run_spec(settings, ws, subset=req.subset)
         except ValueError as exc:
@@ -1682,11 +1792,12 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             return JSONResponse({"error": f"workspace '{ws}' has no member projects"},
                                 status_code=400)
         # Re-enter the exact multi-project run path (validation, payload, enqueue,
-        # pump) — one member collapses to a plain single-project run, same as /api/run.
+        # pump) — one member collapses to a plain single-project run, same as
+        # /api/run. The request rides along so user attribution lands identically.
         return await start_run(RunRequest(
             prompt=req.prompt, title=req.title, effort=req.effort, model=req.model,
             budget=req.budget, projects=spec["projects"],
-            project_deps=(spec["deps"] or None), workspace=ws))
+            project_deps=(spec["deps"] or None), workspace=ws), request)
 
     # ---- F4: project home — recent runs (feeds the quality-trend sparkline) ----
     @app.get("/api/projects/{slug}/runs")
@@ -2063,6 +2174,24 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             lambda: _open_kg(slug).neighborhood(
                 node_id, depth=max(0, min(int(depth), 5)), layer=_kg_layer(layer)))
         return JSONResponse({"project": slug, "node": node_id, **hood})
+
+    # Distillation is the ONE graph2 write: dry_run (the default) returns the
+    # proposed merges/prunes/orphans without touching anything; dry_run=false
+    # applies them and SAVES the per-project graph file — _open_kg hands back the
+    # graph at its real path, so distill()'s save persists to the same file the
+    # read-only graph2 views serve.
+    @app.post("/api/projects/{slug}/graph2/distill")
+    async def graph2_distill(slug: str, req: DistillRequest) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+
+        def _go() -> dict[str, Any]:
+            kg = _open_kg(slug)
+            if req.dry_run:
+                return {**kg_distill.distill_report(kg), "applied": False}
+            return {**kg_distill.distill(kg), "applied": True}
+
+        return JSONResponse(await asyncio.to_thread(_go))
 
     def _read_memory(path: Path, mem_scope: str) -> list[dict[str, Any]]:
         if not path.exists():
