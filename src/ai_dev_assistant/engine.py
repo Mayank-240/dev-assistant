@@ -480,7 +480,8 @@ class Engine:
                 base_t = self._baseline.get("tests")
                 pre_existing = (not run.execution.passed and base_t is not None
                                 and not base_t.passed)
-                self.kg.add_fact(run.id, "tests", "passed" if run.execution.passed else "failed")
+                self.kg.add_fact(run.id, "tests", "passed" if run.execution.passed else "failed",
+                                 layer="run", run_id=run.id)
                 emit(Event(
                     "execution",
                     f"Tests {'passed' if run.execution.passed else 'failed'}: {run.execution.command}"
@@ -827,8 +828,8 @@ class Engine:
         self.kg.add_node(run.id, "task", prompt=run.prompt)
         for st in run.plan.subtasks:
             self.kg.add_node(st.id, "subtask", title=st.title)
-            self.kg.add_fact(run.id, "has_subtask", st.id)
-            self.kg.add_fact(st.id, "assigned_to", st.agent)
+            self.kg.add_fact(run.id, "has_subtask", st.id, layer="run", run_id=run.id)
+            self.kg.add_fact(st.id, "assigned_to", st.agent, layer="run", run_id=run.id)
 
     async def _emit_new_messages(self, emit: EventFn) -> None:
         async with self._msg_lock:
@@ -1020,7 +1021,8 @@ class Engine:
                 metadata={"subtask": state.id},
             )
             self._mem_writes += 1
-            self.kg.add_fact(state.id, "produced_result_by", state.agent)
+            self.kg.add_fact(state.id, "produced_result_by", state.agent,
+                             layer="run", run_id=run.id)
             # per-subtask cost attribution + the file diff (also feeds scoped verification, V2)
             after_cost = usage_snapshot()
             self._cost_by_subtask[state.id] = self._cost_delta(before_cost, after_cost)
@@ -1076,7 +1078,8 @@ class Engine:
                     lint=self.settings.lint_check,
                     timeout=self.settings.verify_timeout, test_paths=test_paths)
                 verdict = apply_objective_gate(verdict, signals, baseline=self._baseline)
-            self.kg.add_fact(state.id, "review_status", "passed" if verdict.passed else "failed")
+            self.kg.add_fact(state.id, "review_status", "passed" if verdict.passed else "failed",
+                             layer="run", run_id=run.id)
             result_text = self._scrub(result or "")
             if len(result_text) > 12000:
                 result_text = result_text[:12000] + "\n… (truncated)"

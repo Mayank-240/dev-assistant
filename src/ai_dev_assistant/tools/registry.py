@@ -417,7 +417,8 @@ class ToolBox:
         obj = str(args.get("object", "")).strip()
         if not (subject and relation and obj):
             return "ERROR: 'subject', 'relation', and 'object' are all required."
-        self._ctx.kg.add_fact(subject, relation, obj, source=self._ctx.agent_name)
+        self._ctx.kg.add_fact(subject, relation, obj, layer="domain",
+                              source=self._ctx.agent_name, run_id=self._ctx.task_scope)
         return f"Recorded: ({subject}) -[{relation}]-> ({obj})"
 
     def _kg_query(self, args: dict[str, Any]) -> str:

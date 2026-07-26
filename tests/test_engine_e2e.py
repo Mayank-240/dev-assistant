@@ -140,6 +140,10 @@ async def test_full_pipeline_offline(tmp_path):
     assert settings.graph_path.is_file()
     rels = {(t.subject, t.relation, t.object) for t in engine.kg.facts_about("s1")}
     assert ("s1", "assigned_to", "researcher") in rels
+    # engine plumbing lands on the "run" layer, keeping the domain knowledge view clean
+    run_edges = engine.kg.export_view(layer="run", limit_nodes=1000)["edges"]
+    assert any(e["relation"] == "assigned_to" and e["layer"] == "run" for e in run_edges)
+    assert all(e["layer"] == "run" for e in run_edges)
 
 
 async def test_run_binds_sandbox_settings(tmp_path):
