@@ -284,9 +284,14 @@ class Engine:
         # ---- R1: resuming an interrupted run reuses its workspace + persisted plan ----
         if resume and task_id and plan is None:
             stored = self.runs.get_plan(task_id)
-            if stored:
-                plan = Plan.model_validate_json(stored)
-                emit(status(f"Resuming task {task_id} from its checkpointed plan."))
+            if not stored:
+                # Silently re-planning a "resume" corrupts the run (new subtask ids get
+                # matched against old checkpoints). Fail loudly instead.
+                emit(Event("error", "Cannot resume: no checkpointed plan for this task.",
+                           {"message": "no stored plan — the run cannot be resumed"}))
+                raise RuntimeError(f"cannot resume {task_id}: no checkpointed plan")
+            plan = Plan.model_validate_json(stored)
+            emit(status(f"Resuming task {task_id} from its checkpointed plan."))
 
         ctx = RunContext(rid=rid, run_ws=run_ws, emit=emit)
         repo_context = await self._setup_workspace(ctx, continue_from=continue_from, resume=resume)

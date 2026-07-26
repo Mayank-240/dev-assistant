@@ -116,15 +116,45 @@ async def test_resume_skips_completed_subtasks(tmp_path):
     assert run2.subtasks["s1"].result
 
 
-async def test_resume_unknown_plan_replans(tmp_path):
-    """Resuming an id with no stored plan falls back to planning fresh (no crash)."""
+async def test_resume_without_stored_plan_fails_loudly(tmp_path):
+    """Resuming an id with no stored plan must REFUSE, not silently re-plan —
+    a fresh plan's subtask ids would be matched against stale checkpoints."""
+    import pytest
+
     settings = _settings(tmp_path)
     engine = Engine(settings)
     provider = FlakyProvider()
     provider.healed = True
     _wire(engine, provider)
     try:
-        run, _b, _o = await engine.run("fresh thing", task_id="20990101-000000-none", resume=True)
+        with pytest.raises(RuntimeError, match="no checkpointed plan"):
+            await engine.run("fresh thing", task_id="20990101-000000-none", resume=True)
     finally:
         await engine.aclose()
-    assert run.all_passed
+
+
+def test_requeue_preserves_plan_and_lineage(tmp_path):
+    """Re-enqueueing an existing run (the web resume path) must not wipe its row —
+    the old INSERT OR REPLACE nulled plan_json and made resumes re-plan."""
+    from ai_dev_assistant.orchestration.run_store import RunStore
+
+    store = RunStore(tmp_path / "runs.db")
+    try:
+        store.start("t1", "build the thing", project="proj-a")
+        store.save_plan("t1", '{"summary": "p", "subtasks": []}')
+        store.set_run_branch("t1", "ada/t1", "main")
+        store.set_parent("t1", "t0")
+        store.finish("t1", status="partial")
+
+        store.enqueue("t1", "build the thing", None, {"resume": True})
+        row = store.get("t1") or {}
+        assert row["status"] == "queued"
+        assert store.get_plan("t1") == '{"summary": "p", "subtasks": []}'
+        assert row["task_branch"] == "ada/t1" and row["review_target"] == "main"
+        assert row["parent_id"] == "t0"
+
+        store.start("t1", "build the thing", project="proj-a")  # session begins again
+        assert store.get_plan("t1") is not None
+        assert (store.get("t1") or {})["task_branch"] == "ada/t1"
+    finally:
+        store.close()

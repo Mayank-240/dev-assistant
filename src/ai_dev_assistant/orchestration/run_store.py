@@ -129,9 +129,13 @@ class RunStore:
 
     def start(self, run_id: str, prompt: str, title: str | None = None,
               project: str | None = None) -> None:
+        # UPSERT, never REPLACE: a resume/re-start must not wipe the row's other
+        # columns (plan_json, parent_id, task_branch, …) — REPLACE deletes them.
         self._conn.execute(
-            "INSERT OR REPLACE INTO runs(id, prompt, title, status, created_at, project) "
-            "VALUES (?, ?, ?, 'running', ?, ?)",
+            "INSERT INTO runs(id, prompt, title, status, created_at, project) "
+            "VALUES (?, ?, ?, 'running', ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET prompt=excluded.prompt, title=excluded.title, "
+            "status='running', created_at=excluded.created_at, project=excluded.project",
             (run_id, prompt, title or derive_title(prompt), time.time(), project or "default"),
         )
         self._conn.commit()
@@ -292,10 +296,17 @@ class RunStore:
 
     # ---- task queue ----
     def enqueue(self, task_id: str, prompt: str, title: str | None, payload: dict[str, Any]) -> None:
-        """Record a queued run (status 'queued') and append it to the pending queue."""
+        """Record a queued run (status 'queued') and append it to the pending queue.
+
+        UPSERT, never REPLACE: re-enqueueing an existing run (resume) must keep its
+        plan_json/branch/lineage columns — REPLACE silently wiped them, which made a
+        resumed run re-plan from scratch.
+        """
         self._conn.execute(
-            "INSERT OR REPLACE INTO runs(id, prompt, title, status, created_at) "
-            "VALUES (?, ?, ?, 'queued', ?)",
+            "INSERT INTO runs(id, prompt, title, status, created_at) "
+            "VALUES (?, ?, ?, 'queued', ?) "
+            "ON CONFLICT(id) DO UPDATE SET prompt=excluded.prompt, title=excluded.title, "
+            "status='queued'",
             (task_id, prompt, title or derive_title(prompt), time.time()),
         )
         nxt = self._conn.execute("SELECT COALESCE(MAX(position), 0) + 1 FROM queue").fetchone()[0]
