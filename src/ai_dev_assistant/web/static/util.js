@@ -1949,6 +1949,82 @@
     };
   }
 
+  // ============================================================
+  // UI smoothing pass — pure models (workspace recent tasks, agent
+  // tool-chip collapse, backend chip, graph seed positions).
+  // ============================================================
+
+  // Per-project run lists -> one merged "Recent tasks" list for the workspace
+  // view. Input: [{slug, name, runs}] where runs are /api/projects/{slug}/runs
+  // rows. Output rows are newest-first (created_at), deduped by id, capped
+  // (default 8), shaped for the shared task-row renderer.
+  function wsRecentTasksModel(perProject, cap) {
+    cap = Number(cap) > 0 ? Math.floor(Number(cap)) : 8;
+    const seen = new Set();
+    const rows = [];
+    (Array.isArray(perProject) ? perProject : []).forEach(p => {
+      p = p || {};
+      const slug = String(p.slug || "");
+      const name = String(p.name || slug);
+      (Array.isArray(p.runs) ? p.runs : []).forEach(r => {
+        r = r || {};
+        const id = String(r.id || "");
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        const status = String(r.status || "");
+        rows.push({
+          taskId: id, title: String(r.title || id),
+          project: slug, projectName: name, status,
+          live: status === "running" || status === "queued",
+          createdAt: (r.created_at != null && isFinite(Number(r.created_at)))
+            ? Number(r.created_at) : null,
+          qualityLabel: r.quality_score != null ? "quality " + r.quality_score + "/100" : "",
+          costLabel: (r.cost_usd != null && Number(r.cost_usd) > 0) ? fmtCost(r.cost_usd) : "",
+        });
+      });
+    });
+    rows.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    const out = rows.slice(0, cap);
+    return { rows: out, empty: !out.length };
+  }
+
+  // Agent-card tool list -> collapsed count-chip model ("26 tools" toggle).
+  function agentToolsModel(tools) {
+    const list = (Array.isArray(tools) ? tools : []).map(String);
+    return {
+      tools: list, count: list.length,
+      label: list.length + (list.length === 1 ? " tool" : " tools"),
+    };
+  }
+
+  // /api/config -> the sidebar backend chip text ("" = leave the placeholder).
+  function backendLabel(cfg) {
+    const b = String((cfg && (cfg.llm_backend || cfg.backend)) || "").trim();
+    return b ? "backend: " + b : "";
+  }
+
+  // Deterministic golden-angle spiral: n seed positions spread over a w×h
+  // canvas (margin-clamped), so the force layout starts unclustered and the
+  // first painted frame has no label pileup.
+  function seedLayout(n, w, h, margin) {
+    n = Math.max(0, Math.floor(Number(n) || 0));
+    w = Number(w) || 0; h = Number(h) || 0;
+    margin = margin == null ? 24 : Number(margin);
+    const cx = w / 2, cy = h / 2;
+    const rx = Math.max(1, w / 2 - margin), ry = Math.max(1, h / 2 - margin);
+    const GA = Math.PI * (3 - Math.sqrt(5));   // golden angle ≈ 2.39996 rad
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const t = n === 1 ? 0 : Math.sqrt((i + 0.5) / n);   // uniform-area radius
+      const a = i * GA;
+      pts.push({
+        x: Math.max(margin, Math.min(w - margin, cx + Math.cos(a) * rx * t)),
+        y: Math.max(margin, Math.min(h - margin, cy + Math.sin(a) * ry * t)),
+      });
+    }
+    return pts;
+  }
+
   const AdaUtil = {
     escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine,
     fmtRelTime, paletteResultsModel, scheduleRowModel, scheduleFormModel,
@@ -1976,6 +2052,7 @@
     agentsListModel, agentFormModel, agentFormValidate, AGENT_EFFORTS,
     benchModel, distillReportModel, distillResultModel,
     userChipModel, usersListModel, userCreateModel,
+    wsRecentTasksModel, agentToolsModel, backendLabel, seedLayout,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = AdaUtil;

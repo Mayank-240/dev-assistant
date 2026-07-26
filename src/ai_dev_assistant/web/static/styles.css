@@ -152,6 +152,9 @@ a:hover { color:var(--accent); }
 .badge-done::before { background:var(--ok); }
 .badge-err::before { background:var(--err); }
 #backend-badge::before { display:none; }
+/* the chip fits the sidebar column and only ellipsizes when genuinely too long
+   (inline-block, not inline-flex — text-overflow needs a block text container) */
+#backend-badge { display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; }
 
 .pill {
   display:inline-flex; align-items:center; gap:7px; font-family:var(--sans); font-size:10.5px;
@@ -170,6 +173,9 @@ a:hover { color:var(--accent); }
 
 .chip { font-family:var(--mono); font-size:10px; padding:2px 7px; border-radius:0; background:transparent; color:var(--muted); border:1px solid var(--border-soft); }
 .chip-tools { margin-left:auto; }
+/* agent-card count chip doubles as the tools-list toggle */
+button.ac-tools-toggle { cursor:pointer; }
+button.ac-tools-toggle:hover { color:var(--text); border-color:var(--border); }
 
 .select, .num {
   border:1px solid var(--border); border-radius:0; background:var(--bg); color:var(--text);
@@ -290,6 +296,15 @@ a:hover { color:var(--accent); }
   color:var(--text-2); border:1px solid var(--border); background:transparent;
   max-width:340px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
+/* project ↔ workspace link: "▦ <workspace>" chip beside the origin badge */
+.ws-chip {
+  flex:0 0 auto; display:inline-flex; align-items:center; gap:6px; padding:2px 8px;
+  border-radius:0; font-family:var(--sans); font-size:10px; font-weight:800;
+  letter-spacing:.06em; text-transform:uppercase; cursor:pointer;
+  color:var(--text-2); border:1px solid var(--border); background:transparent;
+  max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.ws-chip:hover { color:var(--accent-deep); border-color:var(--accent); }
 .dirty-dot { color:var(--accent); font-size:11px; line-height:1; flex:0 0 auto; }
 .archived-tag {
   flex:0 0 auto; padding:2px 8px; border-radius:0; font-size:10px; font-weight:800;
@@ -670,8 +685,13 @@ a:hover { color:var(--accent); }
 .dag-edge { fill:none; stroke:var(--neutral-500); stroke-width:1.4; marker-end:url(#dag-arrow); }
 
 .section-title { margin:0; font-family:var(--sans); font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); }
-.agents-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:2px; background:var(--border); border:2px solid var(--border); }
-.agents-grid:empty { border:0; }
+/* Hairline grids: the 2px rules are drawn by per-CARD outlines that meet in the
+   2px gaps — never by painting the grid CONTAINER's background, which bleeds a
+   gray band into empty tracks / partial last rows (both themes). Keyboard focus
+   still swaps a card's ring for the accent :focus-visible outline. */
+.agents-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:2px; }
+.agents-grid > :not(:focus-visible) { outline:2px solid var(--border); }
+.agents-grid > .muted { grid-column:1 / -1; }   /* empty states span the row, not one track */
 .agent-card {
   background:var(--bg); border:0; border-radius:0; box-shadow:none;
   padding:14px; display:flex; flex-direction:column; gap:9px; cursor:pointer;
@@ -1043,8 +1063,8 @@ a:hover { color:var(--accent); }
 /* ---------- playbooks strip (project Overview) ---------- */
 .pb-strip { width:min(100%, 900px); margin-inline:auto; display:flex; flex-direction:column; gap:10px; }
 .pb-strip .section-label { padding:0 2px; }
-.pb-cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:2px;
-  background:var(--border); border:2px solid var(--border); }
+.pb-cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:2px; }
+.pb-cards > :not(:focus-visible) { outline:2px solid var(--border); }
 .pb-card { background:var(--bg); padding:12px 14px; display:flex; flex-direction:column; gap:6px; cursor:pointer; }
 .pb-card:hover { background:var(--accent-soft); box-shadow:inset 3px 0 0 var(--accent); }
 .pb-name { font-size:12.5px; font-weight:800; color:var(--text); letter-spacing:.02em; }
@@ -1286,7 +1306,8 @@ a:hover { color:var(--accent); }
 .home-strip { padding:16px 18px; margin-top:20px; }
 .home-strip .section-label { margin-bottom:10px; display:block; }
 .home-minis { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:2px;
-  background:var(--border); border:2px solid var(--border); margin-top:20px; }
+  margin-top:20px; }   /* hairlines come from the per-card rings below, not a container background */
+.home-minis > :not(:focus-visible) { outline:2px solid var(--border); }
 .mini-card { background:var(--bg); padding:16px 18px; display:flex; flex-direction:column; gap:8px; }
 .mini-card .section-label { border-bottom:2px solid var(--border); padding-bottom:8px; }
 .mini-big { font-family:var(--sans); font-size:28px; font-weight:800; line-height:1;
@@ -1303,6 +1324,10 @@ a:hover { color:var(--accent); }
   border-bottom:2px solid var(--border); }
 .hb-bar { flex:1 1 auto; max-width:22px; background:var(--neutral-500); }
 .hb-bar:last-child { background:var(--accent); }
+.mini-head { display:flex; align-items:baseline; justify-content:space-between; gap:10px;
+  border-bottom:2px solid var(--border); padding-bottom:8px; }
+.mini-head .section-label { border-bottom:0; padding-bottom:0; }
+.mini-head .link-btn { margin-top:0; align-self:baseline; font-size:11px; flex:0 0 auto; }
 .home-ws-list { display:flex; flex-direction:column; gap:0; border-top:2px solid var(--border); }
 .home-ws-list > .muted { font-size:12.5px; padding:8px 0; margin:0; }
 .home-ws-row { display:flex; align-items:center; gap:9px; padding:9px 2px;
@@ -1312,6 +1337,15 @@ a:hover { color:var(--accent); }
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
 /* ---------- Workspace view ---------- */
+/* Single-column flow: header → composer (full-width) → members → recent → deps.
+   The base .composer centers itself at 900px for the project Overview; here it
+   must span the column like its sibling cards. */
+#view-workspace { display:flex; flex-direction:column; gap:20px; }
+#view-workspace .view-header { margin-bottom:4px; }
+#view-workspace .composer { width:100%; max-width:none; margin:0; }
+.ws-back { display:inline-block; margin-bottom:10px; font-size:10.5px; font-weight:800;
+  letter-spacing:.06em; text-transform:uppercase; text-decoration:none; }
+.ws-back:hover { text-decoration:underline; text-underline-offset:3px; }
 .ws-desc { margin:8px 0 0; font-size:13px; color:var(--muted); max-width:70ch; }
 .ws-head-actions { display:flex; align-items:center; gap:12px; }
 .ws-card { padding:18px 20px; }

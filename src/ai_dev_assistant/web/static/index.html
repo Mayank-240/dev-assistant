@@ -98,6 +98,7 @@
                 <h1 id="proj-name">…</h1>
                 <div class="proj-meta">
                   <span id="proj-origin" class="origin-badge hidden"></span>
+                  <button type="button" id="proj-ws" class="ws-chip hidden"></button>
                   <span id="proj-branch" class="branch-chip hidden"></span>
                   <span id="proj-dirty" class="dirty-dot hidden" title="Uncommitted changes in the checkout">●</span>
                   <span id="proj-archived" class="archived-tag hidden">archived</span>
@@ -634,7 +635,10 @@
                 <button type="button" id="home-bench-link" class="link-btn">All benchmarks →</button>
               </div>
               <div class="card mini-card" id="home-ws-card">
-                <h3 class="section-label">Workspaces</h3>
+                <div class="mini-head">
+                  <h3 class="section-label">Workspaces</h3>
+                  <button type="button" id="home-ws-all" class="link-btn">All workspaces →</button>
+                </div>
                 <div id="home-ws-list" class="home-ws-list"><p class="muted">No workspaces yet.</p></div>
               </div>
             </div>
@@ -666,6 +670,7 @@
           <div id="view-workspace" class="view hidden">
             <div class="view-header">
               <div class="ws-id">
+                <button type="button" id="ws-back" class="link-btn ws-back">← Workspaces</button>
                 <h1 id="ws-name">…</h1>
                 <p id="ws-desc" class="ws-desc"></p>
               </div>
@@ -728,6 +733,11 @@
                 </div>
                 <p id="ws-assign-error" class="pm-error hidden" role="alert"></p>
               </div>
+            </div>
+
+            <div class="card ws-card">
+              <h3 class="section-label">Recent tasks</h3>
+              <ul id="ws-recent" class="task-list"><li class="muted">No tasks yet in this workspace.</li></ul>
             </div>
 
             <div class="card ws-card">

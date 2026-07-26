@@ -24,6 +24,7 @@ const {
   agentsListModel, agentFormModel, agentFormValidate,
   benchModel, distillReportModel, distillResultModel,
   userChipModel, usersListModel, userCreateModel,
+  wsRecentTasksModel, agentToolsModel, backendLabel, seedLayout,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -102,6 +103,10 @@ const state = Object.assign({
 let serverConfig = { budget_usd: 0 };
 async function loadConfig() {
   try { serverConfig = await (await fetch("/api/config")).json(); } catch (e) { /* keep defaults */ }
+  // sidebar backend chip: fill from config at boot — previously it kept the
+  // "backend: …" placeholder until the first run streamed a status event
+  const bl = backendLabel(serverConfig);
+  if (bl) $("backend-badge").textContent = bl;
 }
 
 // ---- W5: live cost-vs-budget meter (hidden when no budget is set) ----
@@ -777,6 +782,17 @@ function renderProjectHeader(st) {
   const origin = $("proj-origin");
   origin.classList.toggle("hidden", isMulti);
   origin.textContent = h.origin;
+  // workspace chip — shown when the project belongs to a workspace; opens it
+  const wsBtn = $("proj-ws");
+  const wsSlug = !isMulti && entry.workspace ? String(entry.workspace) : "";
+  wsBtn.classList.toggle("hidden", !wsSlug);
+  if (wsSlug) {
+    const wsEntry = workspaceEntry(wsSlug);
+    const wsName = (wsEntry && wsEntry.name) || wsSlug;
+    wsBtn.textContent = "▦ " + wsName;
+    wsBtn.title = "Open workspace " + wsName;
+    wsBtn.onclick = () => openWorkspace(wsSlug);
+  }
   const m = projectTaglineModel(h.name, st);
   const branch = $("proj-branch");
   branch.classList.toggle("hidden", isMulti || !m.branchText);
@@ -2278,6 +2294,35 @@ function openWorkspace(slug) {
 async function refreshWorkspaceView() {
   await loadProjects();   // also refreshes workspaceList + sidebar grouping
   renderWorkspace();
+  loadWorkspaceRecent();
+}
+
+// "Recent tasks" — the newest runs across the workspace's member projects,
+// aggregated client-side from the same per-project /runs endpoint the project
+// Tasks tab uses.
+async function loadWorkspaceRecent() {
+  const ul = $("ws-recent");
+  if (!ul) return;
+  const ws = currentWorkspace;
+  const entry = workspaceEntry(ws);
+  const members = (entry && entry.project_slugs) || [];
+  const nameOf = (slug) => {
+    const p = projectList.find(x => x.slug === slug);
+    return (p && p.name) || slug;
+  };
+  const perProject = await Promise.all(members.map(async slug => ({
+    slug, name: nameOf(slug), runs: await fetchProjectRuns(slug),
+  })));
+  if (ws !== currentWorkspace) return;   // user moved on while we fetched
+  const m = wsRecentTasksModel(perProject, 8);
+  ul.innerHTML = "";
+  if (m.empty) {
+    ul.innerHTML = '<li class="muted">No tasks yet in this workspace.</li>';
+    return;
+  }
+  m.rows.forEach(r => ul.appendChild(_homeTaskLi(r, () => {
+    if (r.live) attachToRun(r.taskId, r.title); else openTask(r.taskId, null);
+  })));
 }
 
 function _wsInline(id, msg) {
@@ -2294,6 +2339,7 @@ function renderWorkspace() {
     $("ws-members").innerHTML = "";
     $("ws-deps").innerHTML = "";
     $("ws-subset").innerHTML = "";
+    $("ws-recent").innerHTML = '<li class="muted">No tasks yet in this workspace.</li>';
     return;
   }
   $("ws-name").textContent = entry.name || entry.slug;
@@ -3286,7 +3332,7 @@ let rosterAgents = {};   // name -> agent profile, for the detail popup
 let agentsBody = agentsListModel(null);   // last-fetched {builtin, custom, tools, names}
 
 function _agentCard(a, custom) {
-  const tools = Array.isArray(a.tools) ? a.tools : [];
+  const tm = agentToolsModel(a.tools);
   const card = document.createElement("div");
   card.className = "agent-card";
   const effortChip = a.effort
@@ -3296,11 +3342,21 @@ function _agentCard(a, custom) {
       `<button type="button" class="q-act af-edit" title="Edit this agent">Edit</button>` +
       `<button type="button" class="q-act af-delete" title="Delete this agent (click twice to confirm)">Delete</button></div>`
     : "";
+  // tool chips start collapsed behind the count chip — 19 cards × ~26 chips is
+  // a wall of noise; the count chip toggles this card's list inline
   card.innerHTML = `
-    <div class="ac-top"><span class="ac-dot" style="background:${agentStyle(a.name).color}"></span><span class="ac-agent ac-name">${escapeHtml(a.name)}</span>${effortChip}<span class="chip chip-tools">${tools.length} tools</span></div>
+    <div class="ac-top"><span class="ac-dot" style="background:${agentStyle(a.name).color}"></span><span class="ac-agent ac-name">${escapeHtml(a.name)}</span>${effortChip}<button type="button" class="chip chip-tools ac-tools-toggle" aria-expanded="false" title="Show this agent's tools">${escapeHtml(tm.label)} ▸</button></div>
     <div class="ac-desc">${escapeHtml(a.description || "")}</div>
     <div class="ac-when">${escapeHtml(a.when_to_use || "")}</div>
-    <div class="tool-chips">${tools.map(t => `<span class="tool-chip">${escapeHtml(t)}</span>`).join("")}</div>${acts}`;
+    <div class="tool-chips hidden">${tm.tools.map(t => `<span class="tool-chip">${escapeHtml(t)}</span>`).join("")}</div>${acts}`;
+  const tog = card.querySelector(".ac-tools-toggle");
+  const chips = card.querySelector(".tool-chips");
+  tog.onclick = (e) => {
+    e.stopPropagation();   // never trigger the card's open/edit activation
+    const open = !chips.classList.toggle("hidden");
+    tog.setAttribute("aria-expanded", String(open));
+    tog.textContent = tm.label + (open ? " ▾" : " ▸");
+  };
   if (custom) {
     card.title = "Custom agent — click to edit";
     makeActivatable(card, (e) => {
@@ -3988,9 +4044,13 @@ function focusGraphNode(id) {
 function layout(nodes, edges, W, H) {
   const pos = {};
   const n = nodes.length;
+  // Golden-angle spiral seeding (util.seedLayout): the old single-ring seed
+  // piled every node (and label) onto one circle, so the first painted frame
+  // was a label pileup. Seeds spread over the whole canvas converge cleanly
+  // within the synchronous iterations below — the first frame is settled.
+  const seeds = seedLayout(n, W, H);
   nodes.forEach((nd, i) => {
-    const ang = (i / n) * Math.PI * 2;
-    pos[nd.id] = { x: W / 2 + Math.cos(ang) * 180 + (i % 7) * 4, y: H / 2 + Math.sin(ang) * 150 + (i % 5) * 4, vx: 0, vy: 0 };
+    pos[nd.id] = { x: seeds[i].x, y: seeds[i].y, vx: 0, vy: 0 };
   });
   const k = Math.sqrt((W * H) / n) * 0.55;
   let temp = W / 8;
@@ -5220,6 +5280,8 @@ $("agents-refresh").onclick = () => loadAgents(true);
 // away wave: home + workspaces + custom agents + graph2 controls
 $("home-refresh").onclick = loadHome;
 $("home-spend-link").onclick = showActivity;
+$("home-ws-all").onclick = showWorkspacesView;   // Home Workspaces card → full list
+$("ws-back").onclick = showWorkspacesView;       // workspace header back link
 $("home-bench-link").onclick = () => {   // deep-link to the Benchmarks section
   showActivity();
   requestAnimationFrame(() =>
