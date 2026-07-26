@@ -456,6 +456,29 @@ def accept_commit(settings: Settings, slug: str, sha: str) -> dict:
     return vcs.cherry_pick_merge(root, sha, target)
 
 
+def deliver_branch(settings: Settings, slug: str, branch: str, *, message: str = "") -> dict:
+    """Deliver a whole task branch into the project's review target ("Accept all").
+
+    Same routing as ``accept_commit``: owned checkouts with the target checked
+    out and clean merge directly (working tree advances); in-place projects and
+    everything else go through the temp-worktree merge — the user's checkout is
+    never touched. Idempotent: an already-delivered branch merges as up-to-date.
+    """
+    from . import vcs
+
+    p = get_project(settings, slug)
+    if not p or not p.get("root"):
+        return {"merged": False, "conflict": False, "error": "project has no repository"}
+    root = Path(p["root"])
+    target = review_target(settings, slug)
+    msg = message or f"ada: deliver {branch}"
+    if p.get("origin") != "local":
+        st = project_status(settings, slug)
+        if st.get("branch") == target and not st.get("dirty"):
+            return vcs.merge_in_checkout(root, branch, message=msg)
+    return vcs.merge_branch(root, branch, target, message=msg)
+
+
 def effective_settings(settings: Settings, slug: str | None = None) -> Settings:
     """Resolve per-run Settings: task override → project policy → global defaults (F7).
 

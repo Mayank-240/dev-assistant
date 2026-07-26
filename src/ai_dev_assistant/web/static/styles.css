@@ -930,3 +930,7 @@ a:hover { color:var(--accent); }
 .empty-first h2 { font-family:var(--serif); font-weight:800; font-size:32px; letter-spacing:-.01em; }
 .empty-first p { font-size:14px; color:var(--text-2); }
 .empty-first .btn-primary { margin-top:22px; }
+
+/* Accept all & deliver row in the review panel */
+.rvp-deliver-row { display:flex; align-items:center; gap:12px; padding:10px 0 2px; border-bottom:2px solid var(--border-soft); margin-bottom:10px; }
+.rvp-deliver-row .muted { font-size:12px; }

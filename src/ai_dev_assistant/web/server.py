@@ -1245,6 +1245,49 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             "denied": denied,
         })
 
+    @app.post("/api/tasks/{task_id}/deliver")
+    async def deliver_task(task_id: str) -> JSONResponse:
+        """Accept all & deliver: merge the whole task branch into the review target.
+
+        One-click completion of the review — per-subtask decisions stay available
+        beforehand; this records every undecided subtask as accepted. Idempotent
+        (an already-delivered branch merges as up-to-date)."""
+        row = app.state.runs.get(task_id)
+        if row is None:
+            return JSONResponse({"error": "unknown task"}, status_code=404)
+        status = row.get("status") or ""
+        if status not in _TERMINAL_STATUSES:
+            return JSONResponse(
+                {"error": f"run is still {status or 'active'} — deliver after it finishes"},
+                status_code=409)
+        branch = str(row.get("task_branch") or "").strip()
+        if not branch:
+            return JSONResponse({"error": "task has no delivery branch"}, status_code=409)
+        if not hasattr(projects, "deliver_branch"):
+            return JSONResponse({"error": "deliver is not available yet"}, status_code=501)
+        slug = _project_of_run(row)
+        title = str(row.get("title") or task_id)
+        res = await asyncio.to_thread(
+            projects.deliver_branch, settings, slug, branch,
+            message=f"ada: deliver task {task_id} ({title[:60]})")
+        if res.get("conflict"):
+            return JSONResponse({**res, "error": "merge conflict"}, status_code=409)
+        if not res.get("merged"):
+            return JSONResponse({**res, "error": res.get("error") or "merge failed"},
+                                status_code=409)
+        accepted = []
+        try:
+            states = app.state.runs.get_subtask_states(task_id) or {}
+            reviews = app.state.runs.get_subtask_reviews(task_id) or {}
+            for sid in states:
+                if sid not in reviews:
+                    app.state.runs.set_subtask_review(task_id, sid, "accepted",
+                                                      "accepted via deliver-all")
+                    accepted.append(sid)
+        except Exception:  # noqa: BLE001 - decision bookkeeping is best-effort
+            pass
+        return JSONResponse({**res, "decision": "accepted", "accepted_subtasks": accepted})
+
     @app.post("/api/tasks/{task_id}/subtasks/{subtask_id}/accept")
     async def accept_subtask(task_id: str, subtask_id: str) -> JSONResponse:
         row = app.state.runs.get(task_id)

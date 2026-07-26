@@ -763,3 +763,54 @@ def test_memory_endpoint_without_projects_param_unchanged(tmp_path):
     assert rows
     assert all("project" not in row and "score" not in row for row in rows)
     assert rows[0]["mem_scope"] in ("project", "global")
+
+
+def test_deliver_endpoint_merges_branch_and_records_decisions(tmp_path, monkeypatch):
+    """POST /api/tasks/{id}/deliver: 409 while active, merges the task branch into
+    the review target on a terminal run, records undecided subtasks as accepted."""
+    import subprocess
+
+    from ai_dev_assistant import projects as projmod
+    from ai_dev_assistant.config import Settings as _S
+
+    settings = _S(
+        llm_backend="anthropic", anthropic_api_key="", embeddings_backend="hash",
+        data_dir=tmp_path / "data", docs_dir=tmp_path / "docs", workspace_dir=tmp_path / "ws",
+    )
+    client = TestClient(create_app(settings, api_token=""))
+    app = client.app
+    proj = projmod.create_project(settings, "Ship It")
+    repo = projmod.project_checkout(settings, proj["slug"])
+
+    def g(*args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                       cwd=repo, check=True, capture_output=True)
+
+    g("checkout", "-q", "-b", "ada/t-del")
+    (repo / "done.md").write_text("done\n")
+    g("add", "-A"); g("commit", "-q", "-m", "work")
+    g("checkout", "-q", proj["default_branch"])
+
+    store = app.state.runs
+    store.start("t-del", "ship it", project=proj["slug"])
+    store.set_run_branch("t-del", "ada/t-del", proj["default_branch"])
+    store.checkpoint_subtask("t-del", "s1", status="passed", attempts=1,
+                             result="r", verdict_json=None)
+
+    r = client.post("/api/tasks/t-del/deliver")
+    assert r.status_code == 409  # still running
+
+    store.finish("t-del", status="completed")
+    r = client.post("/api/tasks/t-del/deliver")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["merged"] and body["decision"] == "accepted"
+    assert "s1" in body["accepted_subtasks"]
+    assert (repo / "done.md").is_file()
+    assert store.get_subtask_reviews("t-del")["s1"]["decision"] == "accepted"
+
+    # idempotent second delivery
+    r2 = client.post("/api/tasks/t-del/deliver")
+    assert r2.status_code == 200 and r2.json()["merged"]
+
+    assert client.post("/api/tasks/nope/deliver").status_code == 404

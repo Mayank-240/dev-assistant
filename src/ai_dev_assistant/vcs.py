@@ -400,6 +400,26 @@ def cherry_pick_merge(repo: Path, sha: str, into: str) -> dict:
         return {"merged": False, "conflict": False, "error": str(exc)[:300]}
 
 
+def merge_in_checkout(repo: Path, branch: str, *, message: str) -> dict:
+    """Merge ``branch`` directly in ``repo``'s working tree (must be clean).
+
+    For checkouts the assistant OWNS: delivery advances the checked-out branch
+    and its working tree together. Same return shape as ``merge_branch``.
+    Never used on in-place user repos.
+    """
+    repo = repo.resolve()
+    if _git(["status", "--porcelain"], repo).stdout.strip():
+        return {"merged": False, "conflict": False, "error": "checkout has uncommitted changes"}
+    res = _git([*_IDENT, "merge", "--no-ff", "-m", message, branch], repo)
+    if res.returncode != 0:
+        files = [f for f in _git(["diff", "--name-only", "--diff-filter=U"], repo)
+                 .stdout.splitlines() if f.strip()]
+        _git(["merge", "--abort"], repo)
+        return {"merged": False, "conflict": True, "files": files}
+    return {"merged": True, "conflict": False,
+            "commit": _git(["rev-parse", "HEAD"], repo).stdout.strip()}
+
+
 def cherry_pick_in_checkout(repo: Path, sha: str) -> dict:
     """Apply one commit directly in ``repo``'s working tree (must be clean).
 

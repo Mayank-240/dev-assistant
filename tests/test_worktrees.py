@@ -407,3 +407,44 @@ def test_worktree_add_with_relative_workspace_path(tmp_path, monkeypatch):
     assert (ws_abs / "new.txt").is_file()
     vcs.worktree_remove(rel, "sX")
     assert not wt.exists()
+
+
+def test_merge_in_checkout_and_deliver_branch(tmp_path):
+    """Accept-all delivery: direct merge in an owned clean checkout; dirty refusal;
+    idempotent re-delivery; projects.deliver_branch routes owned checkouts to it."""
+    import subprocess
+
+    import dataclasses
+    from ai_dev_assistant import projects, vcs
+    from ai_dev_assistant.config import Settings
+
+    settings = Settings(
+        llm_backend="anthropic", anthropic_api_key="", embeddings_backend="hash",
+        data_dir=tmp_path / "data", docs_dir=tmp_path / "docs",
+        workspace_dir=tmp_path / "workspace",
+    )
+    proj = projects.create_project(settings, "Deliver Me")
+    repo = projects.project_checkout(settings, proj["slug"])
+
+    def g(*args, cwd=repo):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                       cwd=cwd, check=True, capture_output=True)
+
+    # a task branch with work on it
+    g("checkout", "-q", "-b", "ada/task-1")
+    (repo / "out.md").write_text("# deliverable\n")
+    g("add", "-A"); g("commit", "-q", "-m", "work")
+    g("checkout", "-q", proj["default_branch"])
+
+    res = projects.deliver_branch(settings, proj["slug"], "ada/task-1")
+    assert res.get("merged"), res
+    assert (repo / "out.md").is_file()  # working tree advanced with the merge
+
+    # idempotent: delivering again is up-to-date, not an error
+    res2 = projects.deliver_branch(settings, proj["slug"], "ada/task-1")
+    assert res2.get("merged"), res2
+
+    # dirty checkout refuses the direct merge
+    (repo / "dirty.txt").write_text("x")
+    res3 = vcs.merge_in_checkout(repo, "ada/task-1", message="m")
+    assert not res3.get("merged") and "uncommitted" in (res3.get("error") or "")

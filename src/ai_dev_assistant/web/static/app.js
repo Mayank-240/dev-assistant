@@ -2133,6 +2133,52 @@ async function loadReviewTab() {
     br.innerHTML = `⎇ task branch <code>${escapeHtml(data.task_branch || "—")}</code>` +
       ` · accepting merges into <code>${escapeHtml(data.review_target || "—")}</code>`;
   }
+  // Accept all & deliver — shown when the task has a branch to deliver. Two-step
+  // arm/confirm instead of a blocking dialog.
+  const drow = $("rvp-deliver-row");
+  const dbtn = $("rvp-deliver");
+  if (data.task_branch) {
+    drow.classList.remove("hidden");
+    $("rvp-deliver-note").textContent = "";
+    dbtn.disabled = false;
+    dbtn.dataset.armed = "";
+    dbtn.textContent = "Accept all & deliver →";
+    dbtn.onclick = async () => {
+      if (!dbtn.dataset.armed) {
+        dbtn.dataset.armed = "1";
+        dbtn.textContent = "Confirm: merge branch into " + (data.review_target || "target") + "?";
+        setTimeout(() => { if (dbtn.dataset.armed) { dbtn.dataset.armed = ""; dbtn.textContent = "Accept all & deliver →"; } }, 6000);
+        return;
+      }
+      dbtn.disabled = true;
+      dbtn.textContent = "Delivering…";
+      try {
+        const resp = await fetch("/api/tasks/" + encodeURIComponent(reviewTaskId) + "/deliver",
+                                 { method: "POST" });
+        const res = await resp.json().catch(() => ({}));
+        if (!resp.ok || !res.merged) {
+          const why = res.conflict ? ("conflict: " + (res.files || []).join(", ")) : (res.error || ("HTTP " + resp.status));
+          $("rvp-deliver-note").textContent = "✕ " + why;
+          showToast("Deliver failed — " + why, "warn");
+          dbtn.disabled = false;
+          dbtn.dataset.armed = "";
+          dbtn.textContent = "Accept all & deliver →";
+          return;
+        }
+        $("rvp-deliver-note").textContent = "✓ delivered @ " + String(res.commit || "").slice(0, 8);
+        showToast("Task branch delivered to " + (data.review_target || "target"));
+        refreshProjectPulse(true);
+        loadReviewTab();  // re-render with the recorded decisions
+      } catch (e) {
+        $("rvp-deliver-note").textContent = "✕ could not deliver";
+        dbtn.disabled = false;
+        dbtn.dataset.armed = "";
+        dbtn.textContent = "Accept all & deliver →";
+      }
+    };
+  } else {
+    drow.classList.add("hidden");
+  }
   const subs = data.subtasks || [];
   if (!subs.length) { el.innerHTML = '<p class="muted">No subtask records for this task yet.</p>'; return; }
   el.innerHTML = subs.map(reviewCardHtml).join("");
