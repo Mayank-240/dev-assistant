@@ -77,6 +77,7 @@
           <span id="backend-badge" class="badge badge-muted">backend: …</span>
           <span id="conn" class="badge badge-idle" role="status" aria-live="polite">idle</span>
           <button id="theme-btn" type="button" title="Toggle theme (light · dark · auto)">◐ Auto</button>
+          <span id="user-chip" class="badge badge-muted user-chip hidden"></span>
           <button id="signout-btn" type="button" class="signout-btn hidden" title="Sign out — clears this browser's session cookie">Sign out</button>
         </div>
       </aside>
@@ -320,6 +321,8 @@
                     <button type="button" class="seg-opt" data-v="run" aria-pressed="false">Run plumbing</button>
                     <button type="button" class="seg-opt" data-v="" aria-pressed="false">All</button>
                   </div>
+                  <button id="graph-distill" type="button" class="ghost-btn graph-distill"
+                          title="Merge duplicate nodes, prune stale edges and drop orphans — dry-run report first">Distill…</button>
                   <label class="ctl graph-minw-wrap" title="Hide edges reinforced fewer than this many times">Min&nbsp;weight
                     <select id="graph-minw" class="select">
                       <option value="1">1</option><option value="2">2</option><option value="3">3</option>
@@ -334,6 +337,7 @@
                     <div id="graph-search-results" class="graph-search-results hidden" role="listbox" aria-label="Node search results"></div>
                   </span>
                 </div>
+                <div id="distill-panel" class="distill-panel hidden" role="region" aria-label="Distillation report"></div>
                 <div class="graph-wrap"><svg id="graph-svg" viewBox="0 0 800 520" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Knowledge graph of recorded entities and relationships"></svg></div>
                 <div id="graph-legend" class="legend"></div>
                 <div id="node-detail" class="node-detail muted">Click a node to see its relations and provenance.</div>
@@ -480,6 +484,7 @@
                   <div class="run-status">
                     <span id="timer" class="timer">0.0s</span>
                     <span id="status-pill" class="pill pill-running">running</span>
+                    <span id="run-user-chip" class="chip run-user-chip hidden" title="Who started this run"></span>
                     <button id="review-btn" class="ghost-btn" title="Per-subtask reviews and the task's effective permissions">⚖ Review &amp; Permissions</button>
                     <button id="pause-btn" class="ghost-btn hidden" title="Pause before the next batch">⏸ Pause</button>
                     <button id="steer-btn" class="ghost-btn hidden" title="Send a steering note to the next subtask">✎ Steer</button>
@@ -622,6 +627,7 @@
                 <h3 class="section-label">Benchmarks</h3>
                 <div id="home-bench-stats" class="mini-row"></div>
                 <div id="home-bench-bars" class="hb-bars" role="img" aria-label="Benchmark pass rate by commit"></div>
+                <button type="button" id="home-bench-link" class="link-btn">All benchmarks →</button>
               </div>
               <div class="card mini-card" id="home-ws-card">
                 <h3 class="section-label">Workspaces</h3>
@@ -768,6 +774,18 @@
                 </div>
               </div>
             </div>
+            <div class="card" id="bench-section">
+              <h3 class="section-label">Benchmarks — eval trend by commit</h3>
+              <p id="bench-empty" class="muted hidden"></p>
+              <div id="bench-latest" class="bench-latest hidden"></div>
+              <div id="bench-bars" class="bench-bars hidden" role="img"
+                   aria-label="Benchmark pass rate and quality by commit"></div>
+              <div id="bench-legend" class="bench-legend hidden" aria-hidden="true">
+                <span class="bench-key"><span class="bench-swatch bench-swatch-pass"></span>pass rate</span>
+                <span class="bench-key"><span class="bench-swatch bench-swatch-qual"></span>quality mean</span>
+              </div>
+              <div id="bench-history" class="sp-table-wrap bench-history"></div>
+            </div>
             <div class="card" id="ab-card">
               <h3 class="section-label">A/B (replay smoke) — compare one knob's values offline</h3>
               <p class="muted ab-note">Replays recorded cassettes to validate <b>mechanics</b> (the pipeline still runs end-to-end under each value) — it does <b>not</b> measure real output quality.</p>
@@ -875,6 +893,18 @@
             </div>
             <div class="card gs-info" id="gs-info" aria-label="Read-only environment info"></div>
             <div id="gs-groups" class="gs-groups"><p class="muted">Loading…</p></div>
+            <div class="card gs-card" id="users-card">
+              <h3 class="section-label">Users — named sign-ins for this server</h3>
+              <p class="muted users-note">Each user signs in with a personal token, shown once at creation. Managing users is owner-only.</p>
+              <div id="users-list" class="users-list"><p class="muted">Loading…</p></div>
+              <div class="users-add-row">
+                <input id="user-new-name" class="title-input" type="text" maxlength="40"
+                       placeholder="New user name" aria-label="New user name" />
+                <button id="user-add" class="btn-primary" type="button">Add user</button>
+              </div>
+              <div id="user-token-box" class="user-token-box hidden" role="status" aria-live="polite"></div>
+              <p id="users-error" class="pm-error hidden" role="alert"></p>
+            </div>
           </div>
 
           <!-- ============ FIRST-RUN EMPTY STATE (no projects yet) ============ -->

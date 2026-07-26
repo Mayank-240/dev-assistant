@@ -22,6 +22,8 @@ const {
   homeModel, sidebarGroups, wsDepsModel, wsRunPayload,
   graph2ViewModel, nodePanelModel,
   agentsListModel, agentFormModel, agentFormValidate,
+  benchModel, distillReportModel, distillResultModel,
+  userChipModel, usersListModel, userCreateModel,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -59,6 +61,7 @@ async function submitLogin() {
     $("login-token").value = "";
     $("view-login").classList.add("hidden");
     $("signout-btn").classList.remove("hidden");
+    refreshUserChip();   // the status endpoint now knows who signed in
     bootApp();
   } catch (e) {
     loginError("Could not reach the server.");
@@ -149,6 +152,7 @@ function resetRunView(prompt) {
   $("run-prompt").textContent = prompt;
   $("status-pill").className = "pill pill-running";
   $("status-pill").textContent = "running";
+  setRunUserChip("");
   $("agents").innerHTML = "";
   $("feed").innerHTML = "";
   $("plan-card").classList.add("hidden");
@@ -1063,6 +1067,7 @@ function handleEvent(ev) {
   switch (ev.type) {
     case "status":
       noteQueuedStart();
+      if (d.user) setRunUserChip(d.user);   // "by <name>" chip when the run carries a user
       if (d.backend) $("backend-badge").textContent = "backend: " + d.backend;
       if (ev.message && /Documenting/i.test(ev.message)) setPhase("document");
       feed(ev.message);
@@ -1848,6 +1853,7 @@ function openParentTask(id, docs, kids, meta) {
   stopTimer();
   $("timer").textContent = "";
   $("cancel-btn").classList.add("hidden");
+  setRunUserChip(mm.user);
   state.children = childrenFromRows(kids);
   state.total = state.children.length;
   renderChildrenGrid();
@@ -1900,6 +1906,8 @@ async function openTask(id, meta) {
   setM("m-sessions", mm.sessions_spawned); setM("m-reaped", mm.sessions_reaped);
   setM("m-kg", mm.kg_nodes); setM("m-edges", mm.kg_edges);
   setM("m-mem", mm.memories); setM("m-msgs", mm.messages);
+
+  setRunUserChip(mm.user);   // historical runs record who started them
 
   const summary = planSummary(docs.plan);
   if (summary) { $("plan-card").classList.remove("hidden"); $("plan-summary").textContent = summary; }
@@ -2460,6 +2468,7 @@ async function loadGlobalSettings() {
   if (!data) { box.innerHTML = '<p class="muted">Could not load settings.</p>'; return; }
   renderGlobalSettings(settingsGroupsModel(data));
   loadGithubStatus();   // status line above the GitHub group's fields
+  loadUsers();          // named sign-ins admin card (owner-gated)
 }
 
 function gsControlHtml(f) {
@@ -3142,6 +3151,7 @@ async function loadDashboard() {
   populateCompareOptions();
   loadProjectsActivity();
   loadSpend();
+  loadBenchmarks();
   let s;
   try { s = await (await fetch("/api/stats")).json(); } catch (e) { return; }
   $("ds-runs").textContent = s.runs ?? 0;
@@ -4418,6 +4428,57 @@ function renderOutcomes(m) {
     `</tbody></table>`;
 }
 
+// ---- Benchmarks (All activity): GET /api/benchmarks trend report ----
+async function loadBenchmarks() {
+  let data = null;
+  try {
+    const resp = await fetch("/api/benchmarks");
+    if (resp.ok) data = await resp.json();
+  } catch (e) { /* fall through to the empty state */ }
+  renderBench(benchModel(data));
+}
+
+function renderBench(m) {
+  const empty = $("bench-empty"), latest = $("bench-latest"), bars = $("bench-bars"),
+        legend = $("bench-legend"), hist = $("bench-history");
+  if (!empty) return;
+  empty.classList.toggle("hidden", m.available);
+  latest.classList.toggle("hidden", !m.available);
+  bars.classList.toggle("hidden", !m.available || !m.bars.length);
+  legend.classList.toggle("hidden", !m.available || !m.bars.length);
+  if (!m.available) {
+    empty.textContent = m.emptyText;
+    latest.innerHTML = ""; bars.innerHTML = ""; hist.innerHTML = "";
+    return;
+  }
+  const l = m.latest;
+  const arrow = (d) => d.dir === "flat" ? ""
+    : `<span class="hb-delta hb-${escapeAttr(d.dir)}" title="vs previous entry">${escapeHtml(d.label)}</span>`;
+  latest.innerHTML =
+    `<span class="hb-stat"><b>${escapeHtml(l.passLabel)}</b> pass${arrow(l.deltas.pass)}</span>` +
+    `<span class="hb-stat"><b>${escapeHtml(l.qualityLabel)}</b> quality${arrow(l.deltas.quality)}</span>` +
+    `<span class="hb-stat"><b>${escapeHtml(l.qualityMinLabel)}</b> min${arrow(l.deltas.qualityMin)}</span>` +
+    `<span class="hb-stat"><b>${escapeHtml(l.costLabel)}</b> cost${arrow(l.deltas.cost)}</span>` +
+    (l.sha ? `<span class="chip" title="latest benchmarked commit">${escapeHtml(l.sha)}</span>` : "") +
+    `<span class="muted bench-latest-meta">${escapeHtml((l.suite ? l.suite + " · " : "") + l.runsLabel + " · " + l.durationLabel)}</span>`;
+  bars.innerHTML = m.bars.map(b =>
+    `<div class="bench-col" title="${escapeAttr(b.label)}">` +
+    `<span class="bench-pair"><span class="bench-bar bench-bar-pass" style="height:${b.passH}%"></span>` +
+    `<span class="bench-bar bench-bar-qual" style="height:${b.qualityH}%"></span></span>` +
+    `<span class="bench-sha">${escapeHtml(b.sha)}</span></div>`).join("");
+  if (!m.history.length) { hist.innerHTML = ""; return; }
+  hist.innerHTML =
+    `<table class="dsa-table bench-table"><thead><tr><th scope="col">When</th>` +
+    `<th scope="col">Commit</th><th scope="col">Suite</th><th scope="col">Pass</th>` +
+    `<th scope="col">Quality</th><th scope="col">Cost</th></tr></thead><tbody>` +
+    m.history.map(h =>
+      `<tr><td>${h.ts != null ? escapeHtml(new Date(h.ts * 1000).toLocaleString()) : "—"}</td>` +
+      `<td><code>${escapeHtml(h.sha || "—")}</code></td><td>${escapeHtml(h.suite || "—")}</td>` +
+      `<td>${escapeHtml(h.passLabel)}</td><td>${escapeHtml(h.qualityCell)}</td>` +
+      `<td class="sp-usd">${escapeHtml(h.costLabel)}</td></tr>`).join("") +
+    `</tbody></table>`;
+}
+
 // ---- Per-run cost breakdown (task detail, collapsible) ----
 async function loadRunCost(taskId) {
   if (!taskId) return;
@@ -4514,6 +4575,225 @@ async function loadGithubStatus() {
     `<span>label <code>${escapeHtml(st.label || "ada")}</code></span>` +
     `<span>${st.tracked || 0} tracked run${st.tracked === 1 ? "" : "s"}</span>` +
     `<span class="muted gh-token-note">token via <code>ADA_GITHUB_TOKEN</code> env — never stored in settings</span>`;
+}
+
+// ---- Knowledge-graph distillation (Knowledge · Knowledge graph) ----
+// "Distill…" runs a dry-run report first; applying is a two-click arm/confirm
+// (never window.confirm) that rewrites the graph, then refetches it.
+let _distillArmed = false;
+
+async function _postDistill(dryRun) {
+  const slug = selectedProject();
+  if (!slug || slug === "multi") return null;
+  const resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/graph2/distill", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dry_run: dryRun }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || data.error) throw new Error(data.error || ("HTTP " + resp.status));
+  return data;
+}
+
+function closeDistillPanel() {
+  $("distill-panel").classList.add("hidden");
+  $("distill-panel").innerHTML = "";
+  _distillArmed = false;
+}
+
+const _distillClose =
+  `<button id="distill-close" type="button" class="ghost" aria-label="Close distillation report">✕</button>`;
+
+async function openDistillReport() {
+  const panel = $("distill-panel");
+  panel.classList.remove("hidden");
+  panel.innerHTML = '<p class="muted">Analyzing the graph…</p>';
+  _distillArmed = false;
+  let report;
+  try { report = await _postDistill(true); }
+  catch (e) {
+    panel.innerHTML = `<div class="distill-head"><span class="kicker">Distillation</span>${_distillClose}</div>` +
+      `<p class="pm-error">Distill failed: ${escapeHtml(e.message || String(e))}</p>`;
+    $("distill-close").onclick = closeDistillPanel;
+    return;
+  }
+  if (!report) { closeDistillPanel(); return; }
+  renderDistillPanel(distillReportModel(report));
+}
+
+function renderDistillPanel(m) {
+  const panel = $("distill-panel");
+  if (m.empty) {
+    panel.innerHTML = `<div class="distill-head"><span class="kicker">Distillation</span>${_distillClose}</div>` +
+      `<p class="muted">${escapeHtml(m.emptyText)}</p>`;
+    $("distill-close").onclick = closeDistillPanel;
+    return;
+  }
+  const merges = m.merges.length
+    ? `<span class="kicker">Merges — keep ← drop</span><ul class="distill-list">` +
+      m.merges.map(x => `<li><code>${escapeHtml(x.keep)}</code> ← <code>${escapeHtml(x.drop)}</code>` +
+        (x.reason ? ` <span class="muted">${escapeHtml(x.reason)}</span>` : "") + `</li>`).join("") +
+      `</ul>` : "";
+  const prunes = m.prunes.length
+    ? `<span class="kicker">Prunes — stale edges</span><ul class="distill-list">` +
+      m.prunes.map(x => `<li><code>${escapeHtml(x.edge)}</code>` +
+        (x.detail ? ` <span class="muted">${escapeHtml(x.detail)}</span>` : "") + `</li>`).join("") +
+      `</ul>` : "";
+  const orphans = m.orphans.length
+    ? `<span class="kicker">Orphans — disconnected nodes</span>` +
+      `<p class="distill-orphans">${m.orphans.map(o => `<code>${escapeHtml(o)}</code>`).join(" ")}</p>` : "";
+  panel.innerHTML =
+    `<div class="distill-head"><span class="kicker">Distillation — dry run</span>` +
+    `<span class="muted">${escapeHtml(m.summary)}</span>${_distillClose}</div>` +
+    merges + prunes + orphans +
+    `<div class="pe-actions distill-actions">` +
+    `<button id="distill-apply" type="button" class="btn-danger">Apply distillation</button>` +
+    `<span id="distill-result" class="muted" role="status" aria-live="polite"></span></div>`;
+  $("distill-close").onclick = closeDistillPanel;
+  $("distill-apply").onclick = applyDistill;
+}
+
+async function applyDistill() {
+  const btn = $("distill-apply");
+  if (!_distillArmed) {   // first click arms; the second actually applies
+    _distillArmed = true;
+    btn.textContent = "Really apply? — rewrites the graph";
+    return;
+  }
+  btn.disabled = true;
+  let res;
+  try { res = await _postDistill(false); }
+  catch (e) {
+    $("distill-result").textContent = "Failed: " + (e.message || String(e));
+    _distillArmed = false;
+    btn.textContent = "Apply distillation";
+    btn.disabled = false;
+    return;
+  }
+  const m = distillResultModel(res);
+  await loadGraph();   // show the distilled graph
+  const panel = $("distill-panel");
+  panel.innerHTML = `<div class="distill-head"><span class="kicker">Distillation</span>${_distillClose}</div>` +
+    `<p class="distill-done">${escapeHtml(m.text)}</p>`;
+  $("distill-close").onclick = closeDistillPanel;
+  _distillArmed = false;
+  showToast(m.text, "success");
+}
+
+// ---- Named-user identity: sidebar chip + task-detail "by <name>" chip ----
+function renderUserChip(m) {
+  const el = $("user-chip");
+  if (!el) return;
+  el.classList.toggle("hidden", !m.visible);
+  el.textContent = m.label;
+  el.title = m.visible ? "Signed in as " + m.name : "";
+}
+
+async function refreshUserChip() {
+  try {
+    const status = await (await _fetch("/api/auth/status")).json();
+    renderUserChip(userChipModel(status));
+  } catch (e) { /* leave the chip as-is */ }
+}
+
+// Task detail: "by <name>" next to the status pill when the run records a user.
+function setRunUserChip(user) {
+  const el = $("run-user-chip");
+  if (!el) return;
+  const m = userChipModel({ user });
+  el.classList.toggle("hidden", !m.byLabel);
+  el.textContent = m.byLabel;
+}
+
+// ---- Users admin (global Settings): named sign-ins, owner-gated ----
+let _userDeleteArmed = "";   // user name currently armed for delete
+
+function _usersError(msg) {
+  const el = $("users-error");
+  if (!el) return;
+  el.textContent = msg || "";
+  el.classList.toggle("hidden", !msg);
+}
+
+async function loadUsers() {
+  const box = $("users-list");
+  if (!box) return;
+  _userDeleteArmed = "";
+  let resp, data = null;
+  try {
+    resp = await fetch("/api/users");
+    data = await resp.json().catch(() => null);
+  } catch (e) { box.innerHTML = '<p class="muted">Could not load users.</p>'; return; }
+  if (resp.status === 403) { box.innerHTML = '<p class="muted">Owner only.</p>'; return; }
+  if (!resp.ok) { box.innerHTML = '<p class="muted">User management is not available on this server.</p>'; return; }
+  const m = usersListModel(data);
+  if (m.empty) { box.innerHTML = '<p class="muted">No users yet — add one below.</p>'; return; }
+  box.innerHTML = "";
+  m.rows.forEach(u => {
+    const row = document.createElement("div");
+    row.className = "user-row";
+    row.innerHTML = `<span class="user-name">◆ ${escapeHtml(u.name)}</span>` +
+      (u.createdAt != null
+        ? `<span class="muted">added ${escapeHtml(new Date(u.createdAt * 1000).toLocaleDateString())}</span>` : "") +
+      `<button type="button" class="btn-danger user-del" title="Delete this user — their token stops working">Delete</button>`;
+    const del = row.querySelector(".user-del");
+    del.onclick = () => deleteUser(u.name, del);
+    box.appendChild(row);
+  });
+}
+
+async function createUser() {
+  const name = $("user-new-name").value.trim();
+  _usersError("");
+  if (!name) { _usersError("Enter a user name."); return; }
+  const btn = $("user-add");
+  btn.disabled = true;
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/users", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _usersError("Request failed."); btn.disabled = false; return; }
+  btn.disabled = false;
+  if (resp.status === 403) { _usersError("Owner only."); return; }
+  if (!resp.ok || data.error) { _usersError(data.error || ("HTTP " + resp.status)); return; }
+  const m = userCreateModel(data);
+  const box = $("user-token-box");
+  box.classList.remove("hidden");
+  box.innerHTML =
+    `<span class="kicker">One-time token for ${escapeHtml(m.name || name)}</span>` +
+    `<div class="user-token-row"><code id="user-token-code">${escapeHtml(m.token)}</code>` +
+    `<button id="user-token-copy" type="button" class="ghost-btn">Copy</button></div>` +
+    `<p class="hint user-token-warn">⚠ ${escapeHtml(m.warning || "shown once")}</p>`;
+  $("user-token-copy").onclick = async () => {
+    try { await navigator.clipboard.writeText(m.token); showToast("Token copied", "success"); }
+    catch (e) { showToast("Copy failed — select the token manually", "warn"); }
+  };
+  $("user-new-name").value = "";
+  loadUsers();
+}
+
+async function deleteUser(name, btn) {
+  if (_userDeleteArmed !== name) {   // two-click arm/confirm
+    _userDeleteArmed = name;
+    btn.textContent = "Confirm delete";
+    return;
+  }
+  btn.disabled = true;
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/users/" + encodeURIComponent(name), { method: "DELETE" });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _usersError("Request failed."); btn.disabled = false; return; }
+  if (resp.status === 403) {
+    _usersError("Owner only.");
+    btn.disabled = false; btn.textContent = "Delete"; _userDeleteArmed = "";
+    return;
+  }
+  if (!resp.ok || data.error) { _usersError(data.error || ("HTTP " + resp.status)); btn.disabled = false; return; }
+  _usersError("");
+  loadUsers();
 }
 
 // ---- KB upload: drop zone + file picker (Knowledge · Memory) ----
@@ -4880,6 +5160,11 @@ $("agents-refresh").onclick = () => loadAgents(true);
 // away wave: home + workspaces + custom agents + graph2 controls
 $("home-refresh").onclick = loadHome;
 $("home-spend-link").onclick = showActivity;
+$("home-bench-link").onclick = () => {   // deep-link to the Benchmarks section
+  showActivity();
+  requestAnimationFrame(() =>
+    $("bench-section").scrollIntoView({ behavior: scrollBehavior(), block: "start" }));
+};
 $("new-workspace").onclick = () => {
   const row = $("ws-create-row");
   row.classList.toggle("hidden");
@@ -4919,6 +5204,7 @@ $("graph-layer").querySelectorAll(".seg-opt").forEach(b => b.onclick = () => {
     x.setAttribute("aria-pressed", x === b ? "true" : "false"));
   renderGraph();   // client-side re-filter — no refetch
 });
+$("graph-distill").onclick = openDistillReport;   // curation: dry-run report + apply
 $("graph-minw").onchange = () => {
   graphMinWeight = parseInt($("graph-minw").value, 10) || 1;
   renderGraph();
@@ -4994,6 +5280,11 @@ $("cmp-btn").onclick = compareRuns;
 // cookie-session login gate (S8) + sidebar sign-out
 $("login-form").addEventListener("submit", (e) => { e.preventDefault(); submitLogin(); });
 $("signout-btn").onclick = signOut;
+// Users admin card (global Settings)
+$("user-add").onclick = createUser;
+$("user-new-name").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); createUser(); }
+});
 // feature wave: playbooks · schedules · A/B · palette · notifications · KB · graph · timeline
 $("playbook-modal-close").onclick = closePlaybookModal;
 $("pbm-cancel").onclick = closePlaybookModal;
@@ -5068,6 +5359,7 @@ function bootApp() {
   try { status = await (await _fetch("/api/auth/status")).json(); }
   catch (e) { /* status unreachable — boot; real calls will surface the error */ }
   if (status && status.auth_required) $("signout-btn").classList.remove("hidden");
+  renderUserChip(userChipModel(status));   // "◆ <name>" for named (non-local) sign-ins
   if (authGate(status) === "login") showLogin();
   else bootApp();
 })();

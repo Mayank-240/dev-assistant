@@ -1750,6 +1750,183 @@
     };
   }
 
+  // ===========================================================
+  // Closing wave — benchmarks panel (All activity), knowledge-graph
+  // distillation and named-user identity. Pure models; the endpoints
+  // live in web/server.py. All Node-tested; no DOM access.
+  // ===========================================================
+
+  const BENCH_EMPTY_TEXT = "No benchmark history — run an eval with --record-history.";
+
+  // One trend_report entry (latest or history row) -> display labels.
+  // ts stays numeric (epoch seconds) — date formatting is the caller's concern.
+  function _benchEntryRow(h) {
+    h = h || {};
+    const mean = h.quality_mean != null ? String(h.quality_mean) : "—";
+    return {
+      ts: (h.ts != null && isFinite(Number(h.ts))) ? Number(h.ts) : null,
+      sha: String(h.git_sha || h.sha || "").slice(0, 7),
+      suite: String(h.suite || ""),
+      passLabel: h.pass_rate != null ? Math.round(Number(h.pass_rate) * 100) + "%" : "—",
+      qualityLabel: mean,
+      qualityMinLabel: h.quality_min != null ? String(h.quality_min) : "—",
+      qualityCell: h.quality_mean != null
+        ? mean + (h.quality_min != null ? " / " + h.quality_min : "") : "—",
+      costLabel: h.cost_usd != null ? "$" + Number(h.cost_usd).toFixed(2) : "—",
+    };
+  }
+
+  // GET /api/benchmarks (trend_report) -> the All-activity Benchmarks section:
+  // latest scorecard + deltas, series bars (heights clamped 0-100; non-zero
+  // values get a 4% visibility floor) and the compact history table.
+  function benchModel(p) {
+    p = p || {};
+    const latest = (p.latest && typeof p.latest === "object") ? p.latest : null;
+    if (!latest) {
+      return { available: false, emptyText: BENCH_EMPTY_TEXT,
+               latest: null, bars: [], history: [] };
+    }
+    const delta = (p.delta && typeof p.delta === "object") ? p.delta : {};
+    const clampH = (v) => {
+      const h = Math.max(0, Math.min(100, Math.round(Number(v) || 0)));
+      return h > 0 ? Math.max(4, h) : 0;
+    };
+    const dNum = (v, scale, dp) => (v == null || !isFinite(Number(v)))
+      ? null : Number((Number(v) * scale).toFixed(dp));
+    const runs = Number(latest.runs) || 0;
+    return {
+      available: true,
+      emptyText: "",
+      latest: Object.assign(_benchEntryRow(latest), {
+        runsLabel: runs + " run" + (runs === 1 ? "" : "s"),
+        durationLabel: fmtDuration(latest.duration_s),
+        deltas: {   // vs the previous history entry; pass delta in percentage points
+          pass: _deltaArrow(dNum(delta.pass_rate, 100, 0)),
+          quality: _deltaArrow(dNum(delta.quality_mean, 1, 1)),
+          qualityMin: _deltaArrow(dNum(delta.quality_min, 1, 1)),
+          cost: _deltaArrow(dNum(delta.cost_usd, 1, 2)),
+        },
+      }),
+      bars: (Array.isArray(p.series) ? p.series : []).map(s => {
+        s = s || {};
+        const passH = clampH(Number(s.pass_rate) * 100);
+        const qualityH = clampH(s.quality_mean);
+        const sha = String(s.sha || "").slice(0, 7);
+        return {
+          sha, passH, qualityH,
+          label: sha + " · " + Math.round((Number(s.pass_rate) || 0) * 100) + "% pass"
+            + " · quality " + (s.quality_mean != null ? s.quality_mean : "—")
+            + (s.cost_usd != null ? " · $" + Number(s.cost_usd).toFixed(2) : ""),
+        };
+      }),
+      // the server records history newest-last; the table reads newest-first
+      history: (Array.isArray(p.history) ? p.history : []).slice().reverse().map(_benchEntryRow),
+    };
+  }
+
+  // POST .../graph2/distill {dry_run:true} report -> the report panel model.
+  // A too-small graph arrives as an empty report with a `reason` string.
+  function distillReportModel(r) {
+    r = r || {};
+    const merges = (Array.isArray(r.merges) ? r.merges : []).map(m => {
+      m = m || {};
+      return {
+        keep: String(m.keep || ""), drop: String(m.drop || ""),
+        reason: String(m.reason || ""),
+        label: String(m.keep || "") + " ← " + String(m.drop || ""),
+      };
+    });
+    const prunes = (Array.isArray(r.prunes) ? r.prunes : []).map(e => {
+      e = e || {};
+      const bits = [];
+      if (e.weight != null) bits.push("w" + e.weight);
+      if (e.age_days != null) bits.push(Math.round(Number(e.age_days)) + "d old");
+      return {
+        edge: String(e.src || "") + " → " + String(e.dst || "")
+          + (e.relation ? " (" + e.relation + ")" : ""),
+        detail: bits.join(" · "),
+      };
+    });
+    const orphans = (Array.isArray(r.orphans) ? r.orphans : []).map(String);
+    const empty = !merges.length && !prunes.length && !orphans.length;
+    const reason = String(r.reason || "");
+    const n = (len, one, many) => len + " " + (len === 1 ? one : many);
+    return {
+      empty, reason,
+      emptyText: empty ? (reason || "Nothing to distill.") : "",
+      merges, prunes, orphans,
+      summary: empty ? "" : [
+        n(merges.length, "merge", "merges"),
+        n(prunes.length, "prune", "prunes"),
+        n(orphans.length, "orphan", "orphans"),
+      ].join(" · "),
+      canApply: !empty,
+    };
+  }
+
+  // POST .../graph2/distill {dry_run:false} response -> the applied-result line.
+  function distillResultModel(res) {
+    res = res || {};
+    const merged = Number(res.merged) || 0;
+    const pruned = Number(res.pruned) || 0;
+    const orphansRemoved = Number(res.orphans_removed) || 0;
+    return {
+      merged, pruned, orphansRemoved,
+      total: merged + pruned + orphansRemoved,
+      text: "Distilled — merged " + merged + " · pruned " + pruned
+        + " · removed " + orphansRemoved + " orphan" + (orphansRemoved === 1 ? "" : "s"),
+    };
+  }
+
+  // GET /api/auth/status {auth_required, authorized, user} -> sidebar user chip.
+  // Only a named (non-"local") user on an auth-gated server shows the chip.
+  // byLabel serves the task-detail "by <name>" chip and ignores auth_required
+  // (historical run payloads carry `user` regardless of the current gate).
+  function userChipModel(status) {
+    status = status || {};
+    const user = String(status.user || "").trim();
+    const named = !!user && user !== "local";
+    const visible = !!status.auth_required && named;
+    return {
+      visible,
+      name: named ? user : "",
+      label: visible ? "◆ " + user : "",
+      byLabel: named ? "by " + user : "",
+    };
+  }
+
+  // GET /api/users body -> admin-card rows. Tolerates a bare array, a
+  // {users:[...]} wrapper, and string-only entries.
+  function usersListModel(body) {
+    const list = Array.isArray(body) ? body
+      : (body && Array.isArray(body.users)) ? body.users : [];
+    const rows = list.map(u => {
+      if (typeof u === "string") return { name: u, createdAt: null };
+      u = u || {};
+      return {
+        name: String(u.name || ""),
+        createdAt: (u.created_at != null && isFinite(Number(u.created_at)))
+          ? Number(u.created_at) : null,
+      };
+    }).filter(r => r.name);
+    return {
+      rows, empty: !rows.length,
+      countLabel: rows.length + (rows.length === 1 ? " user" : " users"),
+    };
+  }
+
+  // POST /api/users response -> the one-time-token reveal model.
+  function userCreateModel(res) {
+    res = res || {};
+    const token = String(res.token || "");
+    return {
+      ok: !!token,
+      name: String(res.name || res.user || ""),
+      token,
+      warning: token ? "This token is shown once — copy it now." : "",
+    };
+  }
+
   const AdaUtil = {
     escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine,
     fmtRelTime, paletteResultsModel, scheduleRowModel, scheduleFormModel,
@@ -1775,6 +1952,8 @@
     homeModel, sidebarGroups, wsDepsModel, wsRunPayload,
     graph2ViewModel, nodePanelModel, GRAPH2_TYPES,
     agentsListModel, agentFormModel, agentFormValidate, AGENT_EFFORTS,
+    benchModel, distillReportModel, distillResultModel,
+    userChipModel, usersListModel, userCreateModel,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = AdaUtil;
