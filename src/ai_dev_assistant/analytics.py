@@ -1,10 +1,12 @@
 """Read-only spend analytics over the run store and per-run event logs.
 
-Aggregation layer for a cost dashboard. Everything here is strictly read-only:
-the runs database is opened on its own ``mode=ro`` SQLite connection (never the
-engine's read-write handle, never created if absent), and per-run
-``events.jsonl`` logs are parsed defensively — malformed lines are skipped, a
-deleted docs directory yields an empty breakdown.
+Aggregation layer for a cost dashboard. Everything here is strictly read-only
+against the run store: the runs database is opened on its own ``mode=ro``
+SQLite connection (never the engine's read-write handle, never created if
+absent), and per-run ``events.jsonl`` logs are parsed defensively — malformed
+lines are skipped, a deleted docs directory yields an empty breakdown. The one
+write this module performs is its own alert bookkeeping:
+``<data_dir>/spend_alerts.json`` (see :func:`check_spend_alerts`).
 
 Data sources
 ------------
@@ -30,6 +32,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -39,6 +42,7 @@ __all__ = [
     "project_spend",
     "cost_per_outcome",
     "run_cost_breakdown",
+    "check_spend_alerts",
 ]
 
 
@@ -263,6 +267,87 @@ def cost_per_outcome(settings: Any, *, days: int = 90) -> dict[str, Any]:
     out["usd_per_passed_subtask"] = _ratio(out["total_usd"], out["passed_subtasks"])
     out["usd_per_accepted_subtask"] = _ratio(out["total_usd"], out["accepted_subtasks"])
     return out
+
+
+# ---------------------------------------------------------------------------
+# budget alerts (spend vs. monthly cap, fire-once-per-month bookkeeping)
+# ---------------------------------------------------------------------------
+
+_ALERTS_FILENAME = "spend_alerts.json"
+_ALERT_WINDOW_DAYS = 30
+
+
+def _alerts_path(settings: Any) -> Path:
+    return Path(settings.data_dir) / _ALERTS_FILENAME
+
+
+def _load_alert_state(settings: Any) -> dict[str, Any]:
+    """{"month": "YYYY-MM", "fired": [thresholds]} — {} on missing/corrupt."""
+    try:
+        data = json.loads(_alerts_path(settings).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _save_alert_state(settings: Any, state: dict[str, Any]) -> None:
+    path = _alerts_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def check_spend_alerts(settings: Any, monthly_cap: float, *,
+                       thresholds: tuple[float, ...] = (0.5, 0.8, 1.0),
+                       now: float | None = None) -> list[dict[str, Any]]:
+    """Alerts for spend thresholds newly crossed this calendar month.
+
+    Compares the 30-day spend (:func:`spend_overview`) against
+    ``monthly_cap * threshold`` for each threshold. ``monthly_cap`` is a
+    PARAMETER on purpose: this module does not read the settings schema — the
+    server passes the cap it derives from its Settings (e.g. ``budget_usd``).
+    A cap <= 0 disables alerting entirely.
+
+    Fire-once semantics: which thresholds have already alerted is persisted in
+    ``<data_dir>/spend_alerts.json`` keyed by UTC calendar month
+    (``{"month": "YYYY-MM", "fired": [...]}``); a threshold alerts at most once
+    per month, and the state resets when the month rolls over. ``now`` (epoch
+    seconds) exists for deterministic tests and defaults to the current time —
+    it selects the bookkeeping month only, not the spend window.
+
+    Returns the NEW alerts, oldest threshold first, each::
+
+        {"type": "spend", "threshold": 0.8, "percent": 80, "spend_usd": ...,
+         "monthly_cap": ..., "month": "2026-07", "window_days": 30}
+    """
+    cap = _f(monthly_cap)
+    if cap <= 0:
+        return []
+    ts = time.time() if now is None else float(now)
+    month = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m")
+    spend = _f(spend_overview(settings, days=_ALERT_WINDOW_DAYS)["total_usd"])
+
+    state = _load_alert_state(settings)
+    fired: list[float] = ([_f(t) for t in state.get("fired", [])]
+                          if state.get("month") == month else [])
+
+    alerts: list[dict[str, Any]] = []
+    for th in sorted({_f(t) for t in thresholds}):
+        if th <= 0 or th in fired:
+            continue
+        if spend >= cap * th:
+            alerts.append({
+                "type": "spend",
+                "threshold": th,
+                "percent": int(round(th * 100)),
+                "spend_usd": round(spend, 6),
+                "monthly_cap": round(cap, 6),
+                "month": month,
+                "window_days": _ALERT_WINDOW_DAYS,
+            })
+            fired.append(th)
+    if alerts or state.get("month") != month:
+        _save_alert_state(settings, {"month": month, "fired": sorted(fired)})
+    return alerts
 
 
 # ---------------------------------------------------------------------------

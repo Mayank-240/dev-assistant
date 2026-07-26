@@ -449,6 +449,199 @@ instead.
 )
 
 
+_DEPENDENCY_REFRESH = Playbook(
+    id="dependency-refresh",
+    name="Dependency refresh",
+    description="Unattended refresh of every dependency to the newest version "
+                "its existing constraint allows; completes with no changes "
+                "when everything is already current.",
+    params=(
+        {"key": "scope", "label": "Path to refresh", "type": "str",
+         "default": ".", "required": False},
+    ),
+    prompt_template="""\
+Refresh the dependencies of {scope}: bring every dependency up to the newest version its \
+existing constraint already allows, and leave the project fully working. This is an \
+unattended maintenance run — be conservative, and prefer no change over a risky one.
+
+First, determine whether anything needs doing at all. If every dependency is already at \
+the newest version its constraint permits, complete WITHOUT changing any files and state \
+plainly that all dependencies are current — an empty run is a correct, successful result.
+
+Deliverable (when updates exist): refreshed pins/lockfile within the existing constraint \
+ranges, a green test suite, and a short note listing each package bumped with its old and \
+new versions.
+
+Method:
+1. Run the test suite first and record the baseline; you must not add to any pre-existing \
+failures.
+2. List the available in-range updates. Apply them in small clusters (patch bumps first, \
+then minor), re-running the tests after each cluster.
+3. If a bump breaks the suite and the fix is not obvious and minimal, revert that bump and \
+report it for a human-planned upgrade instead.
+
+Acceptance criteria (plan against these):
+- Every applied bump stays within the constraint already declared in the manifest — no \
+constraint is widened, no major version crossed.
+- The full test suite passes, minus only failures documented in the pre-refresh baseline.
+- The report lists every bump made, or states plainly that everything was already current.
+
+Guardrails:
+- Touch only dependency files (manifest and lockfile); do not edit application code. A \
+bump whose breakage needs code changes is out of scope for this run — revert and report it.
+- Do not add, remove, or replace dependencies; refresh only what is already there.
+- If nothing needs updating, change nothing and say so plainly.""",
+    settings_overrides={"agent_effort": "medium", "verify_run_tests": True},
+    suggested_title="Dependency refresh of {scope}",
+)
+
+_DOC_DRIFT = Playbook(
+    id="doc-drift",
+    name="Fix documentation drift",
+    description="Find documentation that has drifted from the code and update "
+                "the docs to match reality; no code changes, and no changes at "
+                "all when nothing has drifted.",
+    params=(
+        {"key": "scope", "label": "Path to check", "type": "str",
+         "default": ".", "required": False},
+    ),
+    prompt_template="""\
+Find and fix documentation drift in {scope}: places where READMEs, docstrings, or docs \
+pages describe behavior, names, signatures, options, or file paths that no longer match \
+the code.
+
+First, determine whether anything has actually drifted. If the documentation already \
+matches the code, complete WITHOUT changing any files and state plainly that no drift was \
+found — a clean bill of health is a correct, successful result.
+
+Deliverable (when drift exists): corrected documentation, plus a short drift report: each \
+fixed item with the doc location, what it claimed, and what the code actually does.
+
+Method:
+1. Inventory the documentation surfaces in {scope}: README files, docstrings on exported \
+modules, classes and functions, and any docs directory.
+2. Spot-check every checkable claim against the code: named functions and options exist, \
+signatures and defaults match, described behavior is what the code does, referenced paths \
+exist.
+3. Fix each confirmed drift by updating the DOCUMENTATION to match the code — never the \
+other way around.
+
+Acceptance criteria (plan against these):
+- Every edit is backed by a code reading; the drift report ties each fix to the code that \
+contradicts the old text.
+- The diff is documentation-only: no source file changed, and the test suite is untouched \
+and still green.
+- Claims that could not be verified are listed as open questions, not guessed at.
+
+Guardrails:
+- Change documentation only: markdown files, docstrings, and comments. If the CODE is \
+what's wrong, report it — do not fix code in this run.
+- Never invent behavior or options; every statement you write must be grounded in code \
+you read.
+- Match the project's existing doc style and structure; extend it, do not restructure it.""",
+    settings_overrides={"agent_effort": "medium"},
+    suggested_title="Fix documentation drift in {scope}",
+)
+
+_DEAD_CODE = Playbook(
+    id="dead-code",
+    name="Remove dead code",
+    description="Find provably-unreferenced code in a path and remove it with "
+                "recorded evidence; anything uncertain is reported, not "
+                "removed, and a clean path yields no changes.",
+    params=(
+        {"key": "scope", "label": "Path to sweep", "type": "str",
+         "default": ".", "required": False},
+    ),
+    prompt_template="""\
+Find and remove dead code in {scope}: functions, classes, branches, imports, and files \
+that provably cannot be reached from any entry point, public API, test, or configuration.
+
+First, determine whether there is anything to remove. If no dead code can be proven, \
+complete WITHOUT changing any files and state plainly that none was found — a clean bill \
+of health is a correct, successful result.
+
+Deliverable (when dead code exists): the removals, a green test suite, and an evidence \
+report: each removed item with the searches that prove nothing references it.
+
+Method:
+1. Build the candidate list mechanically: unreferenced exports, unused imports, \
+unreachable branches, files nothing imports.
+2. Prove each candidate dead before touching it: search the whole repository — tests, \
+scripts, configuration, templates, and string references that could feed dynamic dispatch \
+or reflection — for anything that could reach it. A candidate with a possible dynamic \
+reference is NOT dead; leave it and note it.
+3. Remove proven-dead items in small clusters, running the test suite after each cluster.
+
+Acceptance criteria (plan against these):
+- Every removal is backed by recorded evidence (the searches performed and their empty \
+results); nothing is removed on suspicion.
+- The full test suite passes, and any removed name that external callers could plausibly \
+import is explicitly flagged in the report.
+- The diff contains only removals and the minimal edits they force (e.g. dropping a \
+now-unused import) — no refactoring, no reformatting.
+
+Guardrails:
+- When in doubt, keep it: uncertain candidates go in the report, not the diff.
+- Never remove code that only tests reference by deleting those tests too; that is a \
+design decision for a human.
+- If nothing is provably dead, change nothing and say so plainly.""",
+    settings_overrides={"agent_effort": "high", "verify_run_tests": True},
+    suggested_title="Remove dead code in {scope}",
+)
+
+_CUT_A_RELEASE = Playbook(
+    id="cut-a-release",
+    name="Cut a release",
+    description="Prepare a release on the task branch: changelog derived from "
+                "git history and run docs, version bump, CHANGELOG.md update — "
+                "committed, but never tagged or pushed.",
+    params=(
+        {"key": "version_bump", "label": "Version bump", "type": "choice",
+         "choices": ["patch", "minor", "major"], "required": True},
+        {"key": "notes_style", "label": "Release notes style", "type": "choice",
+         "choices": ["highlights", "detailed"],
+         "default": "highlights", "required": False},
+    ),
+    prompt_template="""\
+Prepare a {version_bump} release of this project on the task branch. Release notes \
+style: {notes_style}.
+
+Deliverable: a release-ready commit on the task branch containing the version bump and an \
+updated CHANGELOG.md — and nothing else. The human tags and pushes after acceptance; you \
+do neither.
+
+Method:
+1. Find where the project defines its version (package manifest, __version__, VERSION \
+file, ...) and compute the new version from the current one with a {version_bump} bump.
+2. Derive the changelog from the git history since the previous release (the last version \
+bump or tag reachable in history), consulting the run documents and reports that accompany \
+those changes where available: read the actual commits and diffs, then write \
+{notes_style}-style notes grouped by kind (features, fixes, breaking changes, internal). \
+Describe user-visible behavior, not commit subjects verbatim.
+3. Update CHANGELOG.md (create it in the conventional format if absent), bump the version \
+in every place the project defines it, run the test suite, and commit the result on the \
+task branch.
+
+Acceptance criteria (plan against these):
+- The new version is exactly one {version_bump} step from the current version, and every \
+place the project states its version agrees.
+- Every changelog entry corresponds to a real change in the covered history; breaking \
+changes are called out explicitly.
+- The test suite passes, and the release changes are committed on the task branch.
+
+Guardrails:
+- Do NOT create a git tag and do NOT push anywhere: delivery stays branch-based, and \
+tagging is the human's act of acceptance after review.
+- Change only release metadata: the version definition(s) and CHANGELOG.md. No code \
+changes, however small.
+- If the history since the last release contains no changes worth releasing, say so \
+plainly and complete without changing files rather than manufacturing a release.""",
+    settings_overrides={"agent_effort": "medium"},
+    suggested_title="Cut a {version_bump} release",
+)
+
+
 PLAYBOOKS: list[Playbook] = [
     _RAISE_COVERAGE,
     _UPGRADE_DEPENDENCY,
@@ -457,6 +650,10 @@ PLAYBOOKS: list[Playbook] = [
     _DOCUMENT_CODEBASE,
     _FIX_FAILING_TESTS,
     _ADD_FEATURE_TDD,
+    _DEPENDENCY_REFRESH,
+    _DOC_DRIFT,
+    _DEAD_CODE,
+    _CUT_A_RELEASE,
 ]
 
 

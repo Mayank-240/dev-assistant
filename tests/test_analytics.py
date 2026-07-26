@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from ai_dev_assistant.analytics import (
+    check_spend_alerts,
     cost_per_outcome,
     project_spend,
     run_cost_breakdown,
@@ -306,3 +307,67 @@ def test_all_db_connections_are_read_only(settings, store, monkeypatch):
         assert kwargs.get("uri") is True
     # and the data is still fully readable afterwards
     assert store.get("r1")["cost_usd"] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# budget alerts (check_spend_alerts)
+# ---------------------------------------------------------------------------
+
+def _month_ts(months_ahead: int = 0) -> float:
+    """Epoch seconds midway through the UTC month ``months_ahead`` from now."""
+    today = datetime.now(timezone.utc)
+    month0 = (today.year * 12 + today.month - 1) + months_ahead
+    year, month = divmod(month0, 12)
+    return datetime(year, month + 1, 15, 12, 0, tzinfo=timezone.utc).timestamp()
+
+
+def test_spend_alerts_thresholds_fire_once_per_month(settings, store):
+    seed(store, "r1", days_ago=0, cost=5.0)
+    seed(store, "r2", days_ago=1, cost=3.0)  # 30-day spend: 8.0
+    now = _month_ts()
+    alerts = check_spend_alerts(settings, 10.0, now=now)
+    assert [a["threshold"] for a in alerts] == [0.5, 0.8]
+    assert alerts[0]["percent"] == 50 and alerts[1]["percent"] == 80
+    for a in alerts:
+        assert a["type"] == "spend"
+        assert a["spend_usd"] == pytest.approx(8.0)
+        assert a["monthly_cap"] == pytest.approx(10.0)
+        assert a["window_days"] == 30
+    # Same month, same spend: nothing fires twice.
+    assert check_spend_alerts(settings, 10.0, now=now) == []
+
+
+def test_spend_alerts_higher_threshold_fires_later(settings, store):
+    seed(store, "r1", days_ago=0, cost=6.0)
+    now = _month_ts()
+    assert [a["threshold"] for a in check_spend_alerts(settings, 10.0, now=now)] == [0.5]
+    seed(store, "r2", days_ago=0, cost=4.5)  # spend now 10.5 — over the cap
+    assert [a["threshold"] for a in check_spend_alerts(settings, 10.0, now=now)] == [0.8, 1.0]
+
+
+def test_spend_alerts_reset_on_month_rollover(settings, store):
+    seed(store, "r1", days_ago=0, cost=12.0)
+    assert len(check_spend_alerts(settings, 10.0, now=_month_ts())) == 3
+    assert check_spend_alerts(settings, 10.0, now=_month_ts()) == []
+    # New calendar month: the fired-set resets and thresholds fire again.
+    assert len(check_spend_alerts(settings, 10.0, now=_month_ts(1))) == 3
+
+
+def test_spend_alerts_state_file_roundtrip(settings, store):
+    seed(store, "r1", days_ago=0, cost=9.0)
+    now = _month_ts()
+    check_spend_alerts(settings, 10.0, now=now)
+    path = settings.data_dir / "spend_alerts.json"
+    state = json.loads(path.read_text())
+    month = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m")
+    assert state == {"month": month, "fired": [0.5, 0.8]}
+    # A corrupt state file is treated as empty, never crashes — and re-fires.
+    path.write_text("{not json")
+    assert [a["threshold"] for a in check_spend_alerts(settings, 10.0, now=now)] == [0.5, 0.8]
+
+
+def test_spend_alerts_no_cap_means_no_alerts(settings, store):
+    seed(store, "r1", days_ago=0, cost=100.0)
+    assert check_spend_alerts(settings, 0.0, now=_month_ts()) == []
+    assert check_spend_alerts(settings, -5, now=_month_ts()) == []
+    assert not (settings.data_dir / "spend_alerts.json").exists()

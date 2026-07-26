@@ -160,6 +160,10 @@ def test_render_every_playbook_with_minimal_params():
         "document-codebase": {},
         "fix-failing-tests": {},
         "add-feature-tdd": {"feature": "add a --json flag to the CLI"},
+        "dependency-refresh": {},
+        "doc-drift": {},
+        "dead-code": {},
+        "cut-a-release": {"version_bump": "minor"},
     }
     assert set(minimal) == {pb.id for pb in PLAYBOOKS}
     for pid, params in minimal.items():
@@ -177,6 +181,54 @@ def test_render_settings_overrides_is_a_copy():
 def test_render_strips_whitespace_in_str_params():
     out = render("upgrade-dependency", {"package": "  numpy  ", "target_version": "2.1"})
     assert "dependency numpy to version 2.1" in out["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# maintenance + release playbooks (dependency-refresh, doc-drift, dead-code,
+# cut-a-release)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("pid", ["dependency-refresh", "doc-drift", "dead-code"])
+def test_maintenance_playbooks_render_with_no_params(pid):
+    out = render(pid, {})
+    assert "." in out["title"]                    # scope defaults to "."
+    # Unattended runs must be told a clean bill of health means NO file changes.
+    assert "WITHOUT changing any files" in out["prompt"]
+    assert "say so plainly" in out["prompt"] or "state plainly" in out["prompt"]
+
+
+def test_doc_drift_renders_scope():
+    out = render("doc-drift", {"scope": "src/web"})
+    assert "documentation drift in src/web" in out["prompt"]
+    assert out["title"] == "Fix documentation drift in src/web"
+
+
+def test_dead_code_renders_scope():
+    out = render("dead-code", {"scope": "src/pkg"})
+    assert "dead code in src/pkg" in out["prompt"]
+    assert out["title"] == "Remove dead code in src/pkg"
+
+
+def test_cut_a_release_happy_path_and_default_style():
+    out = render("cut-a-release", {"version_bump": "minor", "notes_style": "detailed"})
+    assert out["title"] == "Cut a minor release"
+    assert "a minor release" in out["prompt"]
+    assert "detailed-style notes" in out["prompt"]
+    # Branch-based delivery: the agent must never tag or push.
+    assert "Do NOT create a git tag" in out["prompt"]
+    assert "do NOT push" in out["prompt"]
+    assert "CHANGELOG.md" in out["prompt"]
+    out = render("cut-a-release", {"version_bump": "patch"})
+    assert "highlights-style notes" in out["prompt"]  # notes_style default
+
+
+def test_cut_a_release_param_validation():
+    with pytest.raises(ValueError, match="missing required param 'version_bump'"):
+        render("cut-a-release", {})
+    with pytest.raises(ValueError, match="'version_bump' must be one of.*got 'huge'"):
+        render("cut-a-release", {"version_bump": "huge"})
+    with pytest.raises(ValueError, match="'notes_style' must be one of"):
+        render("cut-a-release", {"version_bump": "patch", "notes_style": "epic"})
 
 
 # ---------------------------------------------------------------------------

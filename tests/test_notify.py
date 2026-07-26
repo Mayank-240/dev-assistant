@@ -569,3 +569,47 @@ class TestRedaction:
     def test_empty_and_none_safe(self):
         assert redact_for_notification("") == ""
         assert redact_for_notification(None) == ""  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------- spend alerts
+
+def _capture(calls):
+    def transport(url, payload, headers):
+        calls.append((url, json.loads(payload.decode("utf-8")), headers))
+    return transport
+
+
+ALERT = {"type": "spend", "threshold": 0.8, "percent": 80, "spend_usd": 8.437,
+         "monthly_cap": 10.0, "month": "2026-07", "window_days": 30}
+
+
+class TestSpendAlerts:
+    def test_format_spend_alert_snapshot(self):
+        assert notify.format_spend_alert(ALERT) == (
+            "Budget alert: 30-day spend $8.44 has crossed 80% of the "
+            "$10.00 monthly cap (2026-07).")
+
+    def test_format_spend_alert_tolerates_missing_fields(self):
+        out = notify.format_spend_alert({})
+        assert out.startswith("Budget alert:") and "$0.00" in out
+
+    def test_notify_spend_alert_bypasses_event_filter(self):
+        calls = []
+        # Default events do NOT include spend_alert — the helper must still fire.
+        cfg = NotifyConfig(webhook_url="https://hooks.example.com/x")
+        assert notify.notify_spend_alert(cfg, ALERT, transport=_capture(calls)) is True
+        assert len(calls) == 1
+        _, payload, _ = calls[0]
+        assert payload["event"] == "spend_alert"
+        assert payload["project"] == "budget"
+        assert payload["message"] == notify.format_spend_alert(ALERT)
+        assert payload["data"]["threshold"] == 0.8
+        assert payload["data"]["monthly_cap"] == 10.0
+
+    def test_notify_spend_alert_never_raises(self):
+        def boom(url, payload, headers):
+            raise OSError("down")
+
+        cfg = NotifyConfig(webhook_url="https://hooks.example.com/x")
+        assert notify.notify_spend_alert(cfg, ALERT, transport=boom) is False
+        assert notify.notify_spend_alert(NotifyConfig(), ALERT) is False  # no channels

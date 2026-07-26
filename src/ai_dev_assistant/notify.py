@@ -52,7 +52,7 @@ import sys
 import time
 import urllib.request
 from email.message import EmailMessage
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -341,4 +341,52 @@ def notify_event(cfg: NotifyConfig, *, event_type: str, task_id: str, project: s
     except Exception:
         # Belt over the per-channel braces: nothing escapes notify_event.
         log.warning("notify: unexpected failure", exc_info=True)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Budget alerts (analytics.check_spend_alerts -> the same channel fan-out)
+# ---------------------------------------------------------------------------
+
+SPEND_ALERT_EVENT = "spend_alert"
+
+
+def format_spend_alert(alert: dict[str, Any]) -> str:
+    """One-line human message for a spend alert dict from
+    ``analytics.check_spend_alerts``."""
+    try:
+        pct = int(round(float(alert.get("threshold") or 0.0) * 100))
+        spend = float(alert.get("spend_usd") or 0.0)
+        cap = float(alert.get("monthly_cap") or 0.0)
+    except (TypeError, ValueError):
+        pct, spend, cap = 0, 0.0, 0.0
+    month = str(alert.get("month") or "")
+    window = alert.get("window_days") or 30
+    return (f"Budget alert: {window}-day spend ${spend:.2f} has crossed {pct}% "
+            f"of the ${cap:.2f} monthly cap ({month}).")
+
+
+def notify_spend_alert(cfg: NotifyConfig, alert: dict[str, Any],
+                       transport: Transport | None = None) -> bool:
+    """Send one budget alert through the existing channel dispatch.
+
+    Reuses :func:`notify_event` (same channels, same redaction, same SSRF
+    guard, same never-raises contract). Budget alerts fire only when
+    ``analytics.check_spend_alerts`` decides a threshold was newly crossed, so
+    the per-event-type filter is bypassed by extending the allowed events for
+    this one call rather than requiring operators to opt in to
+    ``spend_alert``.
+    """
+    try:
+        events = (cfg.events if SPEND_ALERT_EVENT in cfg.events
+                  else (*cfg.events, SPEND_ALERT_EVENT))
+        return notify_event(replace(cfg, events=events),
+                            event_type=SPEND_ALERT_EVENT,
+                            task_id="",
+                            project="budget",
+                            message=format_spend_alert(alert),
+                            data=dict(alert or {}),
+                            transport=transport)
+    except Exception:
+        log.warning("notify: spend alert failed", exc_info=True)
         return False
