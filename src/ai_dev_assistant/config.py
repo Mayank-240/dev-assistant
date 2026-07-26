@@ -2,13 +2,24 @@
 
 Everything tunable lives here so the rest of the code never reads os.environ
 directly. Construct once via ``Settings.load()`` and pass it down.
+
+Precedence: ``Settings.load()`` first resolves every field from the environment
+(falling back to the dataclass defaults), then applies the JSON overlay written
+by the global settings console (``<data_dir>/settings.json``). For any key the
+console has overridden, the console value WINS over the environment; deleting
+the override reverts the key to its env/default value. Only keys whitelisted in
+``SETTINGS_SCHEMA`` are ever read from the overlay — secrets, paths and backend
+identity can only come from the environment.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -131,8 +142,11 @@ class Settings:
     workspace_dir: Path = Path("workspace")
 
     @classmethod
-    def load(cls) -> "Settings":
-        return cls(
+    def load(cls, *, overlay: bool = True) -> "Settings":
+        """Resolve settings from the environment, then apply the settings-console
+        overlay (``<data_dir>/settings.json``) — console values win for keys it
+        has overridden. ``overlay=False`` returns the pure env/default view."""
+        s = cls(
             llm_backend=_get("ADA_LLM_BACKEND", "claude_sdk"),
             sdk_model=_get("ADA_SDK_MODEL", ""),
             anthropic_api_key=_get("ANTHROPIC_API_KEY", ""),
@@ -184,6 +198,7 @@ class Settings:
             memory_scope=_get("ADA_MEMORY_SCOPE", "project"),
             workspace_dir=Path(_get("ADA_WORKSPACE_DIR", "workspace")),
         )
+        return apply_overrides(s) if overlay else s
 
     @property
     def has_api_key(self) -> bool:
@@ -243,3 +258,218 @@ class Settings:
         self.project_dir.mkdir(parents=True, exist_ok=True)
         self.global_db_path.parent.mkdir(parents=True, exist_ok=True)
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
+
+
+# ===========================================================================
+# Global settings console — JSON overlay + editable whitelist.
+#
+# The console persists edits to <data_dir>/settings.json; Settings.load()
+# applies that overlay LAST, so console values win over the environment for
+# the keys it has overridden (see the module docstring). SETTINGS_SCHEMA is
+# the single source of truth for what the console may list and set.
+#
+# Deliberately EXCLUDED (never listed, never settable via the overlay):
+# anthropic_api_key and any tokens, data_dir/docs_dir/workspace_dir,
+# llm_backend, record_dir/replay_dir, protected_paths (project-level policy),
+# git_branch_prefix.
+# ===========================================================================
+
+OVERRIDES_FILENAME = "settings.json"
+
+_EFFORT_CHOICES = ["low", "medium", "high", "xhigh", "max"]
+
+SETTINGS_SCHEMA: list[dict] = [
+    # --- LLM & Models ---
+    {"key": "sdk_model", "group": "LLM & Models", "label": "SDK model",
+     "help": "Model override for the Claude SDK backend — blank keeps the Claude Code default.",
+     "type": "str"},
+    {"key": "orchestrator_model", "group": "LLM & Models", "label": "Orchestrator model",
+     "help": "Model the orchestrator plans and reviews with (API backend).", "type": "str"},
+    {"key": "agent_model", "group": "LLM & Models", "label": "Agent model",
+     "help": "Model the specialist agents execute subtasks with (API backend).", "type": "str"},
+    {"key": "orchestrator_effort", "group": "LLM & Models", "label": "Orchestrator effort",
+     "help": "Reasoning effort for planning and review.", "type": "choice",
+     "choices": _EFFORT_CHOICES},
+    {"key": "agent_effort", "group": "LLM & Models", "label": "Agent effort",
+     "help": "Reasoning effort for subtask execution.", "type": "choice",
+     "choices": _EFFORT_CHOICES},
+    {"key": "reviewer_effort", "group": "LLM & Models", "label": "Reviewer effort",
+     "help": "Reasoning effort for verdict review.", "type": "choice",
+     "choices": _EFFORT_CHOICES},
+    {"key": "request_timeout", "group": "LLM & Models", "label": "Request timeout (s)",
+     "help": "Per-LLM-call HTTP timeout in seconds.", "type": "float"},
+    {"key": "llm_max_retries", "group": "LLM & Models", "label": "LLM max retries",
+     "help": "Bounded backoff retries on transient 429/5xx/timeout.", "type": "int"},
+    # --- Guardrails & Budget ---
+    {"key": "budget_usd", "group": "Guardrails & Budget", "label": "Budget (USD)",
+     "help": "Stop scheduling new work past this cost cap — 0 means no cap.", "type": "float"},
+    {"key": "agent_max_turns", "group": "Guardrails & Budget", "label": "Agent max turns",
+     "help": "Per-agent tool-loop cap — lower is cheaper.", "type": "int"},
+    {"key": "subtask_max_seconds", "group": "Guardrails & Budget", "label": "Subtask max seconds",
+     "help": "Wall-clock cap per subtask attempt — 0 means no cap.", "type": "float"},
+    {"key": "attention_timeout", "group": "Guardrails & Budget", "label": "Attention timeout (s)",
+     "help": "How long an agent waits for an operator answer (counts toward the subtask cap).",
+     "type": "float"},
+    {"key": "max_plan_subtasks", "group": "Guardrails & Budget", "label": "Max plan subtasks",
+     "help": "Reject a plan larger than this (hallucination guard).", "type": "int"},
+    {"key": "max_concurrent_runs", "group": "Guardrails & Budget", "label": "Max concurrent runs",
+     "help": "How many queued tasks execute at once — 1 is serial.", "type": "int"},
+    {"key": "max_concurrent_sessions", "group": "Guardrails & Budget",
+     "label": "Max concurrent sessions",
+     "help": "Agent-session pool size within a run.", "type": "int"},
+    {"key": "max_retries", "group": "Guardrails & Budget", "label": "Max review retries",
+     "help": "How many times a failed subtask is retried after review.", "type": "int"},
+    # --- Execution & Safety ---
+    {"key": "sandbox", "group": "Execution & Safety", "label": "Sandbox",
+     "help": "How agent commands are isolated when they run.", "type": "choice",
+     "choices": ["subprocess", "bwrap", "container", "none"]},
+    {"key": "sandbox_cpu_seconds", "group": "Execution & Safety", "label": "Sandbox CPU seconds",
+     "help": "CPU-time rlimit for sandboxed commands.", "type": "int"},
+    {"key": "sandbox_mem_mb", "group": "Execution & Safety", "label": "Sandbox memory (MB)",
+     "help": "Address-space rlimit for sandboxed commands.", "type": "int"},
+    {"key": "allow_run_command", "group": "Execution & Safety", "label": "Allow run_command",
+     "help": "Expose the run_command / install_packages agent tools.", "type": "bool"},
+    {"key": "allow_web", "group": "Execution & Safety", "label": "Allow web access",
+     "help": "Allow built-in WebSearch/WebFetch in the SDK agent loop.", "type": "bool"},
+    {"key": "redact_secrets", "group": "Execution & Safety", "label": "Redact secrets",
+     "help": "Scrub secret-shaped strings from tool output, docs and memory.", "type": "bool"},
+    {"key": "audit_log", "group": "Execution & Safety", "label": "Audit log",
+     "help": "Append every tool dispatch to an audit log.", "type": "bool"},
+    {"key": "git_mode", "group": "Execution & Safety", "label": "Git mode",
+     "help": "Project outcome: leave a branch for review, or auto-merge on pass.",
+     "type": "choice", "choices": ["branch", "merge"]},
+    {"key": "worktree_per_subtask", "group": "Execution & Safety",
+     "label": "Worktree per subtask",
+     "help": "Isolate parallel subtasks in git worktrees, merged on pass.", "type": "bool"},
+    # --- Verification ---
+    {"key": "verify_run_tests", "group": "Verification", "label": "Run generated tests",
+     "help": "Run generated tests in the workspace after a task.", "type": "bool"},
+    {"key": "verify_timeout", "group": "Verification", "label": "Verify timeout (s)",
+     "help": "Time budget for the post-task test run.", "type": "float"},
+    {"key": "objective_review", "group": "Verification", "label": "Objective review",
+     "help": "Gate verdicts on file contents plus per-subtask tests.", "type": "bool"},
+    {"key": "lint_check", "group": "Verification", "label": "Lint check",
+     "help": "Include ruff/pyflakes signal in the objective gate.", "type": "bool"},
+    {"key": "degrade_on_partial", "group": "Verification", "label": "Degrade on partial",
+     "help": "A subtask with real output that failed review passes with caveats "
+             "so dependents still run.", "type": "bool"},
+    {"key": "adaptive_replan", "group": "Verification", "label": "Adaptive replan",
+     "help": "Let the orchestrator amend the plan DAG between batches.", "type": "bool"},
+    # --- Memory & Knowledge ---
+    {"key": "memory_scope", "group": "Memory & Knowledge", "label": "Memory scope",
+     "help": "Where new memories are written — recall always reads project + global.",
+     "type": "choice", "choices": ["project", "global"]},
+    {"key": "embeddings_backend", "group": "Memory & Knowledge", "label": "Embeddings backend",
+     "help": "Vector backend for memory recall.", "type": "choice",
+     "choices": ["fastembed", "hash"], "restart_required": True},
+    {"key": "embed_model", "group": "Memory & Knowledge", "label": "Embedding model",
+     "help": "Sentence-embedding model used by the fastembed backend.", "type": "str",
+     "restart_required": True},
+    # --- Observability ---
+    {"key": "trace", "group": "Observability", "label": "Trace",
+     "help": "Record an LLM/tool span log per run.", "type": "bool"},
+]
+
+_SCHEMA_BY_KEY: dict[str, dict] = {e["key"]: e for e in SETTINGS_SCHEMA}
+
+
+def is_editable(key: str) -> bool:
+    """True when the settings console may list/set this key."""
+    return key in _SCHEMA_BY_KEY
+
+
+def env_var_for(key: str) -> str:
+    """The ADA_* environment variable backing a whitelisted settings key."""
+    return "ADA_" + key.upper()
+
+
+def load_overrides(data_dir: Path) -> dict:
+    """The console's overlay dict from <data_dir>/settings.json — {} on missing/corrupt."""
+    path = Path(data_dir) / OVERRIDES_FILENAME
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_overrides(data_dir: Path, overrides: dict) -> None:
+    """Merge-write the overlay: existing keys are kept, given keys are updated,
+    and a value of ``None`` deletes a key (revert to env/default)."""
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    current = load_overrides(data_dir)
+    for key, value in overrides.items():
+        if value is None:
+            current.pop(key, None)
+        else:
+            current[key] = value
+    (data_dir / OVERRIDES_FILENAME).write_text(
+        json.dumps(current, indent=2, sort_keys=True) + "\n")
+
+
+_BOOL_TRUE = {"1", "true", "yes", "on"}
+_BOOL_FALSE = {"0", "false", "no", "off"}
+
+
+def coerce_setting(key: str, value: Any) -> Any:
+    """Coerce a console/overlay value to the dataclass field's type.
+
+    Raises ValueError for unknown keys, uncoercible values, or out-of-set
+    choice values. The target type comes from the Settings dataclass itself."""
+    entry = _SCHEMA_BY_KEY.get(key)
+    if entry is None:
+        raise ValueError(f"unknown setting: {key}")
+    ftype = str({f.name: f.type for f in dataclasses.fields(Settings)}[key])
+    try:
+        if ftype == "bool":
+            if isinstance(value, bool):
+                out = value
+            elif isinstance(value, (int, float)) and value in (0, 1):
+                out = bool(value)
+            elif isinstance(value, str) and value.strip().lower() in _BOOL_TRUE | _BOOL_FALSE:
+                out = value.strip().lower() in _BOOL_TRUE
+            else:
+                raise ValueError
+        elif ftype == "int":
+            if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+                raise ValueError
+            out = int(value)
+        elif ftype == "float":
+            if isinstance(value, bool):
+                raise ValueError
+            out = float(value)
+        elif ftype.startswith("tuple"):
+            if isinstance(value, str):
+                out = tuple(p.strip() for p in value.split(",") if p.strip())
+            elif isinstance(value, (list, tuple)):
+                out = tuple(str(v) for v in value)
+            else:
+                raise ValueError
+        else:  # str
+            if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+                raise ValueError
+            out = str(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"cannot coerce {value!r} for setting '{key}' ({ftype})") from None
+    if entry["type"] == "choice" and out not in entry.get("choices", []):
+        raise ValueError(
+            f"'{key}' must be one of: " + ", ".join(entry.get("choices", [])))
+    return out
+
+
+def apply_overrides(settings: Settings) -> Settings:
+    """Return ``settings`` with the console overlay applied on top (console wins).
+
+    Unknown/non-whitelisted keys and uncoercible values in the overlay are
+    ignored defensively — a hand-edited settings.json can never break startup."""
+    overrides = load_overrides(Path(settings.data_dir))
+    patch: dict[str, Any] = {}
+    for key, raw in overrides.items():
+        if key not in _SCHEMA_BY_KEY:
+            continue
+        try:
+            patch[key] = coerce_setting(key, raw)
+        except ValueError:
+            continue
+    return dataclasses.replace(settings, **patch) if patch else settings

@@ -29,7 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import projects, vcs
+from .. import config, projects, vcs
 from ..agents.registry import build_agents
 from ..config import Settings
 from ..engine import Engine
@@ -263,9 +263,15 @@ class SubtaskRejectRequest(BaseModel):
 
 def create_app(settings: Settings | None = None, host: str | None = None,
                api_token: str | None = None) -> FastAPI:
-    settings = settings or Settings.load()
+    # `settings` is the env/default base (paths, backend identity). The settings
+    # console's overlay is applied ON TOP into app.state.base_settings — the live
+    # base every NEW run/plan starts from; PATCH/DELETE /api/settings rebind it,
+    # so edits apply to new runs immediately, without a restart.
+    settings = settings or Settings.load(overlay=False)
     app = FastAPI(title="AI Dev Assistant")
     app.state.settings = settings
+    app.state.env_settings = settings
+    app.state.base_settings = config.apply_overrides(settings)
     app.state.brokers = {}
 
     # ---- S8: bearer-token auth. Token from ADA_API_TOKEN; when binding a non-loopback
@@ -307,7 +313,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     app.state.runs = RunStore(settings.data_dir / "runs.db")
     app.state.runs.interrupt_orphans()  # clean up runs orphaned by a restart
     # task queue / scheduler state
-    app.state.concurrency = max(1, settings.max_concurrent_runs)
+    app.state.concurrency = max(1, app.state.base_settings.max_concurrent_runs)
     app.state.paused = False
     app.state.running = set()  # task_ids currently executing
     app.state.controls = {}  # task_id -> RunControl (in-run pause/steer)
@@ -397,8 +403,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             app.state.runs.start(task_id, prompt, title=(title or None))
         if continue_from:
             app.state.runs.set_parent(task_id, continue_from)
-        engine = Engine(_settings_for(settings, effort, budget, project, memory_scope,
-                                      git_finalize, model=model))
+        engine = Engine(_settings_for(app.state.base_settings, effort, budget, project,
+                                      memory_scope, git_finalize, model=model))
         control = RunControl()
         engine.control = control  # enables pause/resume/steer endpoints to reach this run
         app.state.controls[task_id] = control
@@ -447,7 +453,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                 broker.publish(Event("error", msg, {"message": msg}))
                 app.state.runs.set_status(task_id, "failed")
                 return
-            await fn(_settings_for(settings, effort, budget, model=model), prompt, slugs,
+            await fn(_settings_for(app.state.base_settings, effort, budget, model=model),
+                     prompt, slugs,
                      title=(title or None), stagger=bool(stagger), task_id=task_id,
                      on_event=broker.publish)
         except asyncio.CancelledError:
@@ -469,8 +476,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
 
     @app.post("/api/plan")
     async def make_plan(req: PlanRequest) -> JSONResponse:
-        engine = Engine(_settings_for(settings, req.effort, req.budget, req.project,
-                                      req.memory_scope, model=req.model))
+        engine = Engine(_settings_for(app.state.base_settings, req.effort, req.budget,
+                                      req.project, req.memory_scope, model=req.model))
         try:
             plan = await engine.make_plan(req.prompt, continue_from=req.continue_from)
         except LLMError as exc:
@@ -487,8 +494,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     async def refine_plan(req: RefinePlanRequest) -> JSONResponse:
         if not (req.instruction or "").strip():
             return JSONResponse({"error": "instruction is required"}, status_code=400)
-        engine = Engine(_settings_for(settings, req.effort, req.budget, req.project,
-                                      req.memory_scope, model=req.model))
+        engine = Engine(_settings_for(app.state.base_settings, req.effort, req.budget,
+                                      req.project, req.memory_scope, model=req.model))
         try:
             current = Plan.model_validate(req.plan)
             plan = await engine.refine_plan(req.prompt, current, req.instruction)
@@ -713,12 +720,80 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     # ---- W5: safe, non-secret config for the UI (feeds the cost-vs-budget meter) ----
     @app.get("/api/config")
     async def get_config() -> JSONResponse:
-        # Whitelisted fields only — never API keys, tokens, or paths.
+        # Whitelisted fields only — never API keys, tokens, or paths. Reads the
+        # LIVE base (env + console overlay) so the meter tracks console edits.
+        live = app.state.base_settings
         return JSONResponse({
-            "budget_usd": settings.budget_usd,
-            "llm_backend": settings.llm_backend,
-            "max_concurrent_runs": settings.max_concurrent_runs,
-            "sdk_model": settings.sdk_model,
+            "budget_usd": live.budget_usd,
+            "llm_backend": live.llm_backend,
+            "max_concurrent_runs": live.max_concurrent_runs,
+            "sdk_model": live.sdk_model,
+        })
+
+    # ---- Global settings console: schema-driven GET/PATCH/DELETE over the JSON
+    # overlay in <data_dir>/settings.json. PATCH/DELETE rebind the live base so
+    # NEW runs pick the change up immediately; in-flight runs keep their settings.
+    def _settings_source(key: str, overlay: dict[str, Any]) -> str:
+        if key in overlay:
+            return "override"
+        return "env" if (os.getenv(config.env_var_for(key)) or "") != "" else "default"
+
+    @app.get("/api/settings")
+    async def get_global_settings() -> JSONResponse:
+        overlay = config.load_overrides(settings.data_dir)
+        live = app.state.base_settings
+        groups: list[dict[str, Any]] = []
+        by_name: dict[str, dict[str, Any]] = {}
+        for entry in config.SETTINGS_SCHEMA:
+            group = by_name.get(entry["group"])
+            if group is None:
+                group = {"name": entry["group"], "fields": []}
+                by_name[entry["group"]] = group
+                groups.append(group)
+            group["fields"].append({
+                "key": entry["key"], "label": entry["label"], "help": entry["help"],
+                "type": entry["type"], "choices": list(entry.get("choices") or []),
+                "value": getattr(live, entry["key"]),
+                "source": _settings_source(entry["key"], overlay),
+                "restart_required": bool(entry.get("restart_required")),
+            })
+        return JSONResponse({
+            "groups": groups,
+            "info": {
+                "llm_backend": settings.llm_backend,
+                "data_dir": str(settings.data_dir),
+                "projects": len(projects.list_projects(settings)),
+            },
+        })
+
+    @app.patch("/api/settings")
+    async def patch_global_settings(payload: dict[str, Any]) -> JSONResponse:
+        if not payload:
+            return JSONResponse({"error": "no settings provided"}, status_code=400)
+        coerced: dict[str, Any] = {}
+        for key, value in payload.items():
+            if not config.is_editable(key):
+                return JSONResponse({"error": f"unknown or non-editable setting: {key}"},
+                                    status_code=400)
+            try:  # None deletes the override (save_overrides contract)
+                coerced[key] = None if value is None else config.coerce_setting(key, value)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+        config.save_overrides(settings.data_dir, coerced)
+        app.state.base_settings = config.apply_overrides(app.state.env_settings)
+        return JSONResponse({"ok": True, "settings": {
+            k: getattr(app.state.base_settings, k) for k in coerced}})
+
+    @app.delete("/api/settings/{key}")
+    async def delete_global_setting(key: str) -> JSONResponse:
+        if not config.is_editable(key):
+            return JSONResponse({"error": f"unknown or non-editable setting: {key}"},
+                                status_code=400)
+        config.save_overrides(settings.data_dir, {key: None})
+        app.state.base_settings = config.apply_overrides(app.state.env_settings)
+        return JSONResponse({
+            "ok": True, "value": getattr(app.state.base_settings, key),
+            "source": _settings_source(key, config.load_overrides(settings.data_dir)),
         })
 
     @app.get("/api/quality")
@@ -943,7 +1018,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
 
     @app.get("/api/agents")
     async def list_agents() -> JSONResponse:
-        agents = build_agents(settings)
+        agents = build_agents(app.state.base_settings)  # tool roster follows console edits
         return JSONResponse([
             {
                 "name": a.name,

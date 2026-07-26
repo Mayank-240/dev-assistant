@@ -685,6 +685,82 @@
   }
 
   // ===========================================================
+  // Global settings console — pure models for GET /api/settings.
+  // app.js only does DOM work from these; both are Node-tested.
+  // ===========================================================
+
+  // One field from GET /api/settings -> render model for its row + control.
+  // type: "bool|int|float|str|choice" -> control: checkbox|number|text|select.
+  // Text fields are plain — the caller escapes before injecting into HTML.
+  function fieldControlModel(f) {
+    f = f || {};
+    const type = String(f.type || "str");
+    const control = type === "bool" ? "checkbox"
+      : type === "choice" ? "select"
+      : (type === "int" || type === "float") ? "number" : "text";
+    const source = f.source === "override" || f.source === "env" ? f.source : "default";
+    return {
+      key: String(f.key || ""),
+      label: String(f.label || f.key || ""),
+      help: String(f.help || ""),
+      type, control,
+      choices: Array.isArray(f.choices) ? f.choices.map(String) : [],
+      value: f.value != null ? f.value : "",
+      checked: type === "bool" ? !!f.value : false,
+      step: type === "int" ? "1" : type === "float" ? "any" : "",
+      source,
+      sourceLabel: source === "env" ? ".env" : source,
+      sourceCls: "gs-src-" + source,
+      showReset: source === "override",
+      restart: !!f.restart_required,
+    };
+  }
+
+  // GET /api/settings body -> { info: [{label, value}], groups: [{name, fields}] }.
+  // Tolerates missing/partial payloads (renders empty rather than throwing).
+  function settingsGroupsModel(payload) {
+    payload = payload || {};
+    const info = (payload.info && typeof payload.info === "object") ? payload.info : {};
+    const infoRows = [
+      { label: "backend", value: String(info.llm_backend || "—") },
+      { label: "data dir", value: String(info.data_dir || "—") },
+      { label: "projects", value: info.projects != null ? String(info.projects) : "—" },
+    ];
+    const groups = (Array.isArray(payload.groups) ? payload.groups : []).map(g => ({
+      name: String((g && g.name) || ""),
+      fields: (g && Array.isArray(g.fields) ? g.fields : []).map(fieldControlModel),
+    }));
+    return { info: infoRows, groups };
+  }
+
+  // Raw control input -> { ok, value } or { ok:false, error } for PATCH.
+  // Mirrors the server's coercion so obvious mistakes fail before the request.
+  function coerceFieldInput(field, raw) {
+    field = field || {};
+    const type = String(field.type || "str");
+    const label = field.label || field.key || "value";
+    if (type === "bool") return { ok: true, value: !!raw };
+    const s = String(raw == null ? "" : raw).trim();
+    if (type === "int") {
+      if (!/^-?\d+$/.test(s)) return { ok: false, error: label + " must be a whole number" };
+      return { ok: true, value: parseInt(s, 10) };
+    }
+    if (type === "float") {
+      const n = Number(s);
+      if (!s || !isFinite(n)) return { ok: false, error: label + " must be a number" };
+      return { ok: true, value: n };
+    }
+    if (type === "choice") {
+      const choices = Array.isArray(field.choices) ? field.choices : [];
+      if (!choices.includes(s)) {
+        return { ok: false, error: label + " must be one of: " + choices.join(", ") };
+      }
+      return { ok: true, value: s };
+    }
+    return { ok: true, value: s };
+  }
+
+  // ===========================================================
   // Markdown preview renderer (Files view) — security-first.
   // The ENTIRE input is HTML-escaped first (escapeHtml); every transform
   // below operates on that escaped text, so raw input HTML can never
@@ -866,6 +942,7 @@
     visibleProjects, projectsEmptyState,
     combineChipsModel, combinedProjectsParam, itemProjects, taggedItemRows,
     combinedBannerModel, projectColorMap,
+    settingsGroupsModel, fieldControlModel, coerceFieldInput,
     renderMarkdown,
   };
 

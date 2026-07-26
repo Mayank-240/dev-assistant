@@ -12,6 +12,7 @@ const {
   sidebarProjectRows, projectTabsModel, projectTaskRows, composerModel,
   visibleProjects, combineChipsModel, combinedProjectsParam, itemProjects,
   taggedItemRows, combinedBannerModel, projectColorMap, renderMarkdown,
+  settingsGroupsModel, fieldControlModel, coerceFieldInput,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -500,7 +501,7 @@ function clearContinue() {
 // real project exists yet -> the first-run empty state. The backend's scratch
 // "default" project is never rendered or auto-selected.
 let currentProject = null;
-let currentMainView = "project";   // project | task | activity | agents | empty
+let currentMainView = "project";   // project | task | activity | agents | gsettings | empty
 let currentTab = "overview";       // overview | tasks | run | knowledge | settings
 
 let currentKnow = "memory";        // memory | graph | files
@@ -567,6 +568,11 @@ function renderSidebar() {
     if (currentMainView === "agents") navAgents.setAttribute("aria-current", "page");
     else navAgents.removeAttribute("aria-current");
 
+  }
+  const navSettings = $("nav-gsettings");
+  if (navSettings) {
+    if (currentMainView === "gsettings") navSettings.setAttribute("aria-current", "page");
+    else navSettings.removeAttribute("aria-current");
   }
 }
 
@@ -1775,10 +1781,11 @@ async function openTask(id, meta) {
   updateRunControls();   // historical view — the pill is final, so Pause/Steer hide
 }
 
-// ---- main views: project (tabs) · task detail · all activity · agents · empty ----
+// ---- main views: project (tabs) · task detail · all activity · agents ·
+//      global settings console · empty ----
 const MAIN_VIEWS = {
   project: "view-project", task: "view-task", activity: "view-activity",
-  agents: "view-agents", empty: "view-empty",
+  agents: "view-agents", gsettings: "view-gsettings", empty: "view-empty",
 };
 
 
@@ -1873,6 +1880,120 @@ function showAgents() {
 
   showMainView("agents");
   loadAgents();
+}
+
+// ---- Global settings console: assistant-wide config over the JSON overlay ----
+// Field-level auto-save: every control PATCHes its single key on change; a
+// per-field flash confirms saved/error and the view re-renders from the server
+// (so source badges and reset buttons always reflect persisted truth).
+let _gsFields = {};          // key -> field render model (coercion + restart flags)
+let _gsFlash = {};           // key -> { cls: "saved"|"error", text }  (transient)
+let _gsRestartTouched = false;  // a restart_required field was edited this session
+
+function showGlobalSettings() {
+  showMainView("gsettings");
+  loadGlobalSettings();
+}
+
+async function loadGlobalSettings() {
+  const box = $("gs-groups");
+  let data = null;
+  try {
+    const resp = await fetch("/api/settings");
+    if (resp.ok) data = await resp.json();
+  } catch (e) { /* fall through to the error state */ }
+  if (!data) { box.innerHTML = '<p class="muted">Could not load settings.</p>'; return; }
+  renderGlobalSettings(settingsGroupsModel(data));
+}
+
+function gsControlHtml(f) {
+  const key = escapeAttr(f.key);
+  if (f.control === "checkbox") {
+    return `<input type="checkbox" id="gs-${key}" class="gs-control" data-key="${key}"${f.checked ? " checked" : ""} />`;
+  }
+  if (f.control === "select") {
+    const opts = f.choices.map(c =>
+      `<option value="${escapeAttr(c)}"${c === String(f.value) ? " selected" : ""}>${escapeHtml(c)}</option>`).join("");
+    return `<select id="gs-${key}" class="gs-control select" data-key="${key}">${opts}</select>`;
+  }
+  if (f.control === "number") {
+    return `<input type="number" id="gs-${key}" class="gs-control num" data-key="${key}" step="${escapeAttr(f.step)}" value="${escapeAttr(f.value)}" />`;
+  }
+  return `<input type="text" id="gs-${key}" class="gs-control title-input" data-key="${key}" value="${escapeAttr(f.value)}" />`;
+}
+
+function gsFieldHtml(f) {
+  const flash = _gsFlash[f.key];
+  return `<div class="gs-field">
+    <div class="gs-field-head">
+      <label class="gs-label" for="gs-${escapeAttr(f.key)}">${escapeHtml(f.label)}</label>
+      ${f.restart ? '<span class="gs-restart-tag">restart required</span>' : ""}
+      <span class="gs-src ${f.sourceCls}">${escapeHtml(f.sourceLabel)}</span>
+      ${f.showReset ? `<button type="button" class="gs-reset" data-key="${escapeAttr(f.key)}" title="Remove override — revert to env/default" aria-label="Reset ${escapeAttr(f.label)}">✕</button>` : ""}
+      ${flash ? `<span class="gs-flash gs-flash-${flash.cls}" data-key="${escapeAttr(f.key)}" role="status">${escapeHtml(flash.text)}</span>` : ""}
+    </div>
+    ${gsControlHtml(f)}
+    ${f.help ? `<p class="gs-help">${escapeHtml(f.help)}</p>` : ""}
+  </div>`;
+}
+
+function renderGlobalSettings(model) {
+  $("gs-info").innerHTML = model.info.map(i =>
+    `<div class="gs-info-item"><span class="gs-info-k">${escapeHtml(i.label)}</span><code>${escapeHtml(i.value)}</code></div>`).join("");
+  $("gs-restart-banner").classList.toggle("hidden", !_gsRestartTouched);
+  _gsFields = {};
+  model.groups.forEach(g => g.fields.forEach(f => { _gsFields[f.key] = f; }));
+  const box = $("gs-groups");
+  box.innerHTML = model.groups.map(g => `<section class="card gs-card">
+      <h3 class="section-label">${escapeHtml(g.name)}</h3>
+      <div class="gs-fields">${g.fields.map(gsFieldHtml).join("")}</div>
+    </section>`).join("");
+  box.querySelectorAll(".gs-control").forEach(el => { el.onchange = () => gsSubmit(el); });
+  box.querySelectorAll(".gs-reset").forEach(b => { b.onclick = () => gsReset(b.dataset.key); });
+}
+
+function _gsSetFlash(key, cls, text) {
+  _gsFlash[key] = { cls, text: text || (cls === "saved" ? "saved" : "error") };
+  setTimeout(() => {   // expire in place — never re-render (the user may be typing)
+    if (_gsFlash[key] && _gsFlash[key].cls === cls) {
+      delete _gsFlash[key];
+      const span = document.querySelector(
+        `#gs-groups .gs-flash[data-key="${CSS.escape(key)}"]`);
+      if (span) span.remove();
+    }
+  }, cls === "saved" ? 2000 : 6000);
+}
+
+async function gsSubmit(el) {
+  const key = el.dataset.key;
+  const f = _gsFields[key];
+  if (!f) return;
+  const raw = f.control === "checkbox" ? el.checked : el.value;
+  const c = coerceFieldInput(f, raw);
+  if (!c.ok) { _gsSetFlash(key, "error", c.error); loadGlobalSettings(); return; }
+  try {
+    const resp = await fetch("/api/settings", {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [key]: c.value }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok || body.error) _gsSetFlash(key, "error", body.error || ("HTTP " + resp.status));
+    else {
+      _gsSetFlash(key, "saved");
+      if (f.restart) _gsRestartTouched = true;
+    }
+  } catch (e) { _gsSetFlash(key, "error", "request failed"); }
+  loadGlobalSettings();
+}
+
+async function gsReset(key) {
+  try {
+    const resp = await fetch("/api/settings/" + encodeURIComponent(key), { method: "DELETE" });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok || body.error) _gsSetFlash(key, "error", body.error || ("HTTP " + resp.status));
+    else _gsSetFlash(key, "saved", "reverted");
+  } catch (e) { _gsSetFlash(key, "error", "request failed"); }
+  loadGlobalSettings();
 }
 
 // ---- W5: run comparison (Dashboard) ----
@@ -2963,6 +3084,8 @@ document.querySelectorAll("#project-tabs .ptab").forEach(b => b.onclick = () => 
 document.querySelectorAll("#know-tabs .ktab").forEach(b => b.onclick = () => showKnowledge(b.dataset.know));
 $("nav-activity").onclick = showActivity;
 $("nav-agents").onclick = showAgents;
+$("nav-gsettings").onclick = showGlobalSettings;    // global settings console
+$("gs-refresh").onclick = loadGlobalSettings;
 $("agents-refresh").onclick = () => { agentsLoaded = false; loadAgents(); };
 wireSeg("model-seg", "model");
 wireSeg("effort-seg", "effort");

@@ -293,6 +293,20 @@ def test_pump_skips_task_already_running(tmp_path):
         assert app.state.runs.queue_positions() == {}  # stale entry consumed, not re-run
 
 
+# ---- Global settings console endpoints stay behind the auth middleware ----
+
+def test_settings_console_endpoints_require_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADA_API_TOKEN", TOKEN)
+    c = _client(tmp_path)
+    assert c.get("/api/settings").status_code == 401
+    assert c.patch("/api/settings", json={"trace": False}).status_code == 401
+    assert c.delete("/api/settings/trace").status_code == 401
+    hdr = {"Authorization": f"Bearer {TOKEN}"}
+    assert c.get("/api/settings", headers=hdr).status_code == 200
+    assert c.patch("/api/settings", json={"trace": False}, headers=hdr).status_code == 200
+    assert c.delete("/api/settings/trace", headers=hdr).status_code == 200
+
+
 def test_startup_drops_queue_entries_for_terminal_runs(tmp_path):
     app = create_app(_settings(tmp_path), api_token="")
     app.state.runs.enqueue("done-task", "p", None, {"prompt": "p"})

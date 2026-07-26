@@ -66,6 +66,16 @@ def test_quality_and_events_endpoints(tmp_path):
     assert c.get("/api/tasks/does-not-exist/trace").json() == []
 
 
+def test_config_endpoint_reflects_console_override(tmp_path):
+    """/api/config reads the live base, so a console edit shows up without restart."""
+    c = _client(tmp_path)
+    assert c.get("/api/config").json()["budget_usd"] == 0.0
+    assert c.patch("/api/settings", json={"budget_usd": 3.5}).status_code == 200
+    assert c.get("/api/config").json()["budget_usd"] == 3.5
+    assert c.delete("/api/settings/budget_usd").status_code == 200
+    assert c.get("/api/config").json()["budget_usd"] == 0.0
+
+
 def test_tasks_list_rows_carry_project(tmp_path):
     """GET /api/tasks exposes each run's project (UI scopes recent tasks by it)."""
     c = _client(tmp_path)

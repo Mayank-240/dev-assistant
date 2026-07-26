@@ -48,6 +48,10 @@
             <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 13h12"/><rect x="3" y="8" width="2.4" height="4"/><rect x="7" y="5" width="2.4" height="7"/><rect x="11" y="9" width="2.4" height="3"/></svg>
             All activity
           </button>
+          <button type="button" id="nav-gsettings" class="sb-item">
+            <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="8" cy="8" r="2.3"/><path d="M8 1.6v2.1M8 12.3v2.1M1.6 8h2.1M12.3 8h2.1M3.5 3.5l1.5 1.5M11 11l1.5 1.5M12.5 3.5L11 5M5 11l-1.5 1.5"/></svg>
+            Settings
+          </button>
         </nav>
 
         <div class="sb-foot">
@@ -508,6 +512,22 @@
             <div class="card">
               <div id="agents-roster" class="agents-grid"></div>
             </div>
+          </div>
+
+          <!-- ============ GLOBAL SETTINGS CONSOLE (assistant-wide) ============ -->
+          <div id="view-gsettings" class="view hidden">
+            <div class="view-header">
+              <div>
+                <h1>Settings</h1>
+                <p>Assistant-wide configuration — changes apply to <b>new runs</b>; runs already in flight keep the settings they started with.</p>
+              </div>
+              <button id="gs-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh settings">⟳</button>
+            </div>
+            <div id="gs-restart-banner" class="gs-restart-banner hidden" role="status" aria-live="polite">
+              ↻ A changed setting requires a server restart to take full effect.
+            </div>
+            <div class="card gs-info" id="gs-info" aria-label="Read-only environment info"></div>
+            <div id="gs-groups" class="gs-groups"><p class="muted">Loading…</p></div>
           </div>
 
           <!-- ============ FIRST-RUN EMPTY STATE (no projects yet) ============ -->
