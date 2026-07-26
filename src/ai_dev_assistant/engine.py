@@ -373,6 +373,26 @@ class Engine:
             ],
         }))
 
+        if resume:
+            # Replay restored subtasks into the event stream so the live view shows
+            # them completed with their verdicts — not stranded as "queued".
+            for st in run.subtasks.values():
+                if st.status in (RunStatus.PASSED, RunStatus.PASSED_WITH_CAVEATS):
+                    v = st.verdict
+                    emit(Event("subtask_start", f"{st.id} [{st.agent}] {st.spec.title}", {
+                        "id": st.id, "agent": st.agent, "title": st.spec.title,
+                        "restored": True}))
+                    emit(Event("subtask_review",
+                               f"{st.id} passed (score {v.score if v else '—'}) — restored",
+                               {"id": st.id, "passed": True,
+                                "score": v.score if v else 100,
+                                "attempts": st.attempts,
+                                "reasons": list(v.reasons if v else [])
+                                + ["Restored from a previous session's checkpoint."],
+                                "objective_note": "restored from checkpoint",
+                                "result": self._scrub(st.result or "")[:12000],
+                                "restored": True}))
+
         pool = SessionPool(
             max_concurrent=self.settings.max_concurrent_sessions,
             idle_ttl=self.settings.session_idle_ttl,

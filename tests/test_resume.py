@@ -102,12 +102,20 @@ async def test_resume_skips_completed_subtasks(tmp_path):
     healed = FlakyProvider()
     healed.healed = True
     _wire(engine2, healed)
+    events = []
     try:
-        run2, _brief2, _out2 = await engine2.run("build the thing", task_id=rid, resume=True)
+        run2, _brief2, _out2 = await engine2.run("build the thing", task_id=rid, resume=True,
+                                                 on_event=events.append)
     finally:
         await engine2.aclose()
 
     assert run2.id == rid
+    # restored subtasks are replayed into the stream so the UI shows them completed
+    restored_reviews = [e for e in events
+                        if e.type == "subtask_review" and e.data.get("restored")]
+    assert [e.data["id"] for e in restored_reviews] == ["s1"]
+    assert restored_reviews[0].data["passed"] is True
+    assert restored_reviews[0].data["result"]
     assert "Research approach" not in healed.executed  # restored from checkpoint, not re-run
     assert "Implement change" in healed.executed
     assert "Document it" in healed.executed
