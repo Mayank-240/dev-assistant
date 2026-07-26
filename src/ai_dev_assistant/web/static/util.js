@@ -1415,6 +1415,341 @@
     };
   }
 
+  // ===========================================================
+  // Away wave — pure models: Home aggregation, workspaces
+  // (sidebar grouping, deps editor, run composer), knowledge
+  // graph v2 and the custom-agent editor. All Node-tested.
+  // ===========================================================
+
+  // Benchmark delta -> arrow model. null/0 -> flat dot; positive up; negative down.
+  function _deltaArrow(v) {
+    if (v == null || !isFinite(Number(v)) || Number(v) === 0) return { dir: "flat", label: "" };
+    const n = Number(v);
+    return { dir: n > 0 ? "up" : "down", label: (n > 0 ? "▲ +" : "▼ ") + n };
+  }
+
+  // GET /api/home body -> the whole home-screen render model. Tolerates a
+  // missing/partial payload; text fields are plain (caller escapes).
+  function homeModel(p) {
+    p = p || {};
+    const attention = (Array.isArray(p.attention) ? p.attention : []).map(a => {
+      a = a || {};
+      const kind = a.kind === "permission" ? "permission" : "ask";
+      return {
+        taskId: String(a.task_id || ""), project: String(a.project || ""),
+        kind, kindLabel: kind === "permission" ? "permission request" : "question",
+        agent: String(a.agent || ""),
+        text: String(a.question || a.request || ""),
+        options: Array.isArray(a.options) ? a.options.map(String) : [],
+      };
+    });
+    const live = [];
+    (Array.isArray(p.running) ? p.running : []).forEach(r => {
+      r = r || {};
+      const pr = (r.progress && typeof r.progress === "object") ? r.progress : null;
+      live.push({
+        taskId: String(r.task_id || ""), title: String(r.title || r.task_id || ""),
+        project: String(r.project || ""), state: "running",
+        progressLabel: (pr && pr.total != null)
+          ? (pr.passed != null ? pr.passed : 0) + "/" + pr.total + " subtasks" : "",
+      });
+    });
+    (Array.isArray(p.queued) ? p.queued : []).forEach(q => {
+      q = q || {};
+      live.push({
+        taskId: String(q.task_id || ""), title: String(q.title || q.task_id || ""),
+        project: String(q.project || ""), state: "queued",
+        progressLabel: q.position != null ? "#" + q.position : "",
+      });
+    });
+    const recent = (Array.isArray(p.recent) ? p.recent : []).map(r => {
+      r = r || {};
+      return {
+        taskId: String(r.task_id || ""), title: String(r.title || r.task_id || ""),
+        project: String(r.project || ""), status: String(r.status || ""),
+        qualityLabel: r.quality != null ? "quality " + r.quality + "/100" : "",
+        costLabel: r.cost_usd != null ? fmtCost(r.cost_usd) : "",
+      };
+    });
+    const sp = (p.spend && typeof p.spend === "object") ? p.spend : {};
+    const topProject = (Array.isArray(sp.by_project) && sp.by_project.length)
+      ? { project: String(sp.by_project[0].project || ""),
+          usdLabel: "$" + Number(sp.by_project[0].usd || 0).toFixed(2) }
+      : null;
+    const spend = {
+      totalLabel: "$" + Number(sp.total_usd || 0).toFixed(2),
+      runs: Number(sp.runs) || 0,
+      windowDays: Number(sp.window_days) || 30,
+      topProject,
+    };
+    const b = (p.benchmarks && typeof p.benchmarks === "object") ? p.benchmarks : {};
+    const latest = (b.latest && typeof b.latest === "object") ? b.latest : null;
+    const delta = (b.delta && typeof b.delta === "object") ? b.delta : {};
+    const series = Array.isArray(b.series) ? b.series : [];
+    const benchmarks = {
+      available: !!latest,
+      passLabel: latest && latest.pass_rate != null
+        ? Math.round(Number(latest.pass_rate) * 100) + "%" : "—",
+      qualityLabel: latest && latest.quality_mean != null
+        ? String(latest.quality_mean) : "—",
+      passDelta: _deltaArrow(delta.pass_rate),
+      qualityDelta: _deltaArrow(delta.quality_mean),
+      bars: series.map(s => {
+        const pr = Number((s && s.pass_rate) || 0);
+        return {
+          sha: String((s && s.sha) || "").slice(0, 7),
+          hPct: Math.max(4, Math.round(pr * 100)),
+          label: String((s && s.sha) || "").slice(0, 7) + " · "
+            + Math.round(pr * 100) + "%",
+        };
+      }),
+    };
+    const workspaces = (Array.isArray(p.workspaces) ? p.workspaces : []).map(w => {
+      w = w || {};
+      const n = Number(w.projects) || 0;
+      return { slug: String(w.slug || ""), name: String(w.name || w.slug || ""),
+               projectsLabel: n + " project" + (n === 1 ? "" : "s") };
+    });
+    const c = (p.counts && typeof p.counts === "object") ? p.counts : {};
+    return {
+      attention, attentionCount: attention.length, prominent: attention.length > 0,
+      live, recent, spend, benchmarks, workspaces,
+      counts: { projects: Number(c.projects) || 0, workspaces: Number(c.workspaces) || 0,
+                custom_agents: Number(c.custom_agents) || 0 },
+      errors: (Array.isArray(p.errors) ? p.errors : []).map(String),
+    };
+  }
+
+  // /api/projects items (with the additive "workspace" field) -> sidebar groups:
+  // { groups: [{workspace, projects: [...]}], ungrouped: [...] }. Group order is
+  // first appearance; the scratch "default" project is filtered out.
+  function sidebarGroups(projects) {
+    const groups = [];
+    const byWs = {};
+    const ungrouped = [];
+    visibleProjects(projects).forEach(p => {
+      const ws = p.workspace ? String(p.workspace) : "";
+      if (!ws) { ungrouped.push(p); return; }
+      if (!byWs[ws]) { byWs[ws] = { workspace: ws, projects: [] }; groups.push(byWs[ws]); }
+      byWs[ws].projects.push(p);
+    });
+    return { groups, ungrouped };
+  }
+
+  // Workspace entry {project_slugs, default_deps} -> deps-editor rows: one row
+  // per member with the OTHER members as upstream options (selected = current dep).
+  function wsDepsModel(entry) {
+    entry = entry || {};
+    const members = Array.isArray(entry.project_slugs) ? entry.project_slugs.map(String) : [];
+    const deps = (entry.default_deps && typeof entry.default_deps === "object")
+      ? entry.default_deps : {};
+    const rows = members.map(slug => ({
+      slug,
+      upstreams: members.filter(o => o !== slug).map(o => ({
+        slug: o,
+        selected: (Array.isArray(deps[slug]) ? deps[slug] : []).includes(o),
+      })),
+    }));
+    return { rows, editable: members.length > 1 };
+  }
+
+  // Workspace-run composer values -> { ok, errors, body } for
+  // POST /api/workspaces/{ws}/run. `subset` is the checked member slugs;
+  // checking every member (or none of the checkboxes rendered) sends no subset.
+  function wsRunPayload(f) {
+    f = f || {};
+    const errors = [];
+    const prompt = String(f.prompt || "").trim();
+    if (!prompt) errors.push("prompt is required");
+    const members = Array.isArray(f.members) ? f.members.map(String) : [];
+    const subset = (Array.isArray(f.subset) ? f.subset.map(String) : [])
+      .filter(s => members.includes(s));
+    if (Array.isArray(f.subset) && members.length && !subset.length) {
+      errors.push("pick at least one member project");
+    }
+    const body = { prompt };
+    const title = String(f.title || "").trim();
+    if (title) body.title = title;
+    const effort = String(f.effort || "").trim();
+    if (effort) body.effort = effort;
+    const rawB = String(f.budget == null ? "" : f.budget).trim();
+    if (rawB) {
+      const budget = Number(rawB);
+      if (!isFinite(budget) || budget < 0) errors.push("budget must be a non-negative number");
+      else if (budget > 0) body.budget = budget;
+    }
+    if (subset.length && subset.length < members.length) body.subset = subset;
+    return { ok: !errors.length, errors, body };
+  }
+
+  // ---- Knowledge graph v2 (GET .../graph2) ----
+  // NOTE the payload: nodes {id,label,type,degree,weight}, edges use src/dst
+  // (NOT source/target); labels are display text, ids canonical.
+  const GRAPH2_TYPES = ["file", "task", "agent", "concept"];
+  function _graph2ColorKey(type) {
+    if (type === "file") return "file";
+    if (type === "task" || type === "subtask") return "task";
+    if (type === "agent") return "agent";
+    return "concept";
+  }
+
+  // Client-side layer/min-weight filter + node size/color mapping. Mirrors
+  // export_view semantics: unfiltered keeps isolated nodes; a filter keeps only
+  // nodes incident to surviving edges.
+  function graph2ViewModel(payload, opts) {
+    payload = payload || {};
+    opts = opts || {};
+    const layer = opts.layer === "domain" || opts.layer === "run" ? opts.layer : "";
+    const minWeight = Math.max(1, Number(opts.minWeight) || 1);
+    const allNodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+    const allEdges = Array.isArray(payload.edges) ? payload.edges : [];
+    const edges = allEdges.filter(e => e
+      && (!layer || (e.layer || "domain") === layer)
+      && (Number(e.weight) || 1) >= minWeight);
+    let nodes;
+    if (!layer && minWeight <= 1) {
+      nodes = allNodes.slice();          // include isolated nodes
+    } else {
+      const keep = new Set();
+      edges.forEach(e => { keep.add(e.src); keep.add(e.dst); });
+      nodes = allNodes.filter(n => n && keep.has(n.id));
+    }
+    const mapped = nodes.map(n => {
+      const w = n.weight != null ? Number(n.weight) : (Number(n.degree) || 0);
+      return {
+        ...n,
+        id: String(n.id), label: String(n.label || n.id),
+        type: String(n.type || "concept"),
+        colorKey: _graph2ColorKey(n.type),
+        degree: Number(n.degree) || 0, weight: w,
+        r: Math.min(18, 6 + Math.sqrt(Math.max(0, w)) * 2),
+      };
+    });
+    const present = new Set(mapped.map(n => n.colorKey));
+    return {
+      nodes: mapped,
+      edges: edges.map(e => ({ src: String(e.src), dst: String(e.dst),
+                               relation: String(e.relation || "related_to"),
+                               weight: Number(e.weight) || 1,
+                               layer: String(e.layer || "domain") })),
+      legend: GRAPH2_TYPES.filter(t => present.has(t)),
+      statsLabel: mapped.length + "/" + allNodes.length + " nodes · "
+        + edges.length + "/" + allEdges.length + " edges",
+    };
+  }
+
+  // GET .../graph2/node/{id}?depth=1 body ({node, nodes, edges}) -> side panel:
+  // the focused node's label/type/degree plus its incident edges with
+  // relation/weight/layer/last_ts provenance. lastTs stays numeric (epoch s).
+  function nodePanelModel(hood) {
+    hood = hood || {};
+    const id = String(hood.node || "");
+    const nodes = Array.isArray(hood.nodes) ? hood.nodes : [];
+    const self = nodes.find(n => n && n.id === id)
+      || nodes.find(n => n && String(n.label || "") === id) || null;
+    if (!self) return { empty: true, id, label: id, type: "", degree: 0, edges: [], fileTask: "" };
+    const label = (nid) => {
+      const n = nodes.find(x => x && x.id === nid);
+      return n ? String(n.label || n.id) : String(nid);
+    };
+    let fileTask = "";
+    const edges = (Array.isArray(hood.edges) ? hood.edges : [])
+      .filter(e => e && (e.src === self.id || e.dst === self.id))
+      .map(e => {
+        const out = e.src === self.id;
+        if (!out && e.relation === "produced_file") fileTask = String(e.src);
+        return {
+          dir: out ? "→" : "←",
+          other: out ? String(e.dst) : String(e.src),
+          otherLabel: label(out ? e.dst : e.src),
+          relation: String(e.relation || "related_to"),
+          weight: Number(e.weight) || 1,
+          layer: String(e.layer || "domain"),
+          lastTs: (e.last_ts != null && isFinite(Number(e.last_ts))) ? Number(e.last_ts) : null,
+        };
+      });
+    return {
+      empty: false, id: String(self.id), label: String(self.label || self.id),
+      type: String(self.type || "concept"), degree: Number(self.degree) || 0,
+      edges, fileTask,
+    };
+  }
+
+  // ---- Agents: roster listing + custom-agent editor ----
+  // GET /api/agents body {builtin, custom, tools} -> normalized model.
+  // Tolerates the legacy flat-array shape (treated as all-builtin, no tools).
+  function agentsListModel(body) {
+    if (Array.isArray(body)) {
+      return { builtin: body, custom: [], tools: [],
+               names: body.map(a => String((a && a.name) || "")).filter(Boolean) };
+    }
+    body = body || {};
+    const builtin = Array.isArray(body.builtin) ? body.builtin : [];
+    const custom = Array.isArray(body.custom) ? body.custom : [];
+    return {
+      builtin, custom,
+      tools: (Array.isArray(body.tools) ? body.tools : []).map(String),
+      names: [...builtin, ...custom].map(a => String((a && a.name) || "")).filter(Boolean),
+    };
+  }
+
+  const AGENT_EFFORTS = ["", "low", "medium", "high", "xhigh", "max"];
+  const AGENT_NAME_RE = /^[a-z][a-z0-9_]{0,39}$/;
+
+  // Stored spec (or null for a blank form) + toolbox names -> form field values.
+  function agentFormModel(spec, tools) {
+    spec = spec || {};
+    const chosen = new Set(Array.isArray(spec.tools) ? spec.tools : []);
+    return {
+      heading: spec.name ? "Edit agent — " + spec.name : "New agent",
+      editing: !!spec.name,
+      name: String(spec.name || ""),
+      description: String(spec.description || ""),
+      when_to_use: String(spec.when_to_use || ""),
+      system_prompt: String(spec.system_prompt || ""),
+      effort: AGENT_EFFORTS.includes(spec.effort) ? spec.effort : "",
+      model: String(spec.model || ""),
+      tools: (Array.isArray(tools) ? tools : []).map(t => ({
+        name: String(t), checked: chosen.has(t),
+      })),
+    };
+  }
+
+  // Form values -> { ok, errors, spec } for POST /api/agents {spec}. Mirrors the
+  // server's gates (slug name, non-empty texts, toolbox-only tools, known effort)
+  // so obvious mistakes fail before the request; the server's 400 is still the
+  // real validator and is surfaced inline by the caller.
+  function agentFormValidate(f, tools) {
+    f = f || {};
+    const errors = [];
+    const name = String(f.name || "").trim().toLowerCase();
+    if (!AGENT_NAME_RE.test(name)) {
+      errors.push("name must be a slug — lowercase letters/digits/underscores, starting with a letter");
+    }
+    ["description", "when_to_use", "system_prompt"].forEach(k => {
+      if (!String(f[k] || "").trim()) errors.push(k.replace(/_/g, " ") + " is required");
+    });
+    const toolbox = new Set((Array.isArray(tools) ? tools : []).map(String));
+    const chosen = (Array.isArray(f.tools) ? f.tools : []).map(String);
+    if (!chosen.length) errors.push("pick at least one tool");
+    const unknown = chosen.filter(t => toolbox.size && !toolbox.has(t));
+    if (unknown.length) errors.push("unknown tools: " + unknown.join(", "));
+    const effort = String(f.effort || "");
+    if (!AGENT_EFFORTS.includes(effort)) errors.push("effort must be inherit or one of low/medium/high/xhigh/max");
+    return {
+      ok: !errors.length, errors,
+      spec: {
+        name,
+        description: String(f.description || "").trim(),
+        when_to_use: String(f.when_to_use || "").trim(),
+        system_prompt: String(f.system_prompt || "").trim(),
+        tools: chosen,
+        effort: AGENT_EFFORTS.includes(effort) ? effort : "",
+        model: String(f.model || "").trim(),
+      },
+    };
+  }
+
   const AdaUtil = {
     escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine,
     fmtRelTime, paletteResultsModel, scheduleRowModel, scheduleFormModel,
@@ -1437,6 +1772,9 @@
     renderMarkdown,
     MEMORY_CLAMP_CHARS, memoryRowModel, memoryPageModel,
     gcSummary, gcResultModel, rollbackStateModel, CRON_HINT,
+    homeModel, sidebarGroups, wsDepsModel, wsRunPayload,
+    graph2ViewModel, nodePanelModel, GRAPH2_TYPES,
+    agentsListModel, agentFormModel, agentFormValidate, AGENT_EFFORTS,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = AdaUtil;

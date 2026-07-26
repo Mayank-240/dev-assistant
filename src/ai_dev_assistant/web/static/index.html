@@ -31,10 +31,23 @@
           <h1>AI Dev Assistant</h1>
         </a>
 
+        <nav class="sb-home" aria-label="Home">
+          <button type="button" id="nav-home" class="sb-item">
+            <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2.5 7.5 8 2.5l5.5 5"/><path d="M4 6.8V13.5h8V6.8"/><path d="M6.6 13.5v-3.4h2.8v3.4"/></svg>
+            Home
+          </button>
+        </nav>
+
         <nav class="sb-projects" aria-label="Projects">
           <span class="sb-label" id="projects-label" aria-hidden="true">Projects</span>
           <ul id="project-list" class="project-list" aria-labelledby="projects-label"></ul>
           <button id="new-project" class="sb-new" type="button" title="Create a new project or import an existing repository">+ New / Import</button>
+          <div id="ws-create-row" class="ws-create hidden">
+            <input id="ws-create-name" class="title-input" type="text" maxlength="80"
+                   placeholder="Workspace name" aria-label="New workspace name" />
+            <button id="ws-create-go" class="btn-primary" type="button">Create</button>
+          </div>
+          <button id="new-workspace" class="sb-new" type="button" title="Create a named group of inter-related projects">+ New workspace</button>
         </nav>
 
         <div class="sb-divider" aria-hidden="true"></div>
@@ -297,15 +310,33 @@
 
               <div id="know-graph" class="know-panel hidden" role="tabpanel" aria-labelledby="ktab-graph">
                 <div class="know-head">
-                  <p class="know-desc">Entities and relationships the agents recorded. Click a node to focus its neighborhood (Esc clears).</p>
+                  <p class="know-desc">Entities and relationships the agents recorded. Click a node for its neighborhood &amp; provenance (Esc clears the focus).</p>
                   <span id="graph-stats" class="muted"></span>
+                  <button id="graph-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh knowledge graph">⟳</button>
+                </div>
+                <div class="graph-controls">
+                  <div id="graph-layer" class="seg" role="group" aria-label="Graph layer" title="Knowledge = domain facts · Run plumbing = task/agent/file wiring">
+                    <button type="button" class="seg-opt" data-v="domain" aria-pressed="true">Knowledge</button>
+                    <button type="button" class="seg-opt" data-v="run" aria-pressed="false">Run plumbing</button>
+                    <button type="button" class="seg-opt" data-v="" aria-pressed="false">All</button>
+                  </div>
+                  <label class="ctl graph-minw-wrap" title="Hide edges reinforced fewer than this many times">Min&nbsp;weight
+                    <select id="graph-minw" class="select">
+                      <option value="1">1</option><option value="2">2</option><option value="3">3</option>
+                      <option value="5">5</option><option value="10">10</option>
+                    </select>
+                  </label>
                   <input id="graph-filter" class="title-input graph-filter" type="search"
                          placeholder="Filter nodes…" aria-label="Filter graph nodes by label" />
-                  <button id="graph-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh knowledge graph">⟳</button>
+                  <span class="graph-search-wrap">
+                    <input id="graph-search" class="title-input graph-filter" type="search"
+                           placeholder="Search &amp; focus…" aria-label="Search graph nodes" autocomplete="off" />
+                    <div id="graph-search-results" class="graph-search-results hidden" role="listbox" aria-label="Node search results"></div>
+                  </span>
                 </div>
                 <div class="graph-wrap"><svg id="graph-svg" viewBox="0 0 800 520" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Knowledge graph of recorded entities and relationships"></svg></div>
                 <div id="graph-legend" class="legend"></div>
-                <div id="node-detail" class="node-detail muted">Click a node to see its facts.</div>
+                <div id="node-detail" class="node-detail muted">Click a node to see its relations and provenance.</div>
               </div>
 
               <div id="know-files" class="know-panel hidden" role="tabpanel" aria-labelledby="ktab-files">
@@ -558,6 +589,131 @@
             </div><!-- /run-view -->
           </div><!-- /view-task -->
 
+          <!-- ============ HOME — the console's entry screen ============ -->
+          <div id="view-home" class="view hidden">
+            <div class="view-header">
+              <div>
+                <h1>Home</h1>
+                <p id="home-counts">…</p>
+              </div>
+              <button id="home-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh home">⟳</button>
+            </div>
+
+            <p id="home-errors" class="pm-error hidden" role="alert"></p>
+
+            <section id="home-attn" class="home-attn card" aria-label="Needs you">
+              <div id="home-attn-head" class="home-attn-head">Needs you</div>
+              <div id="home-attn-list" class="attn-list"><p class="muted home-quiet">Nothing needs you.</p></div>
+            </section>
+
+            <section class="card home-strip" aria-label="Running and queued tasks">
+              <h3 class="section-label">Running &amp; queued</h3>
+              <ul id="home-live" class="task-list"><li class="muted">Nothing running.</li></ul>
+            </section>
+
+            <div class="home-minis">
+              <div class="card mini-card" id="home-spend-card">
+                <h3 class="section-label">Spend · 30 days</h3>
+                <span id="home-spend-total" class="mini-big">$0.00</span>
+                <span id="home-spend-top" class="mini-sub muted"></span>
+                <button type="button" id="home-spend-link" class="link-btn">All activity →</button>
+              </div>
+              <div class="card mini-card" id="home-bench-card">
+                <h3 class="section-label">Benchmarks</h3>
+                <div id="home-bench-stats" class="mini-row"></div>
+                <div id="home-bench-bars" class="hb-bars" role="img" aria-label="Benchmark pass rate by commit"></div>
+              </div>
+              <div class="card mini-card" id="home-ws-card">
+                <h3 class="section-label">Workspaces</h3>
+                <div id="home-ws-list" class="home-ws-list"><p class="muted">No workspaces yet.</p></div>
+              </div>
+            </div>
+
+            <section class="card home-strip" aria-label="Recent runs">
+              <h3 class="section-label">Recent runs</h3>
+              <ul id="home-recent" class="task-list"><li class="muted">No finished runs yet.</li></ul>
+            </section>
+          </div>
+
+          <!-- ============ WORKSPACE VIEW ============ -->
+          <div id="view-workspace" class="view hidden">
+            <div class="view-header">
+              <div class="ws-id">
+                <h1 id="ws-name">…</h1>
+                <p id="ws-desc" class="ws-desc"></p>
+              </div>
+              <div class="ws-head-actions">
+                <button id="ws-edit" type="button" class="ghost-btn" title="Edit this workspace's name and description">✎ Edit</button>
+                <button id="ws-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh workspace">⟳</button>
+              </div>
+            </div>
+
+            <div id="ws-edit-form" class="card ws-card hidden">
+              <label class="pm-label" for="ws-name-input">Name</label>
+              <input id="ws-name-input" class="title-input" type="text" maxlength="80" />
+              <label class="pm-label" for="ws-desc-input">Description</label>
+              <textarea id="ws-desc-input" rows="2" class="ws-desc-input"></textarea>
+              <p id="ws-edit-error" class="pm-error hidden" role="alert"></p>
+              <div class="pe-actions">
+                <button id="ws-save" class="btn-primary" type="button">Save</button>
+                <button id="ws-edit-cancel" class="ghost-btn" type="button">Cancel</button>
+              </div>
+            </div>
+
+            <div class="card ws-card composer">
+              <h2 class="composer-heading" id="ws-composer-heading">Run across this workspace</h2>
+              <textarea id="ws-prompt" rows="3" class="ws-prompt" placeholder="Describe the work — it fans out across the members below, dependencies first"></textarea>
+              <input id="ws-title" class="title-input" type="text" maxlength="80" placeholder="Title (optional)" />
+              <div class="controls ws-controls">
+                <label class="ctl" title="Reasoning depth for every member run">Effort
+                  <select id="ws-effort" class="select">
+                    <option value="">(default)</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="xhigh">xhigh</option>
+                    <option value="max">max</option>
+                  </select>
+                </label>
+                <label class="ctl" title="Budget cap for the whole workspace run">Budget&nbsp;$
+                  <input id="ws-budget" class="num" type="number" min="0" step="0.5" placeholder="none" />
+                </label>
+              </div>
+              <div class="ws-subset">
+                <span class="kicker">Members to run</span>
+                <div id="ws-subset" class="ws-subset-list" role="group" aria-label="Member projects to include in this run"></div>
+              </div>
+              <p id="ws-run-error" class="pm-error hidden" role="alert"></p>
+              <div class="composer-foot">
+                <span class="muted ws-run-note">Upstream members run first — their results become context downstream.</span>
+                <button id="ws-run" class="btn-primary" type="button">Run workspace →</button>
+              </div>
+            </div>
+
+            <div class="card ws-card">
+              <h3 class="section-label">Member projects</h3>
+              <div id="ws-members" class="ws-members agents-grid"><p class="muted">No members yet.</p></div>
+              <div class="ws-assign">
+                <label class="pm-label" for="ws-assign-select">Assign an ungrouped project</label>
+                <div class="ws-assign-row">
+                  <select id="ws-assign-select" class="select"></select>
+                  <button id="ws-assign-btn" class="ghost-btn" type="button">+ Assign</button>
+                </div>
+                <p id="ws-assign-error" class="pm-error hidden" role="alert"></p>
+              </div>
+            </div>
+
+            <div class="card ws-card">
+              <h3 class="section-label">Dependencies — which members feed which</h3>
+              <p class="muted ws-deps-note">For each member, tick the upstream members whose results it builds on. Cycles are rejected.</p>
+              <div id="ws-deps" class="ws-deps"></div>
+              <p id="ws-deps-error" class="pm-error hidden" role="alert"></p>
+              <div class="pe-actions">
+                <button id="ws-deps-save" class="btn-primary" type="button">Save dependencies</button>
+              </div>
+            </div>
+          </div>
+
           <!-- ============ ALL ACTIVITY (formerly Dashboard) ============ -->
           <div id="view-activity" class="view hidden">
             <div class="view-header">
@@ -634,15 +790,72 @@
             </div>
           </div>
 
-          <!-- ============ AGENTS (global roster) ============ -->
+          <!-- ============ AGENTS (global roster + custom-agent editor) ============ -->
           <div id="view-agents" class="view hidden">
             <div class="view-header">
               <div>
                 <h1>Agents</h1>
                 <p>The specialist roster the orchestrator routes work to — shared across every project.</p>
               </div>
-              <button id="agents-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh agent roster">⟳</button>
+              <div class="ws-head-actions">
+                <button id="agent-new" type="button" class="btn-primary">+ New agent</button>
+                <button id="agents-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh agent roster">⟳</button>
+              </div>
             </div>
+
+            <div id="agent-form-card" class="card ws-card hidden">
+              <h3 class="section-label" id="af-heading">New agent</h3>
+              <div class="af-grid">
+                <div>
+                  <label class="pm-label" for="af-name">Name — lowercase slug (upsert: saving an existing name replaces it)</label>
+                  <input id="af-name" class="title-input" type="text" maxlength="40" placeholder="e.g. sec_reviewer" />
+                </div>
+                <div>
+                  <label class="pm-label" for="af-desc">Description</label>
+                  <input id="af-desc" class="title-input" type="text" placeholder="What this specialist does" />
+                </div>
+                <div>
+                  <label class="pm-label" for="af-when">When to use</label>
+                  <input id="af-when" class="title-input" type="text" placeholder="When the orchestrator should route work here" />
+                </div>
+                <div class="af-span">
+                  <label class="pm-label" for="af-system">System prompt</label>
+                  <textarea id="af-system" rows="5" class="af-system" placeholder="You are a …"></textarea>
+                </div>
+                <div class="af-span">
+                  <span class="pm-label">Tools</span>
+                  <div id="af-tools" class="af-tools" role="group" aria-label="Tools this agent may use"></div>
+                </div>
+                <div>
+                  <label class="pm-label" for="af-effort">Effort</label>
+                  <select id="af-effort" class="select">
+                    <option value="">inherit</option>
+                    <option value="low">low</option>
+                    <option value="medium">med</option>
+                    <option value="high">high</option>
+                    <option value="xhigh">xhigh</option>
+                    <option value="max">max</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="pm-label" for="af-model">Model (optional)</label>
+                  <input id="af-model" class="title-input" type="text" placeholder="inherit" />
+                </div>
+              </div>
+              <p id="af-error" class="pm-error hidden" role="alert"></p>
+              <div class="pe-actions">
+                <button id="af-save" class="btn-primary" type="button">Save agent</button>
+                <button id="af-cancel" class="ghost-btn" type="button">Cancel</button>
+              </div>
+              <p class="hint">Saved agents are routable by the orchestrator immediately — the very next run can plan work onto them.</p>
+            </div>
+
+            <h3 class="section-label">Custom agents — yours, editable</h3>
+            <div class="card">
+              <div id="agents-custom" class="agents-grid"><p class="muted af-none">No custom agents yet — create one above.</p></div>
+            </div>
+
+            <h3 class="section-label">Built-in specialists — read-only</h3>
             <div class="card">
               <div id="agents-roster" class="agents-grid"></div>
             </div>

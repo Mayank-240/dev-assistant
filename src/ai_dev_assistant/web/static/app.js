@@ -19,6 +19,9 @@ const {
   notifCenterModel, playbookFormModel, tourStepsModel,
   authGate, loginFormModel, loginErrorMessage,
   memoryRowModel, memoryPageModel, gcSummary, gcResultModel, rollbackStateModel,
+  homeModel, sidebarGroups, wsDepsModel, wsRunPayload,
+  graph2ViewModel, nodePanelModel,
+  agentsListModel, agentFormModel, agentFormValidate,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -604,10 +607,28 @@ function currentProjectEntry(slug) {
   return projectList.find(p => p.slug === s) || null;
 }
 
+// ---- workspaces: named groups of inter-related projects ----
+let workspaceList = [];      // last-fetched /api/workspaces entries
+let currentWorkspace = null; // slug of the workspace open in view-workspace
+
+async function loadWorkspaces() {
+  try {
+    const resp = await fetch("/api/workspaces");
+    if (resp.ok) {
+      const rows = await resp.json();
+      workspaceList = Array.isArray(rows) ? rows : [];
+    }
+  } catch (e) { /* keep the last list */ }
+}
+function workspaceEntry(slug) {
+  return workspaceList.find(w => w.slug === slug) || null;
+}
+
 async function loadProjects() {
   let list = [];
   try { list = await (await fetch("/api/projects")).json(); } catch (e) { list = []; }
   projectList = visibleProjects(list);   // the scratch "default" project is never rendered
+  await loadWorkspaces();                // group names for the sidebar + workspace view
   if (currentProject !== "multi") {
     const saved = localStorage.getItem("ada-project") || currentProject;
     currentProject = projectList.some(p => p.slug === saved) ? saved
@@ -621,28 +642,65 @@ async function loadProjects() {
   }
 }
 
-// ---- sidebar: one nav row per project + the "⋔ Across projects" pseudo-entry ----
+// ---- sidebar: workspace-grouped project rows + the "⋔ Across projects" pseudo-entry ----
+function _sidebarProjLi(r, inWs) {
+  const li = document.createElement("li");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "proj-item pl-state-" + r.state
+    + (r.archived ? " pl-archived" : "") + (r.multi ? " pl-multi" : "")
+    + (inWs ? " pl-in-ws" : "");
+  btn.setAttribute("aria-current", r.current ? "true" : "false");
+  btn.title = r.name + (r.state !== "idle" ? " · " + r.state : "")
+    + (r.archived ? " · archived" : "");
+  btn.innerHTML = `<span class="pl-dot" aria-hidden="true"></span>` +
+    `<span class="pl-name">${escapeHtml(r.name)}</span>`;
+  btn.onclick = () => selectProject(r.slug);
+  li.appendChild(btn);
+  return li;
+}
+
+function _sidebarWsLi(wsSlug, count) {
+  const entry = workspaceEntry(wsSlug);
+  const current = currentMainView === "workspace" && currentWorkspace === wsSlug;
+  const li = document.createElement("li");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "ws-head";
+  btn.setAttribute("aria-current", current ? "true" : "false");
+  btn.title = "Open workspace " + ((entry && entry.name) || wsSlug);
+  btn.innerHTML = `<span class="ws-mark" aria-hidden="true">▦</span>` +
+    `<span class="pl-name">${escapeHtml((entry && entry.name) || wsSlug)}</span>` +
+    `<span class="ws-count">${count}</span>`;
+  btn.onclick = () => openWorkspace(wsSlug);
+  li.appendChild(btn);
+  return li;
+}
+
 function renderSidebar() {
   const ul = $("project-list");
   if (!ul) return;
-  const rows = sidebarProjectRows(projectList, projectActivity, currentProject,
-                                  { activity: multiActivity, hasRuns: multiHasRuns });
   ul.innerHTML = "";
-  rows.forEach(r => {
-    const li = document.createElement("li");
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "proj-item pl-state-" + r.state
-      + (r.archived ? " pl-archived" : "") + (r.multi ? " pl-multi" : "");
-    btn.setAttribute("aria-current", r.current ? "true" : "false");
-    btn.title = r.name + (r.state !== "idle" ? " · " + r.state : "")
-      + (r.archived ? " · archived" : "");
-    btn.innerHTML = `<span class="pl-dot" aria-hidden="true"></span>` +
-      `<span class="pl-name">${escapeHtml(r.name)}</span>`;
-    btn.onclick = () => selectProject(r.slug);
-    li.appendChild(btn);
-    ul.appendChild(li);
+  const { groups, ungrouped } = sidebarGroups(projectList);
+  // workspace groups first: a clickable header row, then the member projects
+  groups.forEach(g => {
+    ul.appendChild(_sidebarWsLi(g.workspace, g.projects.length));
+    sidebarProjectRows(g.projects, projectActivity, currentProject, {})
+      .forEach(r => ul.appendChild(_sidebarProjLi(r, true)));
   });
+  // empty workspaces (no member projects yet) stay reachable
+  workspaceList.forEach(w => {
+    if (!groups.some(g => g.workspace === w.slug)) ul.appendChild(_sidebarWsLi(w.slug, 0));
+  });
+  // ungrouped projects keep the existing flat list (+ the multi pseudo-entry)
+  sidebarProjectRows(ungrouped, projectActivity, currentProject,
+                     { activity: multiActivity, hasRuns: multiHasRuns })
+    .forEach(r => ul.appendChild(_sidebarProjLi(r, false)));
+  const navHome = $("nav-home");
+  if (navHome) {
+    if (currentMainView === "home") navHome.setAttribute("aria-current", "page");
+    else navHome.removeAttribute("aria-current");
+  }
   const nav = $("nav-activity");
   if (nav) {
     if (currentMainView === "activity") nav.setAttribute("aria-current", "page");
@@ -1511,8 +1569,10 @@ function attachToRun(id, prompt) {
 let _agentNames = null;
 async function getAgentNames() {
   if (_agentNames) return _agentNames;
-  try { _agentNames = (await (await fetch("/api/agents")).json()).map(a => a.name); }
+  // /api/agents is {builtin, custom, tools} — customs are routable like built-ins
+  try { _agentNames = agentsListModel(await (await fetch("/api/agents")).json()).names; }
   catch (e) { _agentNames = ["researcher", "coder", "documenter"]; }
+  if (!_agentNames.length) _agentNames = ["researcher", "coder", "documenter"];
   return _agentNames;
 }
 
@@ -1912,6 +1972,7 @@ async function openTask(id, meta) {
 // ---- main views: project (tabs) · task detail · all activity · agents ·
 //      global settings console · empty ----
 const MAIN_VIEWS = {
+  home: "view-home", workspace: "view-workspace",
   project: "view-project", task: "view-task", activity: "view-activity",
   agents: "view-agents", gsettings: "view-gsettings", empty: "view-empty",
 };
@@ -1980,6 +2041,12 @@ function openFilesView(taskId) {
 // ---- task detail: opens INSIDE the project context, with a breadcrumb ----
 function setCrumb(title, projectSlug) {
   const slug = projectSlug || currentProject;
+  if (!slug) {   // opened from Home with no project context — crumb goes back home
+    $("crumb-project").textContent = "Home";
+    $("crumb-project").onclick = showHome;
+    $("crumb-title").textContent = title || "";
+    return;
+  }
   const isMulti = slug === "multi";
   const entry = currentProjectEntry(slug);
   $("crumb-project").textContent = isMulti
@@ -1994,7 +2061,367 @@ function openTaskDetail(title, projectSlug) {
 }
 
 function backToProject() {
+  if (!currentProject) { showHome(); return; }
   selectProject(currentProject, currentTab);
+}
+
+// ============================================================
+// HOME — the console's entry screen (GET /api/home).
+// ============================================================
+function showHome() {
+  showMainView("home");
+  loadHome();
+}
+
+async function loadHome() {
+  if (currentMainView !== "home") return;
+  let data = null;
+  try {
+    const resp = await fetch("/api/home");
+    if (resp.ok) data = await resp.json();
+  } catch (e) { /* leave the view as-is */ }
+  if (!data) {
+    const err = $("home-errors");
+    err.textContent = "Could not reach the server.";
+    err.classList.remove("hidden");
+    return;
+  }
+  renderHome(homeModel(data));
+}
+
+function _homeTaskLi(r, onOpen) {
+  const li = document.createElement("li");
+  li.className = "item";
+  const proj = r.project
+    ? `<span class="proj-tag" title="Project">${escapeHtml(r.project)}</span>` : "";
+  const status = r.state || r.status || "";
+  const extra = [
+    r.progressLabel ? `<span class="r-quality">${escapeHtml(r.progressLabel)}</span>` : "",
+    r.qualityLabel ? `<span class="r-quality">${escapeHtml(r.qualityLabel)}</span>` : "",
+    r.costLabel ? `<span class="r-cost">${escapeHtml(r.costLabel)}</span>` : "",
+  ].join("");
+  li.innerHTML = `<div class="r-title">${escapeHtml(r.title)}</div>` +
+    `<div class="r-meta">` +
+    (status ? `<span class="r-status ${escapeAttr(status)}"><span class="r-status-dot"></span>${escapeHtml(status)}</span>` : "") +
+    proj + extra + `</div>`;
+  makeActivatable(li, onOpen, `Open task ${r.title}`);
+  return li;
+}
+
+function renderHome(m) {
+  $("home-counts").textContent =
+    `${m.counts.projects} project${m.counts.projects === 1 ? "" : "s"}` +
+    ` · ${m.counts.workspaces} workspace${m.counts.workspaces === 1 ? "" : "s"}` +
+    ` · ${m.counts.custom_agents} custom agent${m.counts.custom_agents === 1 ? "" : "s"}`;
+  const err = $("home-errors");
+  err.classList.toggle("hidden", !m.errors.length);
+  err.textContent = m.errors.length ? "Some sections failed: " + m.errors.join(" · ") : "";
+
+  // ATTENTION — red-accented and first when anything is waiting on the user
+  const attn = $("home-attn");
+  attn.classList.toggle("home-attn-live", m.prominent);
+  $("home-attn-head").textContent = m.prominent
+    ? `Needs you — ${m.attentionCount} open` : "Needs you";
+  const list = $("home-attn-list");
+  if (!m.prominent) {
+    list.innerHTML = '<p class="muted home-quiet">Nothing needs you.</p>';
+  } else {
+    list.innerHTML = "";
+    m.attention.forEach(a => {
+      const item = document.createElement("div");
+      item.className = "attn-item";
+      item.innerHTML =
+        `<div class="attn-top">` +
+        `<span class="ac-agent"><span class="ac-dot"></span>${escapeHtml(a.agent || "agent")}</span>` +
+        (a.project ? `<span class="proj-tag">${escapeHtml(a.project)}</span>` : "") +
+        `<span class="attn-kind${a.kind === "permission" ? " attn-kind-permission" : ""}">${escapeHtml(a.kindLabel)}</span></div>` +
+        `<p class="attn-q">${escapeHtml(a.text)}</p>` +
+        (a.options.length
+          ? `<p class="attn-q muted">options: ${escapeHtml(a.options.join(" · "))}</p>` : "") +
+        `<span class="home-attn-open">Answer in the task →</span>`;
+      makeActivatable(item, () => attachToRun(a.taskId, a.text || a.taskId),
+        `Open task ${a.taskId} to answer`);
+      list.appendChild(item);
+    });
+  }
+
+  // RUNNING / QUEUED strip
+  const live = $("home-live");
+  live.innerHTML = "";
+  if (!m.live.length) live.innerHTML = '<li class="muted">Nothing running or queued.</li>';
+  m.live.forEach(r => live.appendChild(
+    _homeTaskLi(r, () => attachToRun(r.taskId, r.title))));
+
+  // RECENT
+  const recent = $("home-recent");
+  recent.innerHTML = "";
+  if (!m.recent.length) recent.innerHTML = '<li class="muted">No finished runs yet.</li>';
+  m.recent.forEach(r => recent.appendChild(
+    _homeTaskLi(r, () => openTask(r.taskId, null))));
+
+  // SPEND mini-card
+  $("home-spend-total").textContent = m.spend.totalLabel;
+  $("home-spend-top").textContent = m.spend.topProject
+    ? `top: ${m.spend.topProject.project} ${m.spend.topProject.usdLabel} · ${m.spend.runs} runs`
+    : (m.spend.runs ? m.spend.runs + " runs" : "no spend yet");
+
+  // BENCHMARKS mini-card
+  const stats = $("home-bench-stats");
+  const bars = $("home-bench-bars");
+  if (!m.benchmarks.available) {
+    stats.innerHTML = '<span class="muted">No benchmark history yet.</span>';
+    bars.innerHTML = "";
+  } else {
+    const arrow = (d) => d.dir === "flat" ? ""
+      : `<span class="hb-delta hb-${escapeAttr(d.dir)}" title="vs previous run">${escapeHtml(d.label)}</span>`;
+    stats.innerHTML =
+      `<span class="hb-stat"><b>${escapeHtml(m.benchmarks.passLabel)}</b> pass${arrow(m.benchmarks.passDelta)}</span>` +
+      `<span class="hb-stat"><b>${escapeHtml(m.benchmarks.qualityLabel)}</b> quality${arrow(m.benchmarks.qualityDelta)}</span>`;
+    bars.innerHTML = m.benchmarks.bars.map(b =>
+      `<span class="hb-bar" style="height:${b.hPct}%" title="${escapeAttr(b.label)}"></span>`).join("");
+  }
+
+  // WORKSPACES card
+  const ws = $("home-ws-list");
+  if (!m.workspaces.length) {
+    ws.innerHTML = '<p class="muted">No workspaces yet — group related projects from the sidebar.</p>';
+  } else {
+    ws.innerHTML = "";
+    m.workspaces.forEach(w => {
+      const row = document.createElement("div");
+      row.className = "home-ws-row";
+      row.innerHTML = `<span class="ws-mark" aria-hidden="true">▦</span>` +
+        `<span class="home-ws-name">${escapeHtml(w.name)}</span>` +
+        `<span class="muted">${escapeHtml(w.projectsLabel)}</span>`;
+      makeActivatable(row, () => openWorkspace(w.slug), `Open workspace ${w.name}`);
+      ws.appendChild(row);
+    });
+  }
+}
+
+// ============================================================
+// WORKSPACE VIEW — members, deps editor and the fan-out composer.
+// ============================================================
+function openWorkspace(slug) {
+  currentWorkspace = slug;
+  showMainView("workspace");
+  renderWorkspace();
+  refreshWorkspaceView();
+}
+
+async function refreshWorkspaceView() {
+  await loadProjects();   // also refreshes workspaceList + sidebar grouping
+  renderWorkspace();
+}
+
+function _wsInline(id, msg) {
+  const el = $(id);
+  el.textContent = msg || "";
+  el.classList.toggle("hidden", !msg);
+}
+
+function renderWorkspace() {
+  const entry = workspaceEntry(currentWorkspace);
+  if (!entry) {
+    $("ws-name").textContent = currentWorkspace || "Workspace";
+    $("ws-desc").textContent = "This workspace no longer exists.";
+    $("ws-members").innerHTML = "";
+    $("ws-deps").innerHTML = "";
+    $("ws-subset").innerHTML = "";
+    return;
+  }
+  $("ws-name").textContent = entry.name || entry.slug;
+  $("ws-desc").textContent = entry.description || "";
+  $("ws-composer-heading").textContent = "Run across " + (entry.name || entry.slug);
+
+  const members = entry.project_slugs || [];
+  const nameOf = (slug) => {
+    const p = projectList.find(x => x.slug === slug);
+    return (p && p.name) || slug;
+  };
+
+  // member grid — click opens the project; ✕ unassigns
+  const grid = $("ws-members");
+  grid.innerHTML = "";
+  if (!members.length) {
+    grid.innerHTML = '<p class="muted">No member projects yet — assign one below.</p>';
+  } else {
+    members.forEach(slug => {
+      const card = document.createElement("div");
+      card.className = "agent-card ws-member";
+      const m = activityStripModel(projectActivity[slug]);
+      card.innerHTML =
+        `<div class="ac-top"><span class="ac-agent ac-name">${escapeHtml(nameOf(slug))}</span>` +
+        `<button type="button" class="ghost ws-unassign" title="Remove from this workspace" aria-label="Remove ${escapeAttr(slug)} from workspace">✕</button></div>` +
+        `<div class="ac-deps">${escapeHtml(slug)} · ${escapeHtml(m.text)}</div>`;
+      makeActivatable(card, (e) => {
+        if (e && e.target && e.target.closest("button")) return;
+        selectProject(slug, "overview");
+      }, `Open project ${nameOf(slug)}`);
+      card.querySelector(".ws-unassign").onclick = (e) => {
+        e.stopPropagation();
+        unassignWorkspaceProject(slug);
+      };
+      grid.appendChild(card);
+    });
+  }
+
+  // assign picker — ungrouped projects only
+  const sel = $("ws-assign-select");
+  const ungrouped = sidebarGroups(projectList).ungrouped.filter(p => !p.archived);
+  sel.innerHTML = ungrouped.length
+    ? ungrouped.map(p =>
+        `<option value="${escapeAttr(p.slug)}">${escapeHtml(p.name || p.slug)}</option>`).join("")
+    : '<option value="">(no ungrouped projects)</option>';
+  $("ws-assign-btn").disabled = !ungrouped.length;
+  _wsInline("ws-assign-error", "");
+
+  // deps editor — per member, multi-select upstream members
+  const deps = wsDepsModel(entry);
+  const dbox = $("ws-deps");
+  if (!deps.editable) {
+    dbox.innerHTML = '<p class="muted">Dependencies need at least two member projects.</p>';
+  } else {
+    dbox.innerHTML = deps.rows.map(r =>
+      `<div class="ws-dep-row" data-slug="${escapeAttr(r.slug)}">` +
+      `<span class="ws-dep-name">${escapeHtml(nameOf(r.slug))}</span>` +
+      `<span class="ws-dep-arrow" aria-hidden="true">← builds on</span>` +
+      `<span class="ws-dep-opts">` +
+      r.upstreams.map(u =>
+        `<label class="check ws-dep-check"><input type="checkbox" value="${escapeAttr(u.slug)}"` +
+        `${u.selected ? " checked" : ""} /> ${escapeHtml(nameOf(u.slug))}</label>`).join("") +
+      `</span></div>`).join("");
+  }
+  $("ws-deps-save").disabled = !deps.editable;
+  _wsInline("ws-deps-error", "");
+
+  // composer subset — all members checked by default
+  const subset = $("ws-subset");
+  subset.innerHTML = members.map(slug =>
+    `<label class="check ws-sub-check"><input type="checkbox" value="${escapeAttr(slug)}" checked /> ` +
+    `${escapeHtml(nameOf(slug))}</label>`).join("") || '<span class="muted">no members</span>';
+  _wsInline("ws-run-error", "");
+}
+
+async function createWorkspace() {
+  const name = $("ws-create-name").value.trim();
+  if (!name) { $("ws-create-name").focus(); return; }
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/workspaces", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { showToast("Could not create workspace: " + e, "error"); return; }
+  if (!resp.ok || data.error) { showToast(data.error || ("HTTP " + resp.status), "error", 6000); return; }
+  $("ws-create-name").value = "";
+  $("ws-create-row").classList.add("hidden");
+  showToast("Workspace created · " + (data.name || name), "success");
+  await loadWorkspaces();
+  openWorkspace(data.slug);
+}
+
+async function saveWorkspaceMeta() {
+  const body = { name: $("ws-name-input").value.trim() || null,
+                 description: $("ws-desc-input").value };
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/workspaces/" + encodeURIComponent(currentWorkspace), {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _wsInline("ws-edit-error", "Save failed: " + e); return; }
+  if (!resp.ok || data.error) { _wsInline("ws-edit-error", data.error || ("HTTP " + resp.status)); return; }
+  $("ws-edit-form").classList.add("hidden");
+  showToast("Workspace updated", "success");
+  await refreshWorkspaceView();
+}
+
+async function assignWorkspaceProject() {
+  const slug = $("ws-assign-select").value;
+  if (!slug) return;
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/workspaces/" + encodeURIComponent(currentWorkspace) + "/projects", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project: slug }),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _wsInline("ws-assign-error", "Assign failed: " + e); return; }
+  if (!resp.ok || data.error) { _wsInline("ws-assign-error", data.error || ("HTTP " + resp.status)); return; }
+  showToast("Assigned " + slug, "success", 2500);
+  await refreshWorkspaceView();
+}
+
+async function unassignWorkspaceProject(slug) {
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/workspaces/" + encodeURIComponent(currentWorkspace)
+      + "/projects/" + encodeURIComponent(slug), { method: "DELETE" });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _wsInline("ws-assign-error", "Unassign failed: " + e); return; }
+  if (!resp.ok || data.error) { _wsInline("ws-assign-error", data.error || ("HTTP " + resp.status)); return; }
+  showToast("Removed " + slug + " from the workspace", "warn", 2500);
+  await refreshWorkspaceView();
+}
+
+async function saveWorkspaceDeps() {
+  const deps = {};
+  document.querySelectorAll("#ws-deps .ws-dep-row").forEach(row => {
+    const checked = [...row.querySelectorAll("input:checked")].map(cb => cb.value);
+    if (checked.length) deps[row.dataset.slug] = checked;
+  });
+  const btn = $("ws-deps-save");
+  btn.disabled = true;
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/workspaces/" + encodeURIComponent(currentWorkspace) + "/deps", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deps }),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _wsInline("ws-deps-error", "Save failed: " + e); btn.disabled = false; return; }
+  btn.disabled = false;
+  // 400s (unknown slug / self-dep / cycle) surface inline with the server's message
+  if (!resp.ok || data.error) { _wsInline("ws-deps-error", data.error || ("HTTP " + resp.status)); return; }
+  _wsInline("ws-deps-error", "");
+  showToast("Dependencies saved", "success");
+  await refreshWorkspaceView();
+}
+
+async function runWorkspace() {
+  const entry = workspaceEntry(currentWorkspace) || {};
+  const subset = [...document.querySelectorAll("#ws-subset input:checked")].map(cb => cb.value);
+  const m = wsRunPayload({
+    prompt: $("ws-prompt").value, title: $("ws-title").value,
+    effort: $("ws-effort").value, budget: $("ws-budget").value,
+    subset, members: entry.project_slugs || [],
+  });
+  if (!m.ok) { _wsInline("ws-run-error", m.errors.join(" · ")); return; }
+  _wsInline("ws-run-error", "");
+  const btn = $("ws-run");
+  btn.disabled = true;
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/workspaces/" + encodeURIComponent(currentWorkspace) + "/run", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(m.body),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _wsInline("ws-run-error", "Could not start the run: " + e); btn.disabled = false; return; }
+  btn.disabled = false;
+  if (!resp.ok || data.error || !data.task_id) {
+    _wsInline("ws-run-error", data.error || ("HTTP " + resp.status));
+    return;
+  }
+  $("ws-prompt").value = ""; $("ws-title").value = "";
+  showToast("Workspace run started", "success");
+  state.budgetUsd = m.body.budget || serverConfig.budget_usd || 0;
+  // navigate to the created task exactly like the existing multi-project flow
+  attachToRun(data.task_id, m.body.title || m.body.prompt);
+  loadQueue();
 }
 
 // ---- All activity (formerly the Dashboard) ----
@@ -2785,31 +3212,148 @@ async function sendFeedback(extra) {
   } catch (e) { showToast("Feedback failed", "warn"); }
 }
 
-// ---- Agents roster (the sidebar's dedicated Agents view) ----
+// ---- Agents view: built-in roster (read-only) + custom-agent editor ----
 let agentsLoaded = false;
 let rosterAgents = {};   // name -> agent profile, for the detail popup
-async function loadAgents() {
-  if (agentsLoaded) return;
+let agentsBody = agentsListModel(null);   // last-fetched {builtin, custom, tools, names}
+
+function _agentCard(a, custom) {
+  const tools = Array.isArray(a.tools) ? a.tools : [];
+  const card = document.createElement("div");
+  card.className = "agent-card";
+  const effortChip = a.effort
+    ? `<span class="chip" title="Effort override">${escapeHtml(a.effort)}</span>` : "";
+  const acts = custom
+    ? `<div class="af-card-acts">` +
+      `<button type="button" class="q-act af-edit" title="Edit this agent">Edit</button>` +
+      `<button type="button" class="q-act af-delete" title="Delete this agent (click twice to confirm)">Delete</button></div>`
+    : "";
+  card.innerHTML = `
+    <div class="ac-top"><span class="ac-dot" style="background:${agentStyle(a.name).color}"></span><span class="ac-agent ac-name">${escapeHtml(a.name)}</span>${effortChip}<span class="chip chip-tools">${tools.length} tools</span></div>
+    <div class="ac-desc">${escapeHtml(a.description || "")}</div>
+    <div class="ac-when">${escapeHtml(a.when_to_use || "")}</div>
+    <div class="tool-chips">${tools.map(t => `<span class="tool-chip">${escapeHtml(t)}</span>`).join("")}</div>${acts}`;
+  if (custom) {
+    card.title = "Custom agent — click to edit";
+    makeActivatable(card, (e) => {
+      if (e && e.target && e.target.closest("button")) return;
+      openAgentForm(a);
+    }, `Edit custom agent ${a.name}`);
+    card.querySelector(".af-edit").onclick = (e) => { e.stopPropagation(); openAgentForm(a); };
+    const del = card.querySelector(".af-delete");
+    del.onclick = (e) => {   // two-click confirm — never window.confirm
+      e.stopPropagation();
+      if (!del.dataset.armed) {
+        del.dataset.armed = "1";
+        del.textContent = "Confirm delete";
+        del.classList.add("memc-arm");
+        setTimeout(() => {
+          if (del.dataset.armed) { del.dataset.armed = ""; del.textContent = "Delete"; del.classList.remove("memc-arm"); }
+        }, 5000);
+        return;
+      }
+      deleteCustomAgent(a.name);
+    };
+  } else {
+    card.title = "Built-in specialist — click for full details";
+    makeActivatable(card, () => openRosterModal(a.name), `Open profile for agent ${a.name}`);
+  }
+  return card;
+}
+
+async function loadAgents(force) {
+  if (agentsLoaded && !force) return;
   try {
-    const agents = await (await fetch("/api/agents")).json();
-    rosterAgents = {};
-    const wrap = $("agents-roster");
-    wrap.innerHTML = "";
-    agents.forEach(a => {
+    agentsBody = agentsListModel(await (await fetch("/api/agents")).json());
+  } catch (e) { return; }
+  rosterAgents = {};
+  const roster = $("agents-roster");
+  roster.innerHTML = "";
+  agentsBody.builtin.forEach(a => {
+    rosterAgents[a.name] = a;
+    roster.appendChild(_agentCard(a, false));
+  });
+  const customs = $("agents-custom");
+  customs.innerHTML = "";
+  if (!agentsBody.custom.length) {
+    customs.innerHTML = '<p class="muted af-none">No custom agents yet — create one with “+ New agent”.</p>';
+  } else {
+    agentsBody.custom.forEach(a => {
       rosterAgents[a.name] = a;
-      const card = document.createElement("div");
-      card.className = "agent-card";
-      card.title = "Click for full details";
-      card.innerHTML = `
-        <div class="ac-top"><span class="ac-dot" style="background:${agentStyle(a.name).color}"></span><span class="ac-agent ac-name">${escapeHtml(a.name)}</span><span class="chip chip-tools">${a.tools.length} tools</span></div>
-        <div class="ac-desc">${escapeHtml(a.description)}</div>
-        <div class="ac-when">${escapeHtml(a.when_to_use)}</div>
-        <div class="tool-chips">${a.tools.map(t => `<span class="tool-chip">${escapeHtml(t)}</span>`).join("")}</div>`;
-      makeActivatable(card, () => openRosterModal(a.name), `Open profile for agent ${a.name}`);
-      wrap.appendChild(card);
+      customs.appendChild(_agentCard(a, true));
     });
-    agentsLoaded = true;
-  } catch (e) { /* ignore */ }
+  }
+  agentsLoaded = true;
+}
+
+// ---- custom-agent form (new + edit prefill; upsert by name) ----
+function openAgentForm(spec) {
+  const m = agentFormModel(spec, agentsBody.tools);
+  $("af-heading").textContent = m.heading;
+  $("af-name").value = m.name;
+  $("af-desc").value = m.description;
+  $("af-when").value = m.when_to_use;
+  $("af-system").value = m.system_prompt;
+  $("af-effort").value = m.effort;
+  $("af-model").value = m.model;
+  $("af-tools").innerHTML = m.tools.length
+    ? m.tools.map(t =>
+        `<label class="check af-tool"><input type="checkbox" value="${escapeAttr(t.name)}"` +
+        `${t.checked ? " checked" : ""} /> ${escapeHtml(t.name)}</label>`).join("")
+    : '<span class="muted">Could not load the toolbox — refresh the roster.</span>';
+  $("af-error").classList.add("hidden");
+  $("af-error").textContent = "";
+  $("agent-form-card").classList.remove("hidden");
+  $("af-name").focus();
+  $("agent-form-card").scrollIntoView({ behavior: scrollBehavior(), block: "start" });
+}
+
+function closeAgentForm() {
+  $("agent-form-card").classList.add("hidden");
+}
+
+function _afFail(msg) {
+  const el = $("af-error");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+
+async function saveAgentForm() {
+  const v = agentFormValidate({
+    name: $("af-name").value, description: $("af-desc").value,
+    when_to_use: $("af-when").value, system_prompt: $("af-system").value,
+    tools: [...document.querySelectorAll("#af-tools input:checked")].map(cb => cb.value),
+    effort: $("af-effort").value, model: $("af-model").value,
+  }, agentsBody.tools);
+  if (!v.ok) { _afFail(v.errors.join(" · ")); return; }
+  const btn = $("af-save");
+  btn.disabled = true;
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/agents", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ spec: v.spec }),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _afFail("Request failed: " + e); btn.disabled = false; return; }
+  btn.disabled = false;
+  if (!resp.ok || data.error) { _afFail(data.error || ("HTTP " + resp.status)); return; }
+  closeAgentForm();
+  showToast(`Agent "${v.spec.name}" saved — routable on the next run`, "success");
+  _agentNames = null;   // the plan editor's roster must pick the new agent up
+  loadAgents(true);
+}
+
+async function deleteCustomAgent(name) {
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/agents/" + encodeURIComponent(name), { method: "DELETE" });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { showToast("Delete failed: " + e, "error"); return; }
+  if (!resp.ok || data.error) { showToast(data.error || ("HTTP " + resp.status), "error", 6000); return; }
+  showToast(`Deleted agent "${name}"`, "warn");
+  _agentNames = null;
+  loadAgents(true);
 }
 
 function openRosterModal(name) {
@@ -3072,14 +3616,21 @@ async function deleteMemoryRow(el, raw) {
   renderMemoryCuration();
 }
 
-// ---- Knowledge graph (dependency-free force layout) ----
-const TYPE_COLOR = { task: "var(--g-task)", subtask: "var(--g-subtask)", agent: "var(--g-agent)", concept: "var(--g-concept)" };
+// ---- Knowledge graph v2 (layered/weighted; dependency-free force layout) ----
+// Data comes from GET /api/projects/{slug}/graph2 — nodes {id,label,type,degree,
+// weight}, edges {src,dst,relation,weight,layer} (src/dst, NOT source/target).
+// Combined "Combine with…" views still use the old /api/graph payload,
+// normalized into the same shape.
+const GRAPH2_COLOR = { file: "var(--g-file)", task: "var(--g-task)",
+                       agent: "var(--g-agent)", concept: "var(--g-concept)" };
 const SVGNS = "http://www.w3.org/2000/svg";
-let graphData = { nodes: [], edges: [] };
+let graph2Data = { nodes: [], edges: [] };  // raw (unfiltered) payload
 let graphProjects = null;   // combined-view slugs (null = single-project view)
+let graphLayer = "domain";  // "domain" (Knowledge) | "run" (Run plumbing) | "" (All)
+let graphMinWeight = 1;
 
 // ---- KG polish: label filter (dims non-matching) + node-focus mode ----
-let _graphEls = { nodes: {}, edges: [] };   // id -> {circle,label}; [{el,source,target}]
+let _graphEls = { nodes: {}, edges: [] };   // id -> {circle,label,text}; [{el,src,dst}]
 let _graphNeighbors = {};                   // id -> Set(neighbor ids)
 let graphFocusId = null;                    // focused node id (null = no focus)
 
@@ -3088,7 +3639,7 @@ function applyGraphView() {
   const focus = graphFocusId;
   const nb = focus ? (_graphNeighbors[focus] || new Set()) : null;
   Object.entries(_graphEls.nodes).forEach(([id, els]) => {
-    const dim = !!q && !id.toLowerCase().includes(q);
+    const dim = !!q && !id.toLowerCase().includes(q) && !els.text.includes(q);
     const fade = !!focus && id !== focus && !nb.has(id);
     [els.circle, els.label].forEach(el => {
       el.classList.toggle("g-dim", dim);
@@ -3097,7 +3648,7 @@ function applyGraphView() {
     els.circle.classList.toggle("g-focus", focus === id);
   });
   _graphEls.edges.forEach(e => {
-    e.el.classList.toggle("g-fade", !!focus && e.source !== focus && e.target !== focus);
+    e.el.classList.toggle("g-fade", !!focus && e.src !== focus && e.dst !== focus);
   });
 }
 
@@ -3108,13 +3659,39 @@ function clearGraphFocus() {
   return true;
 }
 
+// Old /api/graph payload (source/target, no weights) -> graph2 shape, so the
+// combined "Combine with…" view renders through the same pipeline.
+function normalizeOldGraph(body) {
+  body = body || {};
+  const edges = (Array.isArray(body.edges) ? body.edges : []).map(e => ({
+    src: e.source, dst: e.target, relation: e.relation || "related_to",
+    weight: e.weight != null ? e.weight : 1, layer: e.layer || "domain",
+  }));
+  // promote nodes that an agent is assigned to / produced by into the "agent" type
+  const agentNames = new Set(edges
+    .filter(e => e.relation === "assigned_to" || e.relation === "produced_result_by")
+    .map(e => e.dst));
+  const deg = {};
+  edges.forEach(e => {
+    deg[e.src] = (deg[e.src] || 0) + 1;
+    deg[e.dst] = (deg[e.dst] || 0) + 1;
+  });
+  const nodes = (Array.isArray(body.nodes) ? body.nodes : []).map(n => ({
+    ...n, id: n.id, label: n.label || n.id,
+    type: agentNames.has(n.id) ? "agent" : (n.type || "concept"),
+    degree: n.degree != null ? n.degree : (deg[n.id] || 0),
+    weight: null,
+  }));
+  return { nodes, edges };
+}
+
 async function loadGraph() {
   const slug = selectedProject();
   if (!slug || slug === "multi") return;
   renderCombineRow();
   const param = combinedProjectsParam(slug, [...combineSelected]);
   let data = null, combinedProjects = null;
-  if (param) {
+  if (param) {   // combined read-only view still rides the old /api/graph
     try {
       const resp = await fetch("/api/graph?projects=" + encodeURIComponent(param));
       if (resp.ok) {
@@ -3122,19 +3699,28 @@ async function loadGraph() {
         if (body && Array.isArray(body.nodes) && Array.isArray(body.edges)) {
           const declared = _combinedDeclared(body, body.nodes);
           if (declared !== null) {
-            data = body;
+            data = normalizeOldGraph(body);
             combinedProjects = declared.length ? declared : param.split(",");
           }
         }
       }
     } catch (e) { /* fall back to the single-project fetch below */ }
   }
-  if (!data) {   // single-project view, or the combined param hasn't landed server-side
-    try { data = await (await fetch("/api/graph?project=" + encodeURIComponent(slug))).json(); }
-    catch (e) { return; }
+  if (!data) {   // single-project view — the layered graph2 endpoint
+    try {
+      const resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/graph2");
+      if (resp.ok) {
+        const body = await resp.json();
+        data = { nodes: body.nodes || [], edges: body.edges || [] };
+      }
+    } catch (e) { /* fall through to the legacy endpoint */ }
+    if (!data) {   // legacy server without graph2
+      try { data = normalizeOldGraph(await (await fetch("/api/graph?project=" + encodeURIComponent(slug))).json()); }
+      catch (e) { return; }
+    }
     combinedProjects = null;
   }
-  graphData = data;
+  graph2Data = data;
   graphProjects = (combinedProjects && combinedProjects.length > 1) ? combinedProjects : null;
   setCombineBanner(graphProjects ? graphProjects.length : 0);
   renderGraph();
@@ -3143,43 +3729,39 @@ async function loadGraph() {
 function renderGraph() {
   const svg = $("graph-svg");
   svg.innerHTML = "";
-  const nodes = graphData.nodes.slice(0, 120);
+  const vm = graph2ViewModel(graph2Data, { layer: graphLayer, minWeight: graphMinWeight });
+  const nodes = vm.nodes.slice(0, 150);   // layout cost cap
   const ids = new Set(nodes.map(n => n.id));
   if (graphFocusId && !ids.has(graphFocusId)) graphFocusId = null;
-  const edges = graphData.edges.filter(e => ids.has(e.source) && ids.has(e.target));
-  $("graph-stats").textContent = `${graphData.nodes.length} nodes · ${graphData.edges.length} edges`;
-
-  // promote nodes that an agent is assigned to / produced by into the "agent" type
-  const agentNames = new Set(edges.filter(e => e.relation === "assigned_to" || e.relation === "produced_result_by").map(e => e.target));
-  nodes.forEach(n => { if (agentNames.has(n.id)) n.type = "agent"; });
+  const edges = vm.edges.filter(e => ids.has(e.src) && ids.has(e.dst));
+  $("graph-stats").textContent = vm.statsLabel;
 
   if (!nodes.length) {
     const t = document.createElementNS(SVGNS, "text");
     t.setAttribute("x", 400); t.setAttribute("y", 260); t.setAttribute("text-anchor", "middle");
-    t.setAttribute("class", "nlabel"); t.textContent = "No knowledge yet — run a task.";
+    t.setAttribute("class", "nlabel");
+    t.textContent = graph2Data.nodes.length
+      ? "Nothing in this layer — try All or a lower min weight."
+      : "No knowledge yet — run a task.";
     svg.appendChild(t); $("graph-legend").innerHTML = ""; return;
   }
 
   const W = 800, H = 520;
   const pos = layout(nodes, edges, W, H);
-  const adj = {};
-  edges.forEach(e => {
-    (adj[e.source] = adj[e.source] || []).push(`→ [${e.relation}] ${e.target}`);
-    (adj[e.target] = adj[e.target] || []).push(`← [${e.relation}] ${e.source}`);
-  });
 
   _graphEls = { nodes: {}, edges: [] };
   _graphNeighbors = {};
   edges.forEach(e => {
-    const a = pos[e.source], b = pos[e.target];
+    const a = pos[e.src], b = pos[e.dst];
     const line = document.createElementNS(SVGNS, "line");
     line.setAttribute("x1", a.x); line.setAttribute("y1", a.y);
     line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
-    line.setAttribute("class", "edge");
+    line.setAttribute("class", "edge" + (e.layer === "run" ? " edge-run" : ""));
+    if (e.weight > 1) line.style.strokeWidth = Math.min(4, 1 + e.weight * 0.4) + "px";
     svg.appendChild(line);
-    _graphEls.edges.push({ el: line, source: e.source, target: e.target });
-    (_graphNeighbors[e.source] = _graphNeighbors[e.source] || new Set()).add(e.target);
-    (_graphNeighbors[e.target] = _graphNeighbors[e.target] || new Set()).add(e.source);
+    _graphEls.edges.push({ el: line, src: e.src, dst: e.dst });
+    (_graphNeighbors[e.src] = _graphNeighbors[e.src] || new Set()).add(e.dst);
+    (_graphNeighbors[e.dst] = _graphNeighbors[e.dst] || new Set()).add(e.src);
   });
 
   // combined view: ring each node with its source project's color
@@ -3187,10 +3769,9 @@ function renderGraph() {
 
   nodes.forEach(n => {
     const p = pos[n.id];
-    const r = n.type === "task" ? 13 : n.type === "subtask" ? 10 : 8;
     const c = document.createElementNS(SVGNS, "circle");
-    c.setAttribute("cx", p.x); c.setAttribute("cy", p.y); c.setAttribute("r", r);
-    c.setAttribute("fill", TYPE_COLOR[n.type] || TYPE_COLOR.concept);
+    c.setAttribute("cx", p.x); c.setAttribute("cy", p.y); c.setAttribute("r", n.r);
+    c.setAttribute("fill", GRAPH2_COLOR[n.colorKey] || GRAPH2_COLOR.concept);
     c.setAttribute("class", "node");
     if (pcolors) {
       const pj = itemProjects(n)[0];
@@ -3202,21 +3783,21 @@ function renderGraph() {
     c.addEventListener("click", () => {
       // node-focus mode: click highlights the neighborhood, click again clears
       graphFocusId = graphFocusId === n.id ? null : n.id;
-      showNode(n, adj[n.id] || []);
+      openNodePanel(n.id);
       applyGraphView();
     });
     svg.appendChild(c);
     const label = document.createElementNS(SVGNS, "text");
-    label.setAttribute("x", p.x + r + 3); label.setAttribute("y", p.y + 3);
+    label.setAttribute("x", p.x + n.r + 3); label.setAttribute("y", p.y + 3);
     label.setAttribute("class", "nlabel");
-    label.textContent = n.id.length > 22 ? n.id.slice(0, 21) + "…" : n.id;
+    label.textContent = n.label.length > 22 ? n.label.slice(0, 21) + "…" : n.label;
     svg.appendChild(label);
-    _graphEls.nodes[n.id] = { circle: c, label };
+    _graphEls.nodes[n.id] = { circle: c, label, text: n.label.toLowerCase() };
   });
   applyGraphView();
 
-  let legend = Object.entries(TYPE_COLOR)
-    .map(([t, c]) => `<span><i style="background:${c}"></i>${t}</span>`).join("");
+  let legend = vm.legend
+    .map(t => `<span><i style="background:${GRAPH2_COLOR[t]}"></i>${t}</span>`).join("");
   if (pcolors) {
     legend += Object.entries(pcolors).map(([s, c]) =>
       `<span><i style="background:transparent;border:2px solid ${c}"></i>${escapeHtml(s)}</span>`).join("");
@@ -3224,19 +3805,116 @@ function renderGraph() {
   $("graph-legend").innerHTML = legend;
 }
 
-function showNode(n, facts) {
-  const taskEdge = (graphData.edges || []).find(e => e.relation === "produced_file" && e.target === n.id);
-  const extra = taskEdge
-    ? `<button type="button" class="open-file" data-task="${escapeAttr(taskEdge.source)}" data-path="${escapeAttr(n.id)}">Open in Files →</button>`
-    : "";
-  const pj = graphProjects ? itemProjects(n) : [];
+// The clicked node's 1-hop neighborhood from the ALREADY-LOADED payload —
+// used for combined views and as the fallback when the server fetch fails.
+function localNeighborhood(id) {
+  const edges = (graph2Data.edges || []).filter(e => e.src === id || e.dst === id);
+  const keep = new Set([id]);
+  edges.forEach(e => { keep.add(e.src); keep.add(e.dst); });
+  return { node: id, nodes: (graph2Data.nodes || []).filter(n => keep.has(n.id)), edges };
+}
+
+// Side panel: label/type/degree + incident edges with relation/weight/layer/
+// last_ts provenance (server neighborhood carries last_ts; local fallback not).
+async function openNodePanel(id) {
+  const slug = selectedProject();
+  let hood = null;
+  if (!graphProjects && slug && slug !== "multi") {
+    try {
+      const resp = await fetch("/api/projects/" + encodeURIComponent(slug)
+        + "/graph2/node/" + encodeURIComponent(id) + "?depth=1");
+      if (resp.ok) hood = await resp.json();
+    } catch (e) { /* fall back to the loaded payload */ }
+  }
+  let vm = nodePanelModel(hood);
+  if (vm.empty) vm = nodePanelModel(localNeighborhood(id));
+  renderNodePanel(vm, id);
+}
+
+function renderNodePanel(vm, id) {
+  const el = $("node-detail");
+  if (vm.empty) {
+    el.classList.add("muted");
+    el.textContent = "No relations recorded for “" + (id || "this node") + "”.";
+    return;
+  }
+  el.classList.remove("muted");
+  const pj = graphProjects
+    ? itemProjects((graph2Data.nodes || []).find(n => n.id === vm.id)) : [];
   const projTag = pj.length
     ? ` <span class="proj-tag" title="Project this node belongs to">${escapeHtml(pj.join(" · "))}</span>` : "";
-  $("node-detail").classList.remove("muted");
-  $("node-detail").innerHTML = `<b>${escapeHtml(n.id)}</b> <span class="muted">(${n.type})</span>${projTag}<br>` +
-    (facts.length ? facts.map(f => escapeHtml(f)).join("<br>") : "<span class='muted'>no relations</span>") + extra;
-  const of = $("node-detail").querySelector(".open-file");
+  const rows = vm.edges.length ? vm.edges.map(e =>
+    `<div class="np-edge"><span class="np-dir" aria-hidden="true">${e.dir}</span> ` +
+    `<b>${escapeHtml(e.otherLabel)}</b> <span class="np-rel">${escapeHtml(e.relation)}</span>` +
+    `<span class="np-meta">w${e.weight} · ${escapeHtml(e.layer)}` +
+    (e.lastTs != null ? " · " + escapeHtml(new Date(e.lastTs * 1000).toLocaleDateString()) : "") +
+    `</span></div>`).join("")
+    : "<span class='muted'>no relations</span>";
+  const openFile = vm.fileTask
+    ? `<button type="button" class="open-file" data-task="${escapeAttr(vm.fileTask)}" data-path="${escapeAttr(vm.id)}">Open in Files →</button>`
+    : "";
+  el.innerHTML = `<b>${escapeHtml(vm.label)}</b> ` +
+    `<span class="muted">(${escapeHtml(vm.type)} · degree ${vm.degree})</span>${projTag}` +
+    `<div class="np-edges">${rows}</div>${openFile}`;
+  const of = el.querySelector(".open-file");
   if (of) of.onclick = async () => { await openFilesView(of.dataset.task); selectFile(of.dataset.path, null); };
+}
+
+// ---- graph2 node search (GET .../graph2/search?q=) — pick a hit to focus it ----
+let _gSearchTimer = null;
+let _gSearchSeq = 0;
+
+function _hideGraphSearch() {
+  $("graph-search-results").classList.add("hidden");
+  $("graph-search-results").innerHTML = "";
+}
+
+function scheduleGraphSearch() {
+  clearTimeout(_gSearchTimer);
+  const q = $("graph-search").value.trim();
+  if (q.length < 2) { _hideGraphSearch(); return; }
+  _gSearchTimer = setTimeout(() => runGraphSearch(q), 250);
+}
+
+async function runGraphSearch(q) {
+  const slug = selectedProject();
+  if (!slug || slug === "multi") return;
+  const seq = ++_gSearchSeq;
+  let hits = [];
+  try {
+    const resp = await fetch("/api/projects/" + encodeURIComponent(slug)
+      + "/graph2/search?q=" + encodeURIComponent(q));
+    if (resp.ok) hits = (await resp.json()).nodes || [];
+  } catch (e) { /* show nothing */ }
+  if (seq !== _gSearchSeq) return;   // a newer query superseded this one
+  const box = $("graph-search-results");
+  if (!hits.length) {
+    box.innerHTML = `<p class="muted gsr-none">No nodes match “${escapeHtml(q)}”.</p>`;
+    box.classList.remove("hidden");
+    return;
+  }
+  box.innerHTML = "";
+  hits.forEach(n => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "gsr-item";
+    b.setAttribute("role", "option");
+    b.innerHTML = `<span class="gsr-label">${escapeHtml(n.label || n.id)}</span>` +
+      `<span class="gsr-type">${escapeHtml(n.type || "concept")}</span>`;
+    b.onclick = () => focusGraphNode(n.id);
+    box.appendChild(b);
+  });
+  box.classList.remove("hidden");
+}
+
+function focusGraphNode(id) {
+  _hideGraphSearch();
+  $("graph-search").value = "";
+  if (_graphEls.nodes[id]) {   // visible under the current layer/weight -> spotlight it
+    graphFocusId = id;
+    applyGraphView();
+  }
+  openNodePanel(id);           // panel works even when the node is filtered out
 }
 
 function layout(nodes, edges, W, H) {
@@ -3262,7 +3940,7 @@ function layout(nodes, edges, W, H) {
       pa.fx = fx; pa.fy = fy;
     }
     edges.forEach(e => {
-      const pa = pos[e.source], pb = pos[e.target];
+      const pa = pos[e.src], pb = pos[e.dst];
       let dx = pa.x - pb.x, dy = pa.y - pb.y;
       let d = Math.hypot(dx, dy) || 0.01;
       const att = (d * d) / k;
@@ -4193,11 +4871,65 @@ document.querySelectorAll("#modal .tab").forEach(t => t.onclick = () => selectTa
 // project tab bar + knowledge sub-tabs + sidebar global nav
 document.querySelectorAll("#project-tabs .ptab").forEach(b => b.onclick = () => selectProjectTab(b.dataset.tab));
 document.querySelectorAll("#know-tabs .ktab").forEach(b => b.onclick = () => showKnowledge(b.dataset.know));
+$("nav-home").onclick = showHome;                   // the console's entry screen
 $("nav-activity").onclick = showActivity;
 $("nav-agents").onclick = showAgents;
 $("nav-gsettings").onclick = showGlobalSettings;    // global settings console
 $("gs-refresh").onclick = loadGlobalSettings;
-$("agents-refresh").onclick = () => { agentsLoaded = false; loadAgents(); };
+$("agents-refresh").onclick = () => loadAgents(true);
+// away wave: home + workspaces + custom agents + graph2 controls
+$("home-refresh").onclick = loadHome;
+$("home-spend-link").onclick = showActivity;
+$("new-workspace").onclick = () => {
+  const row = $("ws-create-row");
+  row.classList.toggle("hidden");
+  if (!row.classList.contains("hidden")) $("ws-create-name").focus();
+};
+$("ws-create-go").onclick = createWorkspace;
+$("ws-create-name").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); createWorkspace(); }
+});
+$("ws-refresh").onclick = refreshWorkspaceView;
+$("ws-edit").onclick = () => {
+  const entry = workspaceEntry(currentWorkspace) || {};
+  const form = $("ws-edit-form");
+  const opening = form.classList.contains("hidden");
+  form.classList.toggle("hidden", !opening);
+  if (opening) {
+    $("ws-name-input").value = entry.name || "";
+    $("ws-desc-input").value = entry.description || "";
+    $("ws-edit-error").classList.add("hidden");
+    $("ws-name-input").focus();
+  }
+};
+$("ws-edit-cancel").onclick = () => $("ws-edit-form").classList.add("hidden");
+$("ws-save").onclick = saveWorkspaceMeta;
+$("ws-assign-btn").onclick = assignWorkspaceProject;
+$("ws-deps-save").onclick = saveWorkspaceDeps;
+$("ws-run").onclick = runWorkspace;
+$("ws-prompt").addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") runWorkspace();
+});
+$("agent-new").onclick = () => openAgentForm(null);
+$("af-save").onclick = saveAgentForm;
+$("af-cancel").onclick = closeAgentForm;
+$("graph-layer").querySelectorAll(".seg-opt").forEach(b => b.onclick = () => {
+  graphLayer = b.dataset.v;
+  $("graph-layer").querySelectorAll(".seg-opt").forEach(x =>
+    x.setAttribute("aria-pressed", x === b ? "true" : "false"));
+  renderGraph();   // client-side re-filter — no refetch
+});
+$("graph-minw").onchange = () => {
+  graphMinWeight = parseInt($("graph-minw").value, 10) || 1;
+  renderGraph();
+};
+$("graph-search").addEventListener("input", scheduleGraphSearch);
+$("graph-search").addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { _hideGraphSearch(); e.stopPropagation(); }
+});
+document.addEventListener("click", (e) => {   // click-away closes the node-search dropdown
+  if (!e.target.closest(".graph-search-wrap")) _hideGraphSearch();
+});
 wireSeg("model-seg", "model");
 wireSeg("effort-seg", "effort");
 $("app-start").onclick = startApp;
@@ -4272,11 +5004,11 @@ function bootApp() {
   _appBooted = true;
   loadConfig();
   loadProjects().then(() => {
-    // Project-first landing: the selected project's Overview is the default view.
-    // Opening/attaching a task (openTask/attachToRun/launchRun) switches to its detail.
-    // With no real projects yet, the main area is the first-run empty state.
-    if (currentProject) selectProject(currentProject, "overview");
-    else { showEmptyState(); maybeStartTour(); }   // first-run tour over the empty state
+    // Home-first landing: the console's entry screen aggregates attention items,
+    // live work, spend and workspaces. Opening/attaching a task switches to its
+    // detail; projects are one sidebar click away.
+    showHome();
+    if (!currentProject) maybeStartTour();   // first-run tour (no projects yet)
   });
   loadQueue();
   setInterval(loadQueue, 4000);  // keep the queue panel + chip fresh
@@ -4284,6 +5016,9 @@ function bootApp() {
     refreshProjectPulse(false);
     if (currentMainView === "activity") loadProjectsActivity();
   }, 5000);
+  setInterval(() => {            // Home refreshes every ~15s while visible
+    if (currentMainView === "home") loadHome();
+  }, 15000);
 }
 
 // S8 boot gate: ask the (always-open) auth status endpoint whether a login is
