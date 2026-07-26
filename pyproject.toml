@@ -20,6 +20,10 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pywebpush>=2",
+]
+push = [
+    "pywebpush>=2",
 ]
 
 [project.scripts]

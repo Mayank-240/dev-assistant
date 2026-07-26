@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- ADA mark: red square, dark diamond. Full-bleed so it works as a
+       maskable icon (safe zone: keep the mark within the central 80%). -->
+  <rect width="512" height="512" fill="#ec3013"/>
+  <path d="M256 116 L396 256 L256 396 L116 256 Z" fill="#16130f"/>
+</svg>
