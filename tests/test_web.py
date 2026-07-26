@@ -841,3 +841,71 @@ def test_settings_for_applies_playbook_overrides():
     # unknown keys in a playbook's overrides are ignored, never a crash
     s3 = _settings_for(base, None, None, settings_overrides={"not_a_field": 1})
     assert s3 == _settings_for(base, None, None)
+
+
+# ---- S8 completion: cookie-session login (the browser UI's auth path) ----
+# Bearer/query-param auth itself is covered in test_web_auth.py; these pin the
+# /api/auth/status + /api/login + /api/logout endpoints and the ada_token cookie.
+
+_TOKEN = "s8-test-token"
+
+
+def _auth_client(tmp_path):
+    settings = Settings(
+        llm_backend="anthropic", anthropic_api_key="", embeddings_backend="hash",
+        data_dir=tmp_path / "data", docs_dir=tmp_path / "docs", workspace_dir=tmp_path / "ws",
+    )
+    return TestClient(create_app(settings, api_token=_TOKEN))
+
+
+def test_auth_off_keeps_api_open_and_status_says_so(tmp_path):
+    c = _client(tmp_path)  # api_token="" -> auth off, exactly as before
+    assert c.get("/api/tasks").status_code == 200
+    assert c.get("/api/auth/status").json() == {"auth_required": False, "authorized": True}
+    # login is refused when there is no token to match (nothing to set a cookie for)
+    assert c.post("/api/login", json={"token": "anything"}).status_code == 403
+
+
+def test_token_set_requires_credentials_but_status_stays_open(tmp_path):
+    c = _auth_client(tmp_path)
+    assert c.get("/api/tasks").status_code == 401
+    assert c.get("/api/tasks", headers={"Authorization": f"Bearer {_TOKEN}"}).status_code == 200
+    body = c.get("/api/auth/status").json()  # readable without any credentials
+    assert body == {"auth_required": True, "authorized": False}
+    with_bearer = c.get("/api/auth/status", headers={"Authorization": f"Bearer {_TOKEN}"})
+    assert with_bearer.json()["authorized"] is True
+
+
+def test_login_sets_cookie_and_cookie_alone_authorizes(tmp_path):
+    c = _auth_client(tmp_path)
+    r = c.post("/api/login", json={"token": _TOKEN})
+    assert r.status_code == 204
+    set_cookie = r.headers["set-cookie"]
+    assert "ada_token" in set_cookie and "HttpOnly" in set_cookie
+    # the client's jar keeps the cookie; no Authorization header from here on
+    assert c.get("/api/tasks").status_code == 200
+    assert c.get("/api/auth/status").json()["authorized"] is True
+
+
+def test_login_wrong_token_is_403_and_sets_no_cookie(tmp_path):
+    c = _auth_client(tmp_path)
+    r = c.post("/api/login", json={"token": "wrong"})
+    assert r.status_code == 403
+    assert "set-cookie" not in r.headers
+    assert c.get("/api/tasks").status_code == 401
+    assert c.post("/api/login", json={}).status_code == 403  # blank never matches
+
+
+def test_logout_clears_cookie(tmp_path):
+    c = _auth_client(tmp_path)
+    assert c.post("/api/login", json={"token": _TOKEN}).status_code == 204
+    assert c.get("/api/tasks").status_code == 200
+    assert c.post("/api/logout").status_code == 204
+    assert c.get("/api/tasks").status_code == 401
+
+
+def test_ws_accepts_session_cookie(tmp_path):
+    c = _auth_client(tmp_path)
+    with c.websocket_connect("/ws/whatever",
+                             headers={"cookie": f"ada_token={_TOKEN}"}) as ws:
+        assert ws.receive_json()["type"] == "error"  # unknown task, but authenticated

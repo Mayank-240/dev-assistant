@@ -119,6 +119,31 @@ test("reduceRunEvent tolerates out-of-order and unknown events", () => {
   assert.equal(s.phase, "document");
 });
 
+test("reduceRunEvent 'subtask_retry' flips a failed review back to running", () => {
+  const s = initialRunAggregates();
+  reduceRunEvent(s, planEvent());
+  reduceRunEvent(s, { type: "subtask_start", ts: 1, data: { id: "s1", agent: "coder" } });
+  reduceRunEvent(s, { type: "subtask_review", ts: 2, data: { id: "s1", passed: false, score: 3 } });
+  assert.ok(s.reviewed.has("s1"));
+  reduceRunEvent(s, { type: "subtask_retry", ts: 3, data: { id: "s1", agent: "coder", attempt: 1, max: 1 } });
+  assert.equal(s.agentData.s1.status, "running");
+  assert.ok(!s.reviewed.has("s1"));                  // progress no longer counts it as finished
+  reduceRunEvent(s, { type: "subtask_retry", ts: 3, data: {} });  // id-less retry is a no-op
+});
+
+test("reduceRunEvent 'plan_update' adds a mid-run repair subtask exactly once", () => {
+  const s = initialRunAggregates();
+  reduceRunEvent(s, planEvent());
+  reduceRunEvent(s, { type: "plan_update", ts: 4,
+                      data: { id: "s1-fix", agent: "debugger", title: "Repair: Write it", repairs: "s1" } });
+  assert.equal(s.total, 3);
+  assert.equal(s.agentData["s1-fix"].status, "queued");
+  assert.equal(s.agentData["s1-fix"].agent, "debugger");
+  // idempotent: replaying the same event never double-counts
+  reduceRunEvent(s, { type: "plan_update", ts: 5, data: { id: "s1-fix", agent: "debugger" } });
+  assert.equal(s.total, 3);
+});
+
 test("reduceRunEvent 'diff' attaches the file lists to the agent record", () => {
   const s = initialRunAggregates();
   reduceRunEvent(s, planEvent());

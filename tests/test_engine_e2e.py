@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import asyncio
 
+import dataclasses
+
 from ai_dev_assistant.config import Settings
 from ai_dev_assistant.engine import Engine
 from ai_dev_assistant.llm.schemas import BriefDoc, Plan, SubTask, Verdict
+from ai_dev_assistant.orchestration.task import RunStatus
 
 
 class _Usage:
@@ -140,7 +143,6 @@ async def test_full_pipeline_offline(tmp_path):
 
 
 async def test_budget_stops_run(tmp_path):
-    import dataclasses
     settings = dataclasses.replace(_settings(tmp_path), budget_usd=3.0)  # each agent call costs 5
     engine = Engine(settings)
     fake = FakeProvider()
@@ -159,3 +161,95 @@ async def test_budget_stops_run(tmp_path):
     assert done.data["over_budget"] is True
     # s1/s2 (parallel, no deps) ran; s3 (depends on them) was stopped by the cap
     assert run.subtasks["s3"].status.value != "passed"
+
+
+# ---- self-heal (adaptive replan on by default) + retry visibility ----
+
+class _OneStepProvider(FakeProvider):
+    """Single-subtask plan so the failure/repair/retry paths are deterministic."""
+
+    async def structured(self, *, system, user, schema, model, effort=None, max_tokens=4000):
+        if schema is Plan:
+            return Plan(summary="One coding step.", subtasks=[
+                SubTask(id="s1", title="Implement change", description="Write the code.",
+                        agent="coder", rationale="needs code", depends_on=[],
+                        acceptance_criteria=["code provided"])])
+        return await super().structured(system=system, user=user, schema=schema,
+                                        model=model, effort=effort, max_tokens=max_tokens)
+
+
+class _TimeoutProvider(_OneStepProvider):
+    """The original attempt sleeps past the wall-clock cap; the injected repair
+    subtask (its task text starts with 'Repair:') completes normally."""
+
+    async def run_agent(self, *, prompt, on_step=None, **_kw):
+        if "Repair:" not in prompt:
+            await asyncio.sleep(5)  # cancelled by the subtask wall-clock cap
+        self.usage.cost_usd += 0.01
+        return "Repaired — satisfies the acceptance criteria."
+
+
+async def test_timeout_failed_subtask_gets_repair_subtask(tmp_path):
+    # adaptive_replan is deliberately NOT set: self-heal must be the default
+    settings = dataclasses.replace(_settings(tmp_path), subtask_max_seconds=0.2,
+                                   objective_review=False)
+    assert settings.adaptive_replan is True
+    engine = Engine(settings)
+    fake = _TimeoutProvider()
+    engine.provider = fake
+    engine.orchestrator._provider = fake
+    engine.reviewer._provider = fake
+
+    events = []
+    try:
+        run, brief, out_dir = await engine.run("do a thing", on_event=events.append)
+    finally:
+        await engine.aclose()
+
+    # the wall-clock timeout left s1 FAILED (not stuck RUNNING) …
+    assert run.subtasks["s1"].status is RunStatus.FAILED
+    assert "wall-clock cap" in (run.subtasks["s1"].error or "")
+    # … and the replan hook self-healed it with a bounded "-fix" repair subtask
+    fix = run.subtasks.get("s1-fix")
+    assert fix is not None and fix.status is RunStatus.PASSED
+    assert any(e.type == "plan_update" and e.data.get("id") == "s1-fix" for e in events)
+
+
+class _FailReviewOnceProvider(_OneStepProvider):
+    """First verdict fails with a concrete reason; the retry passes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.review_calls = 0
+
+    async def structured(self, *, system, user, schema, model, effort=None, max_tokens=4000):
+        if schema is Verdict:
+            self.review_calls += 1
+            if self.review_calls == 1:
+                return Verdict(passed=False, score=40, reasons=["missing edge cases"],
+                               suggestions=["handle empty input"])
+            return Verdict(passed=True, score=95, reasons=["meets all criteria"], suggestions=[])
+        return await super().structured(system=system, user=user, schema=schema,
+                                        model=model, effort=effort, max_tokens=max_tokens)
+
+
+async def test_review_retry_emits_subtask_retry_event(tmp_path):
+    settings = dataclasses.replace(_settings(tmp_path), max_retries=1,
+                                   objective_review=False)
+    engine = Engine(settings)
+    fake = _FailReviewOnceProvider()
+    engine.provider = fake
+    engine.orchestrator._provider = fake
+    engine.reviewer._provider = fake
+
+    events = []
+    try:
+        run, brief, out_dir = await engine.run("do a thing", on_event=events.append)
+    finally:
+        await engine.aclose()
+
+    retry = next(e for e in events if e.type == "subtask_retry")
+    assert retry.data == {"id": "s1", "agent": "coder", "attempt": 1, "max": 1}
+    assert "missing edge cases" in retry.message
+    assert run.subtasks["s1"].status is RunStatus.PASSED
+    assert run.subtasks["s1"].attempts == 2  # the retry actually re-ran the agent

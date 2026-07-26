@@ -252,6 +252,12 @@ a:hover { color:var(--accent); }
   color:var(--text-2); cursor:pointer;
 }
 #theme-btn:hover { background:color-mix(in srgb, var(--text) 7%, transparent); }
+.signout-btn {
+  font-size:10.5px; font-weight:800; letter-spacing:.05em; text-transform:uppercase;
+  padding:5px 10px; border-radius:0; border:1px solid var(--border); background:transparent;
+  color:var(--text-2); cursor:pointer;
+}
+.signout-btn:hover { border-color:var(--accent); color:var(--accent-deep); }
 
 /* ============================================================
    MAIN COLUMN
@@ -886,18 +892,15 @@ a:hover { color:var(--accent); }
 .d-hunk { color:var(--accent-deep); font-weight:600; }
 .d-file { color:var(--text-2); font-weight:600; }
 
-/* ---------- token bar + toasts ---------- */
-.token-bar { position:fixed; left:50%; bottom:18px; transform:translateX(-50%); z-index:60;
-  display:flex; align-items:center; gap:10px; max-width:min(640px, calc(100vw - 32px));
-  padding:10px 14px; border-radius:0; background:var(--bg); border:2px solid var(--text);
-  box-shadow:0 12px 32px color-mix(in srgb, #2d2b2b 22%, transparent); font-size:12.5px; color:var(--text-2); }
-.token-bar input { flex:1; min-width:180px; padding:6px 8px; border-radius:0;
-  border:1px solid var(--border); background:var(--bg); color:var(--text);
-  font-family:var(--mono); font-size:12px; }
-.token-bar button { padding:6px 14px; border-radius:0; border:0;
-  background:var(--accent); color:#f3f2f2; cursor:pointer; font-size:11px; font-weight:800;
-  letter-spacing:.04em; text-transform:uppercase; }
-.token-bar button:hover { background:var(--accent-hover); }
+/* ---------- login gate (S8) + toasts ---------- */
+.login-screen { position:fixed; inset:0; z-index:70; display:flex; align-items:center; justify-content:center; background:var(--bg); }
+.login-box { display:flex; flex-direction:column; gap:12px; width:min(380px, calc(100vw - 48px));
+  padding:28px; border-radius:0; background:var(--surface); border:2px solid var(--text); }
+.login-brand { display:flex; align-items:center; gap:10px; padding-bottom:14px; border-bottom:2px solid var(--border); }
+.login-brand h1 { margin:0; font-family:var(--sans); font-size:13px; font-weight:800; letter-spacing:.02em; text-transform:uppercase; line-height:1.25; }
+.login-hint { margin:0; font-size:12.5px; color:var(--text-2); }
+.login-box .pm-label { margin:6px 0 0; }
+.login-box .btn-primary { align-self:flex-start; margin-top:6px; }
 
 .toasts { position:fixed; right:20px; bottom:20px; display:flex; flex-direction:column; gap:8px; z-index:60; }
 .toast { padding:11px 15px; border-radius:0; background:var(--bg); border:1px solid var(--text); box-shadow:0 3px 10px color-mix(in srgb, #2d2b2b 16%, transparent); font-size:12.5px; color:var(--text); max-width:340px; }

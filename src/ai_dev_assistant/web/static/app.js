@@ -16,41 +16,60 @@ const {
   fmtRelTime, paletteResultsModel, scheduleRowModel, scheduleFormModel,
   spendOverviewModel, spendOutcomesModel, runCostModel, abTableModel,
   notifCenterModel, playbookFormModel, tourStepsModel,
+  authGate, loginFormModel, loginErrorMessage,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
 const _reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)");
 const scrollBehavior = () => (_reduceMotion && _reduceMotion.matches ? "auto" : "smooth");
 
-// ---- bearer-token auth (S8) ----
-// When the server has a token configured, attach it to every API call and to the
-// WebSocket as a query param. A 401 pops a small prompt; the token persists in
-// localStorage. With no token configured (the localhost default) this is inert.
-function apiToken() { return localStorage.getItem("ada-token") || ""; }
-function tokenQuery(prefix) { const t = apiToken(); return t ? prefix + "token=" + encodeURIComponent(t) : ""; }
-let _tokenPromptShown = false;
-function showTokenBar() {
-  if (_tokenPromptShown) return;
-  _tokenPromptShown = true;
-  const bar = $("token-bar");
-  if (!bar) return;
-  bar.classList.remove("hidden");
-  $("token-input").focus();
+// ---- cookie-session auth (S8) ----
+// When the server has a token configured, /api/auth/status gates boot behind a
+// full-screen login. POST /api/login sets an HttpOnly ada_token cookie, which then
+// rides on every fetch/WebSocket/download automatically — the token is never kept
+// client-side. With no token configured (the localhost default) this is inert.
+let _appBooted = false;
+function showLogin() {
+  if (!$("view-login").classList.contains("hidden")) return;
+  $("view-login").classList.remove("hidden");
+  $("login-token").focus();
 }
-function saveToken() {
-  const v = $("token-input").value.trim();
-  if (!v) return;
-  localStorage.setItem("ada-token", v);
+function loginError(text) {
+  const err = $("login-error");
+  err.textContent = text;
+  err.classList.toggle("hidden", !text);
+}
+async function submitLogin() {
+  const m = loginFormModel($("login-token").value);
+  if (!m.ok) { loginError(m.error); return; }
+  $("login-btn").disabled = true;
+  try {
+    const res = await _fetch("/api/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: m.token }),
+    });
+    if (!res.ok) { loginError(loginErrorMessage(res.status)); return; }
+    if (_appBooted) { location.reload(); return; }  // re-login after an expired session
+    loginError("");
+    $("login-token").value = "";
+    $("view-login").classList.add("hidden");
+    $("signout-btn").classList.remove("hidden");
+    bootApp();
+  } catch (e) {
+    loginError("Could not reach the server.");
+  } finally {
+    $("login-btn").disabled = false;
+  }
+}
+async function signOut() {
+  try { await _fetch("/api/logout", { method: "POST" }); } catch (e) { /* reload regardless */ }
   location.reload();
 }
 const _fetch = window.fetch.bind(window);
 window.fetch = async (url, opts = {}) => {
-  const t = apiToken();
-  if (t && typeof url === "string" && url.startsWith("/api/")) {
-    opts = { ...opts, headers: { ...(opts.headers || {}), Authorization: "Bearer " + t } };
-  }
   const res = await _fetch(url, opts);
-  if (res.status === 401 && typeof url === "string" && url.startsWith("/api/")) showTokenBar();
+  // cookie gone (server restarted with a new token) — re-gate instead of failing quietly
+  if (res.status === 401 && typeof url === "string" && url.startsWith("/api/")) showLogin();
   return res;
 };
 
@@ -975,6 +994,17 @@ function handleEvent(ev) {
       updateProgress();
       feed(ev.message);
       break;
+    case "plan_update":
+      // adaptive replan added a subtask mid-run (e.g. a bounded repair) — give it a card
+      if (d.id && !state.agents[d.id]) {
+        $("agents-title").classList.remove("hidden");
+        $("agents").appendChild(makeAgentCard(d));
+        state.agents[d.id] = true;
+      }
+      $("m-agents").textContent = state.total;
+      updateProgress();
+      feed("+ " + ev.message);
+      break;
     case "child_start":
       renderChildrenGrid();
       feed("▶ " + ev.message);
@@ -1012,6 +1042,13 @@ function handleEvent(ev) {
       setMetricsFrom(d);
       if ("cost_usd" in d) updateBudgetMeter(d.cost_usd);
       feed((d.passed ? "✓ " : "✗ ") + ev.message + (d.objective_note ? "  ·  " + d.objective_note : ""));
+      break;
+    case "subtask_retry":
+      setAgentState(d.id, "running", "retrying");
+      setPlanNodeState(d.id, "running");
+      if (state.openAgentId === d.id) renderAgentModal(state.agentData[d.id]);
+      updateProgress();
+      feed("↻ " + ev.message);
       break;
     case "message":
       $("m-msgs").textContent = state.messages;
@@ -1390,7 +1427,7 @@ async function launchRun(body, prompt) {
 function connectWS(taskId) {
   state.taskId = taskId;
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/${taskId}` + tokenQuery("?"));
+  const ws = new WebSocket(`${proto}://${location.host}/ws/${taskId}`);
   ws.onopen = () => setConn("live", "badge-live");
   ws.onmessage = (m) => handleEvent(JSON.parse(m.data));
   ws.onclose = () => { if ($("status-pill").textContent === "running") setConn("disconnected", "badge-err"); };
@@ -2995,7 +3032,7 @@ async function selectFile(path, li) {
   const taskQ = filesTask ? "&task=" + encodeURIComponent(filesTask) : "";
   $("file-name").textContent = path; $("file-name").classList.remove("muted");
   const dl = $("file-download");
-  dl.href = "/api/workspace/download?path=" + encodeURIComponent(path) + taskQ + tokenQuery("&");
+  dl.href = "/api/workspace/download?path=" + encodeURIComponent(path) + taskQ;
   dl.classList.remove("hidden");
   const pre = $("file-content");
   pre.classList.remove("muted");
@@ -3818,9 +3855,9 @@ $("pause-btn").onclick = pauseResume;
 $("steer-btn").onclick = steerRun;
 $("dash-refresh").onclick = loadDashboard;
 $("cmp-btn").onclick = compareRuns;
-// bearer-token prompt (shown on 401 when the server requires auth)
-$("token-save").onclick = saveToken;
-$("token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") saveToken(); });
+// cookie-session login gate (S8) + sidebar sign-out
+$("login-form").addEventListener("submit", (e) => { e.preventDefault(); submitLogin(); });
+$("signout-btn").onclick = signOut;
 // feature wave: playbooks · schedules · A/B · palette · notifications · KB · graph · timeline
 $("playbook-modal-close").onclick = closePlaybookModal;
 $("pbm-cancel").onclick = closePlaybookModal;
@@ -3853,17 +3890,32 @@ document.querySelectorAll("#fb-stars button").forEach(b => b.onclick = () => {
   document.querySelectorAll("#fb-stars button").forEach(x => x.classList.toggle("on", parseInt(x.dataset.r) <= _fbRating));
   sendFeedback({});
 });
-loadConfig();
-loadProjects().then(() => {
-  // Project-first landing: the selected project's Overview is the default view.
-  // Opening/attaching a task (openTask/attachToRun/launchRun) switches to its detail.
-  // With no real projects yet, the main area is the first-run empty state.
-  if (currentProject) selectProject(currentProject, "overview");
-  else { showEmptyState(); maybeStartTour(); }   // first-run tour over the empty state
-});
-loadQueue();
-setInterval(loadQueue, 4000);  // keep the queue panel + chip fresh
-setInterval(() => {            // keep sidebar dots, activity strips & header status live
-  refreshProjectPulse(false);
-  if (currentMainView === "activity") loadProjectsActivity();
-}, 5000);
+function bootApp() {
+  if (_appBooted) return;
+  _appBooted = true;
+  loadConfig();
+  loadProjects().then(() => {
+    // Project-first landing: the selected project's Overview is the default view.
+    // Opening/attaching a task (openTask/attachToRun/launchRun) switches to its detail.
+    // With no real projects yet, the main area is the first-run empty state.
+    if (currentProject) selectProject(currentProject, "overview");
+    else { showEmptyState(); maybeStartTour(); }   // first-run tour over the empty state
+  });
+  loadQueue();
+  setInterval(loadQueue, 4000);  // keep the queue panel + chip fresh
+  setInterval(() => {            // keep sidebar dots, activity strips & header status live
+    refreshProjectPulse(false);
+    if (currentMainView === "activity") loadProjectsActivity();
+  }, 5000);
+}
+
+// S8 boot gate: ask the (always-open) auth status endpoint whether a login is
+// needed before the app touches any protected /api/* route.
+(async function initAuth() {
+  let status = null;
+  try { status = await (await _fetch("/api/auth/status")).json(); }
+  catch (e) { /* status unreachable — boot; real calls will surface the error */ }
+  if (status && status.auth_required) $("signout-btn").classList.remove("hidden");
+  if (authGate(status) === "login") showLogin();
+  else bootApp();
+})();

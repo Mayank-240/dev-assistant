@@ -412,6 +412,7 @@ class Engine:
             transient_retries=self.settings.llm_max_retries,
             replan=self._make_replan(run, emit) if self.settings.adaptive_replan else None,
             gate=self.control.gate if self.control else None,
+            on_retry=self._make_on_retry(emit),
         )
         over_budget = False
         finalized = False
@@ -757,11 +758,26 @@ class Engine:
                     r.subtasks[fix_id] = SubTaskState(spec=fix)
                     self._repairs += 1
                     added += 1
-                    emit(status(f"Adaptive replan: added repair subtask {fix_id}."))
+                    # Structured so the UI can add a card/node for the mid-run subtask.
+                    emit(Event("plan_update", f"Adaptive replan: added repair subtask {fix_id}.", {
+                        "id": fix.id, "title": fix.title, "agent": fix.agent,
+                        "depends_on": list(fix.depends_on), "repairs": st.id,
+                    }))
                     if self._repairs >= _MAX_REPAIRS:
                         break
             return added
         return replan
+
+    def _make_on_retry(self, emit: EventFn):
+        """Retry visibility: surface a review-failed retry in the event stream/UI."""
+        def on_retry(state: SubTaskState, attempt: int, max_retries: int,
+                     verdict: Verdict) -> None:
+            reason = verdict.reasons[0] if verdict.reasons else "review failed"
+            emit(Event("subtask_retry",
+                       f"Retrying {state.id} (attempt {attempt}/{max_retries}): {reason}",
+                       {"id": state.id, "agent": state.agent, "attempt": attempt,
+                        "max": max_retries}))
+        return on_retry
 
     def _consolidate_longterm(self, run: TaskRun, brief: BriefDoc) -> None:  # kept for compatibility
         pass

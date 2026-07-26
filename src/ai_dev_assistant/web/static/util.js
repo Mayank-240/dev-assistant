@@ -144,6 +144,12 @@
         state.phase = "execute";
         break;
       }
+      case "plan_update": {  // adaptive replan added a subtask mid-run (e.g. a repair)
+        if (d.id == null || state.agentData[d.id]) break;
+        state.agentData[d.id] = makeAgentRecord(d);
+        state.total += 1;
+        break;
+      }
       case "child_start": {
         if (!state.children) state.children = [];
         let c = _childOf(state, d);
@@ -193,6 +199,13 @@
           a.cost = d.cost || null;
         }
         if ("cost_usd" in d) state.costUsd = Number(d.cost_usd);
+        break;
+      }
+      case "subtask_retry": {  // failed review being re-run — it is no longer finished
+        if (d.id == null) break;
+        state.reviewed.delete(d.id);
+        const a = state.agentData[d.id];
+        if (a) a.status = "running";
         break;
       }
       case "message":
@@ -1202,6 +1215,27 @@
     return { fields, ok: !errors.length, errors, params };
   }
 
+  // ---- S8: cookie-session auth gate ----
+  // /api/auth/status response -> which screen boots first. Only a server that
+  // requires auth AND hasn't authorized this browser gates on the login screen;
+  // anything else (auth off, valid cookie, unreachable status) boots the app.
+  function authGate(status) {
+    status = status || {};
+    return status.auth_required && !status.authorized ? "login" : "app";
+  }
+
+  // Login form: raw input -> trimmed token + inline error ("" when submittable).
+  function loginFormModel(raw) {
+    const token = String(raw == null ? "" : raw).trim();
+    return { token, ok: !!token, error: token ? "" : "Enter the API token." };
+  }
+
+  // Failed POST /api/login -> the error line (403 is the only expected rejection).
+  function loginErrorMessage(httpStatus) {
+    if (httpStatus === 403) return "That token was not accepted — check it and try again.";
+    return "Sign-in failed (HTTP " + httpStatus + ").";
+  }
+
   // ---- First-run tour: 4 spotlight steps, shown once with 0 projects ----
   function tourStepsModel(projectCount, done) {
     return {
@@ -1224,6 +1258,7 @@
     fmtRelTime, paletteResultsModel, scheduleRowModel, scheduleFormModel,
     spendOverviewModel, spendOutcomesModel, runCostModel, abTableModel,
     notifCenterModel, playbookFormModel, tourStepsModel,
+    authGate, loginFormModel, loginErrorMessage,
     makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
     computeBudgetMeter, timelineRows, compareRowModel, RESUMABLE_STATUSES, isResumable,
     projectStatusLine, activityStripModel,

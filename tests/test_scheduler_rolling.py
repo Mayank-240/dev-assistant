@@ -158,6 +158,32 @@ async def test_replan_fires_on_terminal_failure_and_repair_runs():
     assert run.subtasks["b"].status is RunStatus.BLOCKED  # its dep truly failed
 
 
+# ---- on_retry hook fires when a failed review is about to be re-run ----
+async def test_on_retry_hook_fires_on_review_retry():
+    run = _run([_sub("a")])
+    pool = _pool()
+    retries: list[tuple[str, int, int, str]] = []
+    verdicts = iter([Verdict(passed=False, score=40, reasons=["missing tests"]),
+                     Verdict(passed=True, score=90)])
+
+    async def execute(state, deps, session):
+        return f"output for {state.id}"
+
+    async def verify(state, result):
+        return next(verdicts)
+
+    def on_retry(state, attempt, max_retries, verdict):
+        retries.append((state.id, attempt, max_retries, verdict.reasons[0]))
+
+    sched = Scheduler(pool=pool, execute=execute, verify=verify, max_retries=1,
+                      on_retry=on_retry)
+    await sched.run(run)
+    await pool.stop()
+
+    assert retries == [("a", 1, 1, "missing tests")]
+    assert run.subtasks["a"].status is RunStatus.PASSED
+
+
 # ---- degrade-on-partial unchanged under rolling dispatch ----
 async def test_degrade_on_partial_unchanged():
     run = _run([_sub("a"), _sub("b", agent="documenter", deps=["a"])])

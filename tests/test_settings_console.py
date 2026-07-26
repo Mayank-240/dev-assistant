@@ -144,6 +144,17 @@ def test_settings_load_applies_overlay_over_env(tmp_path, monkeypatch):
     assert Settings.load().budget_usd == 2.0
 
 
+def test_adaptive_replan_defaults_on(tmp_path, monkeypatch):
+    # Self-heal is the default: without env/overlay, failed subtasks get a bounded repair.
+    monkeypatch.setenv("ADA_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("ADA_ADAPTIVE_REPLAN", raising=False)
+    assert Settings().adaptive_replan is True
+    assert Settings.load(overlay=False).adaptive_replan is True
+    # env can still turn it off
+    monkeypatch.setenv("ADA_ADAPTIVE_REPLAN", "0")
+    assert Settings.load(overlay=False).adaptive_replan is False
+
+
 # ---- GET /api/settings: shape, values, source detection ----
 
 def test_get_settings_shape_and_info(tmp_path):

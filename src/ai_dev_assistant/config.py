@@ -90,7 +90,8 @@ class Settings:
     lint_check: bool = True         # include ruff/pyflakes signal in the objective gate
 
     # --- Planning (Tier 3) ---
-    adaptive_replan: bool = False   # let the orchestrator amend the DAG between batches
+    adaptive_replan: bool = True    # amend the DAG between batches (bounded self-heal of
+                                    # failed subtasks); on by default
     max_plan_subtasks: int = 24     # reject a plan larger than this (hallucination guard)
 
     # --- Cost guardrail ---
@@ -176,7 +177,7 @@ class Settings:
             verify_timeout=_float("ADA_VERIFY_TIMEOUT", 120.0),
             objective_review=_bool("ADA_OBJECTIVE_REVIEW", True),
             lint_check=_bool("ADA_LINT_CHECK", True),
-            adaptive_replan=_bool("ADA_ADAPTIVE_REPLAN", False),
+            adaptive_replan=_bool("ADA_ADAPTIVE_REPLAN", True),
             max_plan_subtasks=_int("ADA_MAX_PLAN_SUBTASKS", 24),
             budget_usd=_float("ADA_BUDGET_USD", 0.0),
             agent_max_turns=_int("ADA_AGENT_MAX_TURNS", 24),
@@ -368,7 +369,8 @@ SETTINGS_SCHEMA: list[dict] = [
      "help": "A subtask with real output that failed review passes with caveats "
              "so dependents still run.", "type": "bool"},
     {"key": "adaptive_replan", "group": "Verification", "label": "Adaptive replan",
-     "help": "Let the orchestrator amend the plan DAG between batches.", "type": "bool"},
+     "help": "Let the orchestrator amend the plan DAG between batches — on by default; "
+             "failed subtasks get a bounded repair attempt.", "type": "bool"},
     # --- Memory & Knowledge ---
     {"key": "memory_scope", "group": "Memory & Knowledge", "label": "Memory scope",
      "help": "Where new memories are written — recall always reads project + global.",

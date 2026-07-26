@@ -24,7 +24,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -313,6 +313,10 @@ class ABRequest(BaseModel):
     values: list[str]
 
 
+class LoginRequest(BaseModel):
+    token: str = ""
+
+
 def create_app(settings: Settings | None = None, host: str | None = None,
                api_token: str | None = None) -> FastAPI:
     # `settings` is the env/default base (paths, backend identity). The settings
@@ -346,15 +350,50 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         auth = request.headers.get("authorization", "")
         if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:].strip(), app.state.api_token):
             return True
+        # session cookie set by POST /api/login (how the browser UI authenticates)
+        cookie = request.cookies.get("ada_token", "")
+        if cookie and secrets.compare_digest(cookie, app.state.api_token):
+            return True
         supplied = request.query_params.get("token", "")
         return bool(supplied) and secrets.compare_digest(supplied, app.state.api_token)
+
+    # Always-open auth endpoints: the UI must be able to ask whether login is needed
+    # and perform it while still unauthorized.
+    _AUTH_OPEN = {"/api/auth/status", "/api/login", "/api/logout"}
 
     @app.middleware("http")
     async def require_token(request, call_next):
         # /healthz, /readyz, / and /static stay open; every /api/* route needs the token.
-        if request.url.path.startswith("/api/") and not _authorized(request):
+        if (request.url.path.startswith("/api/") and request.url.path not in _AUTH_OPEN
+                and not _authorized(request)):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return await call_next(request)
+
+    @app.get("/api/auth/status")
+    async def auth_status(request: Request) -> JSONResponse:
+        return JSONResponse({"auth_required": bool(app.state.api_token),
+                             "authorized": _authorized(request)})
+
+    @app.post("/api/login")
+    async def login(req: LoginRequest) -> Response:
+        supplied = (req.token or "").strip()
+        if not (app.state.api_token and supplied
+                and secrets.compare_digest(supplied, app.state.api_token)):
+            await asyncio.sleep(0.3)  # flat delay on every failure — slows brute force
+            return JSONResponse({"error": "invalid token"}, status_code=403)
+        # HttpOnly session cookie: flows on every fetch/WebSocket automatically and is
+        # unreadable from JS. ADA_COOKIE_SECURE=1 marks it HTTPS-only (set behind TLS).
+        resp = Response(status_code=204)
+        resp.set_cookie("ada_token", app.state.api_token, httponly=True,
+                        samesite="strict", path="/",
+                        secure=os.getenv("ADA_COOKIE_SECURE", "").strip() == "1")
+        return resp
+
+    @app.post("/api/logout")
+    async def logout() -> Response:
+        resp = Response(status_code=204)
+        resp.delete_cookie("ada_token", path="/")
+        return resp
 
     # Explicit CORS policy: same-origin by default (no cross-origin allowed);
     # widen with a comma-separated ADA_CORS_ORIGINS.
@@ -1016,10 +1055,13 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     @app.websocket("/ws/{task_id}")
     async def ws(websocket: WebSocket, task_id: str) -> None:
         # S8: WebSockets can't send an Authorization header from the browser — accept
-        # the token as a query param instead. Reject before the handshake completes.
+        # the token as a query param, or the ada_token session cookie (set by
+        # /api/login; rides along on the handshake). Reject before it completes.
         if app.state.api_token:
             supplied = websocket.query_params.get("token", "")
-            if not (supplied and secrets.compare_digest(supplied, app.state.api_token)):
+            cookie = websocket.cookies.get("ada_token", "")
+            if not ((supplied and secrets.compare_digest(supplied, app.state.api_token))
+                    or (cookie and secrets.compare_digest(cookie, app.state.api_token))):
                 await websocket.close(code=4401)
                 return
         await websocket.accept()

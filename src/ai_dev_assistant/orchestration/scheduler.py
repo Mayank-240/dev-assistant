@@ -43,6 +43,10 @@ VerifyFn = Callable[[SubTaskState, str], Awaitable[Verdict]]
 # amend the DAG (add/repair subtasks). Returns the number of subtasks added (0 = no
 # change). Injected by the engine when adaptive replanning is enabled.
 ReplanFn = Callable[[TaskRun], Awaitable[int]]
+# Optional hook: called just before a subtask that failed review is re-run —
+# (state, attempt, max_retries, verdict), attempt 1-based. Injected by the engine to
+# surface retries in the event stream/UI.
+RetryFn = Callable[[SubTaskState, int, int, Verdict], None]
 
 _TRANSIENT_BACKOFF = (0.5, 2.0, 6.0)  # seconds between transient retries
 
@@ -59,6 +63,7 @@ class Scheduler:
         transient_retries: int = 3,
         replan: ReplanFn | None = None,
         gate: Callable[[], Awaitable[None]] | None = None,
+        on_retry: RetryFn | None = None,
     ) -> None:
         self._pool = pool
         self._execute = execute
@@ -68,6 +73,7 @@ class Scheduler:
         self._transient_retries = transient_retries
         self._replan = replan
         self._gate = gate  # awaited before each dispatch (pause/resume control)
+        self._on_retry = on_retry  # review-retry observer (event stream/UI)
 
     async def run(self, run: TaskRun) -> TaskRun:
         # Rolling dispatch: keep a set of in-flight tasks; whenever ANY of them settles,
@@ -176,6 +182,8 @@ class Scheduler:
             review_attempts += 1
             if review_attempts <= self._max_retries:
                 logger.info("subtask %s failed review (score %d); retrying", state.id, verdict.score)
+                if self._on_retry is not None:
+                    self._on_retry(state, review_attempts, self._max_retries, verdict)
                 deps = run.dependency_results(state)  # refresh in case deps advanced
 
         # Retries exhausted. Degrade to a soft-success if we have real output to build on.

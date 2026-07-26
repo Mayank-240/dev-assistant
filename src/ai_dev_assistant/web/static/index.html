@@ -64,6 +64,7 @@
           <span id="backend-badge" class="badge badge-muted">backend: …</span>
           <span id="conn" class="badge badge-idle" role="status" aria-live="polite">idle</span>
           <button id="theme-btn" type="button" title="Toggle theme (light · dark · auto)">◐ Auto</button>
+          <button id="signout-btn" type="button" class="signout-btn hidden" title="Sign out — clears this browser's session cookie">Sign out</button>
         </div>
       </aside>
 
@@ -810,11 +811,20 @@
     <ul id="notif-list" class="notif-list"><li class="muted">Nothing yet — run a task.</li></ul>
   </div>
 
-  <!-- Bearer-token prompt (shown when the server requires auth and a call 401s) -->
-  <div id="token-bar" class="token-bar hidden" role="region" aria-label="API token required">
-    <span>This server requires an API token — it was printed at server startup.</span>
-    <input id="token-input" type="password" placeholder="Paste API token" aria-label="API token" autocomplete="off" />
-    <button id="token-save" type="button">Save</button>
+  <!-- Full-screen login gate (S8: shown when the server requires an API token;
+       POST /api/login sets an HttpOnly session cookie, then the app boots) -->
+  <div id="view-login" class="login-screen hidden" role="region" aria-label="Sign in">
+    <form id="login-form" class="login-box" novalidate>
+      <div class="login-brand">
+        <div class="logo" aria-hidden="true">◆</div>
+        <h1>AI Dev Assistant</h1>
+      </div>
+      <p class="login-hint">This server requires an API token — set via <code>ADA_API_TOKEN</code>, or printed once at server startup.</p>
+      <label class="pm-label" for="login-token">API token</label>
+      <input id="login-token" class="title-input" type="password" placeholder="Paste API token" autocomplete="current-password" />
+      <p id="login-error" class="pm-error hidden" role="alert"></p>
+      <button id="login-btn" class="btn-primary" type="submit">Sign in →</button>
+    </form>
   </div>
 
   <div id="toasts" class="toasts" role="status" aria-live="polite"></div>

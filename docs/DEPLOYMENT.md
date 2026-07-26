@@ -60,8 +60,11 @@ curl -H "Authorization: Bearer <token>" http://localhost:8000/api/tasks
 ```
 
 The web UI is at `http://localhost:8000/` (the page and `/static` are open;
-every `/api/*` call and WebSocket needs the token — WebSockets and downloads
-pass it as `?token=<token>`). `/healthz` and `/readyz` are unauthenticated.
+every `/api/*` call and WebSocket needs the token). The UI shows a sign-in
+screen: paste the token once and an HttpOnly `ada_token` session cookie takes
+over for all fetches, WebSockets and downloads. Non-browser clients keep using
+`Authorization: Bearer <token>` (or `?token=<token>` on WebSockets/downloads).
+`/healthz` and `/readyz` are unauthenticated.
 
 Set `ANTHROPIC_API_KEY` in your shell or a `.env` file next to
 `docker-compose.yml`; compose passes it through. The image defaults to
@@ -82,6 +85,41 @@ or put `ADA_API_TOKEN=...` in the compose `.env` file and reference it as
 `- ADA_API_TOKEN=${ADA_API_TOKEN}`. A pinned token survives restarts, works
 with orchestration that can't scrape logs, and keeps the token out of `docker
 logs` entirely.
+
+## Remote access & TLS
+
+To reach the assistant from another machine:
+
+- **`ADA_BIND_HOST`** — the server binds `127.0.0.1` by default. Set
+  `ADA_BIND_HOST=0.0.0.0` (or a specific interface) to accept remote
+  connections; any non-loopback bind forces bearer-token auth on.
+- **`ADA_API_TOKEN`** — the token remote clients must present. If unset, one is
+  auto-generated and printed once at startup (see "Pinning the API token"
+  above). In the browser, paste it into the sign-in screen once — an HttpOnly
+  session cookie handles everything after that.
+- **`ADA_COOKIE_SECURE=1`** — set this when the server is reached over HTTPS.
+  It marks the session cookie `Secure`, so browsers never send it over plain
+  HTTP. Always set it behind a TLS-terminating proxy.
+
+The server speaks plain HTTP; put a reverse proxy in front for TLS. Caddy
+provisions certificates automatically with three lines:
+
+```
+ada.example.com {
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
+With Docker, publish the port to loopback only so the proxy is the sole way in:
+`-p 127.0.0.1:8000:8000` (a bare `-p 8000:8000` exposes the container on every
+host interface, bypassing the proxy).
+
+Note on credentials: the default LLM backend is the Claude Agent SDK, which
+uses the host's Claude Code login — no `ANTHROPIC_API_KEY` is needed, and
+`ADA_API_TOKEN` is unrelated to Anthropic credentials. It only guards access
+to this server's API. (The container image is the exception: it switches to
+`ADA_LLM_BACKEND=anthropic` with an `ANTHROPIC_API_KEY`, as covered in the
+Quickstart, because a container has no interactive Claude Code login.)
 
 ## Volumes: what state lives where
 
