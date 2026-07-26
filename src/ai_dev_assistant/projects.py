@@ -429,6 +429,8 @@ _POLICY_MAP = {
     "allow_web": "allow_web",
     "max_plan_subtasks": "max_plan_subtasks",
     "worktree_per_subtask": "worktree_per_subtask",
+    "subtask_max_seconds": "subtask_max_seconds",
+    "attention_timeout": "attention_timeout",
 }
 
 

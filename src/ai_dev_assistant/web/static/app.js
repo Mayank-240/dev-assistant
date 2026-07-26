@@ -478,6 +478,10 @@ function setContinue(taskId, label) {
   $("continue-ref").textContent = label || taskId;
   $("continue-banner").classList.remove("hidden");
   closeModalEl("modal");
+  // The composer lives on the project Overview tab — navigate there so the
+  // continue banner is actually visible (the button lives on the task view).
+  showMainView("project");
+  selectProjectTab("overview", true);
   const p = $("prompt");
   p.placeholder = "What should the assistant do next on this task? e.g. “add error handling and tests”";
   p.focus();

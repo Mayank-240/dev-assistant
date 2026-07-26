@@ -85,7 +85,7 @@ class Settings:
     # --- Cost guardrail ---
     budget_usd: float = 0.0         # 0 = no cap; otherwise stop scheduling new work past this
     agent_max_turns: int = 24       # per-agent tool-loop cap (lower = cheaper)
-    subtask_max_seconds: float = 900.0  # wall-clock cap per subtask attempt (0 = no cap)
+    subtask_max_seconds: float = 1800.0  # wall-clock cap per subtask attempt (0 = no cap)
     attention_timeout: float = 600.0    # how long an agent waits for an operator answer
                                         # (counts toward the subtask wall-clock cap)
 
@@ -157,7 +157,7 @@ class Settings:
             max_plan_subtasks=_int("ADA_MAX_PLAN_SUBTASKS", 24),
             budget_usd=_float("ADA_BUDGET_USD", 0.0),
             agent_max_turns=_int("ADA_AGENT_MAX_TURNS", 24),
-            subtask_max_seconds=_float("ADA_SUBTASK_MAX_SECONDS", 900.0),
+            subtask_max_seconds=_float("ADA_SUBTASK_MAX_SECONDS", 1800.0),
             attention_timeout=_float("ADA_ATTENTION_TIMEOUT", 600.0),
             git_finalize=_bool("ADA_GIT_FINALIZE", False),
             git_branch_prefix=_get("ADA_GIT_BRANCH_PREFIX", "ada/"),

@@ -171,7 +171,17 @@ def _settings_for(base: Settings, effort: str | None, budget: float | None,
     # project owns the repo. git_finalize remains a per-run knob.
     if git_finalize is not None:
         overrides["git_finalize"] = bool(git_finalize)
-    return dataclasses.replace(base, **overrides) if overrides else base
+    resolved = dataclasses.replace(base, **overrides) if overrides else base
+    # Apply the project's policy (F7): forces per-subtask worktrees ON for project
+    # tasks (per-subtask review depends on their commits) and applies policy
+    # budget/effort/git_mode/protected_paths under the request's explicit overrides.
+    try:
+        resolved = projects.effective_settings(resolved)
+        if overrides:  # the request's explicit choices beat policy defaults
+            resolved = dataclasses.replace(resolved, **overrides)
+    except Exception:
+        pass
+    return resolved
 
 
 class PlanRequest(BaseModel):
