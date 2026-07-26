@@ -153,7 +153,8 @@ def test_get_settings_shape_and_info(tmp_path):
     body = r.json()
     names = [g["name"] for g in body["groups"]]
     assert names == ["LLM & Models", "Guardrails & Budget", "Execution & Safety",
-                     "Verification", "Memory & Knowledge", "Observability"]
+                     "Verification", "Memory & Knowledge", "Observability",
+                     "Notifications", "GitHub"]
     fields = _all_fields(body)
     assert {f["key"] for f in fields} == {e["key"] for e in config.SETTINGS_SCHEMA}
     for f in fields:

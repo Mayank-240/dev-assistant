@@ -824,3 +824,20 @@ def test_deliver_endpoint_merges_branch_and_records_decisions(tmp_path, monkeypa
     assert r2.status_code == 200 and r2.json()["merged"]
 
     assert client.post("/api/tasks/nope/deliver").status_code == 404
+
+
+# ---- Playbooks: settings_overrides thread through _settings_for ----
+
+def test_settings_for_applies_playbook_overrides():
+    from ai_dev_assistant.web.server import _settings_for
+
+    base = Settings()
+    s = _settings_for(base, None, None,
+                      settings_overrides={"agent_effort": "max", "budget_usd": 3.0})
+    assert s.agent_effort == "max" and s.budget_usd == 3.0
+    # explicit request choices still beat the playbook's overrides
+    s2 = _settings_for(base, None, 9.0, settings_overrides={"budget_usd": 3.0})
+    assert s2.budget_usd == 9.0
+    # unknown keys in a playbook's overrides are ignored, never a crash
+    s3 = _settings_for(base, None, None, settings_overrides={"not_a_field": 1})
+    assert s3 == _settings_for(base, None, None)

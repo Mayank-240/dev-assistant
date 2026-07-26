@@ -129,6 +129,15 @@ class Settings:
     record_dir: str = ""           # if set, record provider calls as replay cassettes here
     replay_dir: str = ""           # if set, server provider calls from cassettes here (offline)
 
+    # --- Notifications (web server builds NotifyConfig from these at event time) ---
+    notify_webhook: str = ""        # JSON POST target for ask/permission/done/error pings
+    notify_desktop: bool = False    # macOS banner via osascript (darwin only)
+    notify_events: str = ""         # csv of event types; blank = ask,permission,done,error
+
+    # --- GitHub poller (token is ENV-ONLY: ADA_GITHUB_TOKEN / GITHUB_TOKEN) ---
+    github_repos: str = ""          # "owner/repo=project-slug,..." mapping the poller watches
+    github_label: str = "ada"       # only open issues with this label become tasks
+
     # --- Storage / embeddings ---
     embeddings_backend: str = "fastembed"  # "fastembed" | "hash"
     embed_model: str = "BAAI/bge-small-en-v1.5"
@@ -190,6 +199,11 @@ class Settings:
             trace=_bool("ADA_TRACE", True),
             record_dir=_get("ADA_RECORD_DIR", ""),
             replay_dir=_get("ADA_REPLAY_DIR", ""),
+            notify_webhook=_get("ADA_NOTIFY_WEBHOOK", ""),
+            notify_desktop=_bool("ADA_NOTIFY_DESKTOP", False),
+            notify_events=_get("ADA_NOTIFY_EVENTS", ""),
+            github_repos=_get("ADA_GITHUB_REPOS", ""),
+            github_label=_get("ADA_GITHUB_LABEL", "ada"),
             embeddings_backend=_get("ADA_EMBEDDINGS_BACKEND", "fastembed"),
             embed_model=_get("ADA_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
             data_dir=Path(_get("ADA_DATA_DIR", ".ada_data")),
@@ -368,6 +382,24 @@ SETTINGS_SCHEMA: list[dict] = [
     # --- Observability ---
     {"key": "trace", "group": "Observability", "label": "Trace",
      "help": "Record an LLM/tool span log per run.", "type": "bool"},
+    # --- Notifications ---
+    {"key": "notify_webhook", "group": "Notifications", "label": "Webhook URL",
+     "help": "POST a JSON ping to this http(s) URL when a run needs you or finishes — "
+             "blank disables the webhook channel.", "type": "str"},
+    {"key": "notify_desktop", "group": "Notifications", "label": "Desktop notifications",
+     "help": "Show a macOS desktop banner on notify events (macOS only; ignored elsewhere).",
+     "type": "bool"},
+    {"key": "notify_events", "group": "Notifications", "label": "Notify events",
+     "help": "Comma-separated event types to notify on (ask, permission, done, error) — "
+             "blank means all four.", "type": "str"},
+    # --- GitHub ---
+    {"key": "github_repos", "group": "GitHub", "label": "Repo mapping",
+     "help": "Comma-separated owner/repo=project-slug pairs the issue poller watches, "
+             "e.g. 'acme/api=api-backend'. The token is never set here — it comes only "
+             "from the ADA_GITHUB_TOKEN or GITHUB_TOKEN environment variable.",
+     "type": "str"},
+    {"key": "github_label", "group": "GitHub", "label": "Issue label",
+     "help": "Only open issues carrying this label are turned into tasks.", "type": "str"},
 ]
 
 _SCHEMA_BY_KEY: dict[str, dict] = {e["key"]: e for e in SETTINGS_SCHEMA}

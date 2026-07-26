@@ -17,29 +17,33 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .. import config, projects, vcs
+from .. import analytics, config, github, notify, playbooks, projects, search, vcs
 from ..agents.registry import build_agents
 from ..config import Settings
 from ..engine import Engine
 from ..knowledge import combine
+from ..knowledge.base import KnowledgeBase
 from ..knowledge.graph import NetworkXKnowledgeGraph
 from ..llm.errors import LLMError
 from ..llm.schemas import Plan
+from ..memory.store import MemoryStore
 from ..orchestration.events import Event
 from ..orchestration.run_control import RunControl
 from ..orchestration.run_store import RunStore, derive_title
+from ..orchestration.schedules import ScheduleStore, next_run_at
 from ..orchestration.task import new_task_id
 
 _STATIC = Path(__file__).parent / "static"
@@ -72,6 +76,15 @@ def _fanout_runner():
 
 # Pseudo-project slug carried by cross-project parent run rows (fanout contract).
 _MULTI_PROJECT = "multi"
+
+# Valid Settings field names — used to sanity-filter playbook settings_overrides.
+_SETTINGS_FIELDS = {f.name for f in dataclasses.fields(Settings)}
+
+# Background loop cadences (seconds).
+_SCHEDULES_TICK_S = 60.0
+_GITHUB_TICK_S = 120.0
+
+_KB_UPLOAD_MAX_BYTES = 2 * 1024 * 1024  # per-file cap for /kb/upload
 
 
 def _is_loopback(host: str) -> bool:
@@ -145,7 +158,8 @@ _MODELS: dict[str, str] = {
 
 def _settings_for(base: Settings, effort: str | None, budget: float | None,
                   project: str | None = None, memory_scope: str | None = None,
-                  git_finalize: bool | None = None, model: str | None = None) -> Settings:
+                  git_finalize: bool | None = None, model: str | None = None,
+                  settings_overrides: dict[str, Any] | None = None) -> Settings:
     overrides: dict[str, Any] = {}
     cfg = _EFFORT.get(effort or "")
     if cfg:
@@ -181,6 +195,13 @@ def _settings_for(base: Settings, effort: str | None, budget: float | None,
             resolved = dataclasses.replace(resolved, **overrides)
     except Exception:
         pass
+    # Playbook settings_overrides land after policy, but still under any explicit
+    # request choices (effort/model/budget/...) — those are re-applied last.
+    extra = {k: v for k, v in (settings_overrides or {}).items() if k in _SETTINGS_FIELDS}
+    if extra:
+        resolved = dataclasses.replace(resolved, **extra)
+        if overrides:
+            resolved = dataclasses.replace(resolved, **overrides)
     return resolved
 
 
@@ -261,6 +282,37 @@ class SubtaskRejectRequest(BaseModel):
     comment: str | None = None      # why the subtask's work was rejected (feeds learning)
 
 
+class PlaybookRunRequest(BaseModel):
+    params: dict[str, Any] = {}
+    project: str | None = None
+    effort: str | None = None
+    model: str | None = None
+    budget: float | None = None
+    title: str | None = None        # optional; defaults to the playbook's rendered title
+
+
+class ScheduleCreateRequest(BaseModel):
+    project: str | None = None
+    prompt: str
+    title: str | None = None
+    every_hours: float
+    budget_usd: float = 0.0
+
+
+class SchedulePatchRequest(BaseModel):
+    project: str | None = None
+    prompt: str | None = None
+    title: str | None = None
+    every_hours: float | None = None
+    budget_usd: float | None = None
+    enabled: bool | None = None
+
+
+class ABRequest(BaseModel):
+    knob: str
+    values: list[str]
+
+
 def create_app(settings: Settings | None = None, host: str | None = None,
                api_token: str | None = None) -> FastAPI:
     # `settings` is the env/default base (paths, backend identity). The settings
@@ -312,6 +364,10 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     app.state.tasks = {}  # task_id -> asyncio.Task (for cancellation)
     app.state.runs = RunStore(settings.data_dir / "runs.db")
     app.state.runs.interrupt_orphans()  # clean up runs orphaned by a restart
+    # Recurring runs: same runs.db file, its own table + connection (schedules contract).
+    app.state.schedules = ScheduleStore(settings.data_dir / "runs.db")
+    app.state.github_transport = None  # tests inject a fake github Transport here
+    app.state.bg_tasks = []  # background loop asyncio.Tasks (started at startup)
     # task queue / scheduler state
     app.state.concurrency = max(1, app.state.base_settings.max_concurrent_runs)
     app.state.paused = False
@@ -349,7 +405,46 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             payload.get("effort"), payload.get("budget"), payload.get("title"),
             payload.get("project"), payload.get("memory_scope"), payload.get("continue_from"),
             payload.get("git_finalize"), bool(payload.get("resume")),
-            model=payload.get("model")))
+            model=payload.get("model"),
+            settings_overrides=payload.get("settings_overrides")))
+
+    # ---- Out-of-tab notifications: NotifyConfig from the LIVE settings at event
+    # time; dispatch rides the engine on_event bridge and never blocks the loop.
+    def _notify_config(live: Settings) -> notify.NotifyConfig:
+        events = tuple(e.strip().lower() for e in (live.notify_events or "").split(",")
+                       if e.strip())
+        desktop = bool(live.notify_desktop) and sys.platform == "darwin"
+        webhook = (live.notify_webhook or "").strip()
+        if events:
+            return notify.NotifyConfig(webhook_url=webhook, desktop=desktop, events=events)
+        return notify.NotifyConfig(webhook_url=webhook, desktop=desktop)
+
+    def _dispatch_notify(event: Event, task_id: str, project_slug: str) -> None:
+        """Fan a run event out to the configured notify channels. Fire-and-forget:
+        the webhook/osascript work runs in a thread, and nothing here ever raises."""
+        try:
+            cfg = _notify_config(app.state.base_settings)
+            if not (cfg.webhook_url or cfg.desktop):
+                return
+            if not notify.should_notify(cfg, event.type):
+                return
+
+            def _send() -> None:
+                notify.notify_event(
+                    cfg, event_type=event.type, task_id=task_id, project=project_slug,
+                    message=event.message or "",
+                    data=event.data if isinstance(event.data, dict) else {})
+
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                _send()  # no running loop (tests/teardown) — notify_event never raises
+                return
+            loop.create_task(asyncio.to_thread(_send))
+        except Exception:  # noqa: BLE001 — a notifier must never take down a run
+            pass
+
+    app.state.notify_dispatch = _dispatch_notify
 
     def _evict_broker_later(task_id: str, broker: Broker) -> None:
         """W4: drop a finished task's broker after a grace period so RAM doesn't hold
@@ -392,19 +487,26 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                         project: str | None = None, memory_scope: str | None = None,
                         continue_from: str | None = None,
                         git_finalize: bool | None = None, resume: bool = False,
-                        model: str | None = None) -> None:
+                        model: str | None = None,
+                        settings_overrides: dict[str, Any] | None = None) -> None:
         broker: Broker = app.state.brokers[task_id]
+        slug = projects.resolve(settings, project)
+
+        def _publish(ev: Event) -> None:
+            broker.publish(ev)
+            _dispatch_notify(ev, task_id, slug)
+
         # record up front so cancels-during-planning persist (title auto-derived if blank);
         # the run row carries its project so activity/history can be filtered per project.
         try:
-            app.state.runs.start(task_id, prompt, title=(title or None),
-                                 project=projects.resolve(settings, project))
+            app.state.runs.start(task_id, prompt, title=(title or None), project=slug)
         except TypeError:  # run store without the project column (landing separately)
             app.state.runs.start(task_id, prompt, title=(title or None))
         if continue_from:
             app.state.runs.set_parent(task_id, continue_from)
         engine = Engine(_settings_for(app.state.base_settings, effort, budget, project,
-                                      memory_scope, git_finalize, model=model))
+                                      memory_scope, git_finalize, model=model,
+                                      settings_overrides=settings_overrides))
         control = RunControl()
         engine.control = control  # enables pause/resume/steer endpoints to reach this run
         app.state.controls[task_id] = control
@@ -414,19 +516,19 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         try:
             plan = Plan.model_validate(plan_dict) if plan_dict else None
             await engine.run(prompt, plan=plan, task_id=task_id, title=(title or None),
-                             continue_from=continue_from, on_event=broker.publish, **extra)
+                             continue_from=continue_from, on_event=_publish, **extra)
         except TypeError as exc:
             msg = "resume not available yet" if resume else str(exc)
-            broker.publish(Event("error", f"Run failed: {msg}", {"message": msg}))
+            _publish(Event("error", f"Run failed: {msg}", {"message": msg}))
             app.state.runs.set_status(task_id, "failed")
         except asyncio.CancelledError:
-            broker.publish(Event("error", "Run cancelled by user.", {"message": "cancelled"}))
+            _publish(Event("error", "Run cancelled by user.", {"message": "cancelled"}))
             app.state.runs.set_status(task_id, "cancelled")
         except LLMError as exc:
-            broker.publish(Event("error", f"Run failed: {exc}", {"message": str(exc)}))
+            _publish(Event("error", f"Run failed: {exc}", {"message": str(exc)}))
             app.state.runs.set_status(task_id, "failed")  # don't strand it 'running'
         except Exception as exc:  # don't leave the socket hanging on unexpected failures
-            broker.publish(Event("error", f"Unexpected error: {exc}", {"message": str(exc)}))
+            _publish(Event("error", f"Unexpected error: {exc}", {"message": str(exc)}))
             app.state.runs.set_status(task_id, "failed")
         finally:
             await engine.aclose()
@@ -434,7 +536,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             app.state.running.discard(task_id)
             app.state.controls.pop(task_id, None)
             if not broker.done:
-                broker.publish(Event("done", "Run ended.", {}))
+                _publish(Event("done", "Run ended.", {}))
             _evict_broker_later(task_id, broker)
             _pump()  # a slot just freed — start the next queued task
 
@@ -446,31 +548,36 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         (parent project='multi', children with parent_id) and emits plan/child_start/
         child_done/brief/done on the parent stream — we just wire it into the Broker."""
         broker: Broker = app.state.brokers[task_id]
+
+        def _publish(ev: Event) -> None:
+            broker.publish(ev)
+            _dispatch_notify(ev, task_id, _MULTI_PROJECT)
+
         fn = _fanout_runner()
         try:
             if fn is None:  # queued before the fan-out core landed (e.g. across a restart)
                 msg = "cross-project fan-out is not available yet"
-                broker.publish(Event("error", msg, {"message": msg}))
+                _publish(Event("error", msg, {"message": msg}))
                 app.state.runs.set_status(task_id, "failed")
                 return
             await fn(_settings_for(app.state.base_settings, effort, budget, model=model),
                      prompt, slugs,
                      title=(title or None), stagger=bool(stagger), task_id=task_id,
-                     on_event=broker.publish)
+                     on_event=_publish)
         except asyncio.CancelledError:
-            broker.publish(Event("error", "Run cancelled by user.", {"message": "cancelled"}))
+            _publish(Event("error", "Run cancelled by user.", {"message": "cancelled"}))
             app.state.runs.set_status(task_id, "cancelled")
         except LLMError as exc:
-            broker.publish(Event("error", f"Run failed: {exc}", {"message": str(exc)}))
+            _publish(Event("error", f"Run failed: {exc}", {"message": str(exc)}))
             app.state.runs.set_status(task_id, "failed")
         except Exception as exc:  # don't leave the socket hanging on unexpected failures
-            broker.publish(Event("error", f"Unexpected error: {exc}", {"message": str(exc)}))
+            _publish(Event("error", f"Unexpected error: {exc}", {"message": str(exc)}))
             app.state.runs.set_status(task_id, "failed")
         finally:
             app.state.tasks.pop(task_id, None)
             app.state.running.discard(task_id)
             if not broker.done:
-                broker.publish(Event("done", "Run ended.", {}))
+                _publish(Event("done", "Run ended.", {}))
             _evict_broker_later(task_id, broker)
             _pump()  # a slot just freed — start the next queued task
 
@@ -1687,6 +1794,354 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         entry = _app_procs.get(slug)
         return JSONResponse({"lines": list(entry["logs"]) if entry else [],
                              "running": _app_running(entry)})
+
+    # =====================================================================
+    # Feature wave: playbooks, schedules, search, analytics, KB upload,
+    # GitHub poller, A/B replay. All under /api/* (auth middleware applies).
+    # =====================================================================
+
+    # ---- Playbooks: parameterized task templates -> the normal run pipeline ----
+    @app.get("/api/playbooks")
+    async def list_playbooks() -> JSONResponse:
+        return JSONResponse(playbooks.catalog())
+
+    @app.post("/api/playbooks/{pid}/run")
+    async def run_playbook(pid: str, req: PlaybookRunRequest):
+        try:
+            rendered = playbooks.render(pid, req.params or {})
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        task_id = new_task_id()
+        title = (req.title or "").strip() or rendered["title"]
+        app.state.brokers[task_id] = Broker()
+        app.state.brokers[task_id].publish(Event("status", "Backend: " + settings.llm_backend,
+                                                 {"backend": settings.llm_backend}))
+        # Same shape/path as /api/run's single-project payload, plus the playbook's
+        # settings_overrides, which _start/_settings_for thread onto the run.
+        payload: dict[str, Any] = {
+            "prompt": rendered["prompt"], "plan": None, "effort": req.effort,
+            "model": req.model, "budget": req.budget, "title": title,
+            "project": req.project, "memory_scope": None, "continue_from": None,
+            "git_finalize": None, "settings_overrides": rendered["settings_overrides"],
+        }
+        app.state.runs.enqueue(task_id, rendered["prompt"], title, payload)
+        _pump()  # auto-run if a slot is free
+        status = "running" if task_id in app.state.running else "queued"
+        return {"task_id": task_id, "status": status, "title": title,
+                "position": app.state.runs.queue_positions().get(task_id)}
+
+    # ---- Schedules: recurring per-project runs ----
+    def _schedule_row(row: dict[str, Any]) -> dict[str, Any]:
+        return {**row, "next_run_at": next_run_at(row)}
+
+    @app.get("/api/schedules")
+    async def list_schedules(project: str | None = None) -> JSONResponse:
+        return JSONResponse([_schedule_row(r) for r in app.state.schedules.list(project)])
+
+    @app.post("/api/schedules")
+    async def create_schedule(req: ScheduleCreateRequest) -> JSONResponse:
+        try:
+            row = app.state.schedules.create(
+                project=projects.resolve(settings, req.project), prompt=req.prompt,
+                title=(req.title or None), every_hours=req.every_hours,
+                budget_usd=float(req.budget_usd or 0.0))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse(_schedule_row(row))
+
+    @app.patch("/api/schedules/{sid}")
+    async def patch_schedule(sid: str, req: SchedulePatchRequest) -> JSONResponse:
+        fields = req.model_dump(exclude_unset=True)
+        try:
+            row = app.state.schedules.update(sid, **fields)
+        except KeyError:
+            return JSONResponse({"error": f"unknown schedule: {sid}"}, status_code=404)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse(_schedule_row(row))
+
+    @app.delete("/api/schedules/{sid}")
+    async def delete_schedule(sid: str) -> JSONResponse:
+        if app.state.schedules.get(sid) is None:
+            return JSONResponse({"error": f"unknown schedule: {sid}"}, status_code=404)
+        app.state.schedules.delete(sid)
+        return JSONResponse({"ok": True})
+
+    async def _schedules_tick(now: float | None = None) -> int:
+        """One scheduler pass: enqueue a run per due schedule, then mark_started
+        (which advances the interval, so due() stays idempotent). Returns how many
+        runs were enqueued. Failures are logged and skipped, never raised."""
+        started = 0
+        try:
+            due = await asyncio.to_thread(app.state.schedules.due, now)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ai-dev-assistant] schedules: due() failed: {exc}", flush=True)
+            return 0
+        for row in due:
+            sid = row.get("id")
+            try:
+                task_id = new_task_id()
+                title = row.get("title") or derive_title(row.get("prompt") or "")
+                payload = {
+                    "prompt": row.get("prompt") or "", "plan": None, "effort": None,
+                    "model": None, "budget": (row.get("budget_usd") or None),
+                    "title": title, "project": row.get("project"), "memory_scope": None,
+                    "continue_from": None, "git_finalize": None,
+                }
+                app.state.brokers[task_id] = Broker()
+                app.state.runs.enqueue(task_id, payload["prompt"], title, payload)
+                app.state.schedules.mark_started(sid, task_id, now)
+                started += 1
+            except Exception as exc:  # noqa: BLE001 — one bad schedule must not stop the rest
+                print(f"[ai-dev-assistant] schedules: {sid} failed to start: {exc}", flush=True)
+        if started:
+            _pump()
+        return started
+
+    app.state.schedules_tick = _schedules_tick
+
+    # ---- Global search ----
+    @app.get("/api/search")
+    async def global_search_endpoint(
+            q: str = "", kinds: str | None = None,
+            projects_csv: str | None = Query(None, alias="projects"),
+            limit: int = 30) -> JSONResponse:
+        query = (q or "").strip()
+        if not query:
+            return JSONResponse([])
+        kind_tuple = (tuple(k.strip() for k in (kinds or "").split(",") if k.strip())
+                      or ("task", "memory", "kb", "file"))
+        proj_filter = None
+        if projects_csv is not None and projects_csv.strip():
+            proj_filter = [s.strip() for s in projects_csv.split(",") if s.strip()]
+        hits = await asyncio.to_thread(
+            search.global_search, app.state.base_settings, query,
+            kinds=kind_tuple, projects_filter=proj_filter,
+            limit=max(1, min(int(limit), 100)))
+        return JSONResponse(hits)
+
+    # ---- Spend analytics (read-only over runs.db + events.jsonl) ----
+    @app.get("/api/analytics/overview")
+    async def analytics_overview(days: int = 30) -> JSONResponse:
+        return JSONResponse(await asyncio.to_thread(
+            analytics.spend_overview, app.state.base_settings, days=max(1, int(days))))
+
+    @app.get("/api/analytics/outcomes")
+    async def analytics_outcomes(days: int = 90) -> JSONResponse:
+        return JSONResponse(await asyncio.to_thread(
+            analytics.cost_per_outcome, app.state.base_settings, days=max(1, int(days))))
+
+    @app.get("/api/analytics/project/{slug}")
+    async def analytics_project(slug: str, days: int = 90) -> JSONResponse:
+        return JSONResponse(await asyncio.to_thread(
+            analytics.project_spend, app.state.base_settings, slug, days=max(1, int(days))))
+
+    @app.get("/api/analytics/run/{task_id}")
+    async def analytics_run(task_id: str) -> JSONResponse:
+        return JSONResponse(await asyncio.to_thread(
+            analytics.run_cost_breakdown, app.state.base_settings, task_id))
+
+    # ---- KB upload: one text file -> the project's knowledge base ----
+    @app.post("/api/projects/{slug}/kb/upload")
+    async def kb_upload(slug: str, file: UploadFile = File(...)) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        raw = await file.read()
+        if len(raw) > _KB_UPLOAD_MAX_BYTES:
+            return JSONResponse({"error": "file too large (2 MB cap)"}, status_code=413)
+        text = raw.decode("utf-8", errors="replace")
+        name = Path(file.filename or "upload.txt").name or "upload.txt"
+
+        def _ingest() -> int:
+            # Build the per-project KB exactly like the engine does:
+            # MemoryStore(settings-for-slug).vectors -> KnowledgeBase.
+            s = dataclasses.replace(app.state.base_settings,
+                                    project=projects.resolve(settings, slug))
+            store = MemoryStore(s)
+            try:
+                # reingest: re-uploading a file replaces its chunks, never duplicates.
+                return KnowledgeBase(store.vectors).reingest(f"upload:{name}", text)
+            finally:
+                store.close()
+
+        chunks = await asyncio.to_thread(_ingest)
+        return JSONResponse({"chunks": chunks})
+
+    # ---- GitHub poller: labeled issues -> runs; finished runs -> PRs ----
+    _gh_state_path = settings.data_dir / "github_seen.json"
+
+    def _gh_load_state() -> dict[str, Any]:
+        try:
+            data = json.loads(_gh_state_path.read_text())
+        except (OSError, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            return {"seen": [], "tracked": {}}
+        seen = data.get("seen")
+        tracked = data.get("tracked")
+        return {"seen": [str(m) for m in seen] if isinstance(seen, list) else [],
+                "tracked": dict(tracked) if isinstance(tracked, dict) else {}}
+
+    def _gh_save_state(state: dict[str, Any]) -> None:
+        try:
+            _gh_state_path.parent.mkdir(parents=True, exist_ok=True)
+            _gh_state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+        except OSError as exc:
+            print(f"[ai-dev-assistant] github: could not persist state: {exc}", flush=True)
+
+    def _github_config() -> github.GitHubConfig:
+        """Repos + label from the LIVE settings; the token is ENV-ONLY by design
+        (never in the schema, never returned by any endpoint)."""
+        live = app.state.base_settings
+        token = (os.getenv("ADA_GITHUB_TOKEN") or os.getenv("GITHUB_TOKEN") or "").strip()
+        return github.GitHubConfig(
+            token=token, label=(live.github_label or "").strip() or "ada",
+            repo_map=github._parse_repo_map(live.github_repos or ""))
+
+    @app.get("/api/github/status")
+    async def github_status() -> JSONResponse:
+        cfg = _github_config()
+        state = _gh_load_state()
+        return JSONResponse({
+            "enabled": cfg.enabled, "repos": dict(cfg.repo_map), "label": cfg.label,
+            "tracked": len(state["tracked"]), "seen": len(state["seen"]),
+        })
+
+    async def _github_finish(client: github.GitHubClient, task_id: str,
+                             ref: dict[str, Any], row: dict[str, Any]) -> None:
+        """A tracked run reached a terminal status: push its branch, open a PR with
+        the run's evidence, and comment the link back on the issue. Every failure
+        is logged and skipped — the poll loop must never crash."""
+        repo = str(ref.get("repo") or "")
+        number = ref.get("number")
+        try:
+            branch = str(row.get("task_branch") or "").strip()
+            if not (repo and branch):
+                return  # nothing deliverable (e.g. run failed before branching)
+            slug = _project_of_run(row)
+            root = _project_root(slug)
+            if root:
+                res = await asyncio.to_thread(github.push_branch, Path(root), branch)
+                if not res.get("pushed"):
+                    print(f"[ai-dev-assistant] github: push of {branch} failed for "
+                          f"{task_id}: {res.get('error')}", flush=True)
+            base = str(row.get("review_target") or "").strip() or _review_target_for(slug)
+            body = github.pr_body({
+                "tldr": row.get("summary") or "", "branch": branch,
+                "tests": row.get("tests") or "",
+                "quality_score": row.get("quality_score"),
+                "cost_usd": row.get("cost_usd"),
+            })
+            title = str(row.get("title") or "") or derive_title(row.get("prompt") or "")
+            pr = await asyncio.to_thread(client.open_pr, repo, head=branch, base=base,
+                                         title=title, body=body)
+            if pr is None:
+                print(f"[ai-dev-assistant] github: open_pr failed for {task_id}", flush=True)
+            elif number is not None:
+                await asyncio.to_thread(
+                    client.comment, repo, number,
+                    f"ADA finished task {task_id}: {pr.get('url') or 'PR opened'}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ai-dev-assistant] github: completion of {task_id} failed: {exc}",
+                  flush=True)
+
+    async def _github_tick() -> None:
+        """One poll cycle: new labeled issues become runs (deduped via the persisted
+        seen-set); tracked runs that finished get a pushed branch + PR + comment."""
+        cfg = _github_config()
+        if not cfg.enabled:
+            return
+        client = github.GitHubClient(cfg, transport=app.state.github_transport)
+        state = _gh_load_state()
+        seen = set(state["seen"])
+        tracked: dict[str, Any] = state["tracked"]
+        dirty = False
+        started = 0
+        for repo, slug in cfg.repo_map.items():
+            issues = await asyncio.to_thread(client.list_labeled_issues, repo)
+            for issue in issues:
+                marker = github.seen_marker(issue)
+                if not marker or marker in seen:
+                    continue
+                prompt = github.issue_to_prompt(issue)
+                if not prompt:
+                    seen.add(marker)  # junk issue — never retry it
+                    dirty = True
+                    continue
+                task_id = new_task_id()
+                title = str(issue.get("title") or "").strip() or derive_title(prompt)
+                payload = {
+                    "prompt": prompt, "plan": None, "effort": None, "model": None,
+                    "budget": None, "title": title, "project": slug,
+                    "memory_scope": None, "continue_from": None, "git_finalize": None,
+                }
+                try:
+                    app.state.brokers[task_id] = Broker()
+                    app.state.runs.enqueue(task_id, prompt, title, payload)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[ai-dev-assistant] github: enqueue for {marker} failed: {exc}",
+                          flush=True)
+                    continue
+                seen.add(marker)
+                tracked[task_id] = {"repo": repo, "number": issue.get("number")}
+                dirty = True
+                started += 1
+                await asyncio.to_thread(client.comment, repo, issue.get("number"),
+                                        f"ADA started task {task_id}")
+        # Completion pass: finished tracked runs -> branch push + PR, then untrack.
+        for task_id in list(tracked):
+            ref = tracked.get(task_id) or {}
+            row = app.state.runs.get(task_id)
+            if row is None:  # run row deleted — nothing left to deliver
+                tracked.pop(task_id, None)
+                dirty = True
+                continue
+            if (row.get("status") or "") not in _TERMINAL_STATUSES:
+                continue
+            await _github_finish(client, task_id, ref, row)
+            tracked.pop(task_id, None)
+            dirty = True
+        if dirty:
+            _gh_save_state({"seen": sorted(seen), "tracked": tracked})
+        if started:
+            _pump()
+
+    app.state.github_tick = _github_tick
+
+    # ---- A/B knob comparison (offline replay smoke) ----
+    @app.post("/api/ab")
+    async def run_ab_endpoint(req: ABRequest) -> JSONResponse:
+        from ..evals.ab import run_ab
+        try:
+            report = await asyncio.to_thread(
+                run_ab, app.state.base_settings, req.knob, list(req.values), replay=True)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse(report.to_dict())
+
+    # ---- Background loop lifecycle: started at startup, cancelled at shutdown ----
+    async def _periodic(interval: float, tick) -> None:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — the loop itself never dies
+                print(f"[ai-dev-assistant] background tick failed: {exc}", flush=True)
+
+    @app.on_event("startup")
+    async def _start_background_loops() -> None:
+        app.state.bg_tasks = [
+            asyncio.create_task(_periodic(_SCHEDULES_TICK_S, _schedules_tick)),
+            asyncio.create_task(_periodic(_GITHUB_TICK_S, _github_tick)),
+        ]
+
+    @app.on_event("shutdown")
+    async def _stop_background_loops() -> None:
+        for t in app.state.bg_tasks:
+            t.cancel()
+        app.state.bg_tasks = []
 
     if _STATIC.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
