@@ -13,6 +13,9 @@ const {
   visibleProjects, combineChipsModel, combinedProjectsParam, itemProjects,
   taggedItemRows, combinedBannerModel, projectColorMap, renderMarkdown,
   settingsGroupsModel, fieldControlModel, coerceFieldInput,
+  fmtRelTime, paletteResultsModel, scheduleRowModel, scheduleFormModel,
+  spendOverviewModel, spendOutcomesModel, runCostModel, abTableModel,
+  notifCenterModel, playbookFormModel, tourStepsModel,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -146,6 +149,10 @@ function resetRunView(prompt) {
   $("plan-dag").innerHTML = "";
   $("timeline-card").classList.add("hidden");
   $("timeline").innerHTML = "";
+  $("cost-card").classList.add("hidden");
+  $("cost-card").removeAttribute("open");
+  $("cost-table").innerHTML = "";
+  state.subtaskCosts = null;
   $("attention-card").classList.add("hidden");
   $("attention-list").innerHTML = "";
   _attnOpen = 0;
@@ -880,16 +887,28 @@ function showToast(msg, type = "", ms = 4000) {
   $("toasts").appendChild(el);
   setTimeout(() => { el.style.transition = "opacity .3s"; el.style.opacity = "0"; setTimeout(() => el.remove(), 300); }, ms);
 }
+// Timeline zoom (0.5×–4× horizontal scale) + optional per-subtask cost annotations
+// (state.subtaskCosts: id -> usd, filled from /api/analytics/run/{id}).
+let tlZoom = 1;
+function applyTimelineZoom() {
+  const el = $("timeline");
+  if (el) el.style.width = Math.round(tlZoom * 100) + "%";
+  const val = $("tl-zoom-val");
+  if (val) val.textContent = tlZoom + "×";
+}
 function renderTimeline() {
   const rows = timelineRows(state.timeline);
   if (!rows.length) return;
   const el = $("timeline"); el.innerHTML = "";
+  applyTimelineZoom();
+  const costs = state.subtaskCosts || {};
   rows.forEach(r => {
     const st = agentStyle(r.agent);
+    const cost = (r.id in costs) ? `<span class="tl-cost" title="Subtask LLM cost">${escapeHtml(fmtCost(costs[r.id]))}</span>` : "";
     const row = document.createElement("div"); row.className = "tl-row";
     row.innerHTML = `<span class="tl-label"><span class="tl-dot" style="background:${st.color}" aria-hidden="true"></span>${escapeHtml(r.id)} · ${escapeHtml(r.agent)}</span>` +
       `<div class="tl-track" aria-hidden="true"><div class="tl-bar" style="left:${r.leftPct}%;width:${r.widthPct}%;background:${st.color}"></div></div>` +
-      `<span class="tl-dur">${escapeHtml(r.durLabel)}</span>`;
+      `<span class="tl-dur">${escapeHtml(r.durLabel)}</span>${cost}`;
     el.appendChild(row);
   });
 }
@@ -899,6 +918,7 @@ function noteQueuedStart() {
   if (!state.wasQueued) return;
   state.wasQueued = false;
   showToast("Queued task started", "success");
+  notify("start", "Queued task started");
 }
 
 function handleEvent(ev) {
@@ -1029,10 +1049,12 @@ function handleEvent(ev) {
     // delivered to the run through the steer endpoint.
     case "ask":
       renderAttention({ kind: "question", id: d.id, agent: d.agent, text: d.question || ev.message, options: d.options || [] });
+      notify("ask", (d.agent ? d.agent + " asks: " : "") + (d.question || ev.message || "needs your input"));
       feed("? " + ev.message);
       break;
     case "permission":
       renderAttention({ kind: "permission", id: d.id, agent: d.agent, text: d.request || ev.message, options: [] });
+      notify("permission", (d.agent ? d.agent + " requests permission: " : "Permission requested: ") + (d.request || ev.message || ""));
       feed("⚠ " + ev.message);
       break;
     case "execution": {
@@ -1088,6 +1110,11 @@ function handleEvent(ev) {
       renderTimeline();
       $("timeline-card").classList.remove("hidden");
       state.docsId = d.task_id || null;
+      if (state.docsId) loadRunCost(state.docsId);
+      notify(d.over_budget ? "error" : "done",
+             d.over_budget ? "Run stopped at its budget cap"
+               : "passed" in d ? `Task done · ${d.passed}/${d.total} passed` : "Task done",
+             d.task_id);
       stopTimer();
       setConn("done", "badge-done");
       $("run-btn").disabled = false;
@@ -1106,6 +1133,7 @@ function handleEvent(ev) {
       }
       $("status-pill").className = "pill pill-err";
       $("status-pill").textContent = (d.message === "cancelled") ? "cancelled" : "error";
+      notify("error", d.message === "cancelled" ? "Run cancelled" : (ev.message || "Run failed"));
       feed("✗ " + (ev.message || "error"));
       stopTimer();
       $("cancel-btn").classList.add("hidden");
@@ -1778,6 +1806,7 @@ async function openTask(id, meta) {
   $("progress-bar").style.width = "100%";
   $("progress-label").textContent = tally + " subtasks";
   state.docsId = id;
+  loadRunCost(id);   // collapsible per-subtask cost table + timeline annotations
   updateRunControls();   // historical view — the pill is final, so Pause/Steer hide
 }
 
@@ -1819,8 +1848,8 @@ function selectProjectTab(tab, force) {
   ["overview", "tasks", "run", "knowledge", "settings"].forEach(t => {
     $("panel-" + t).classList.toggle("hidden", t !== currentTab);
   });
-  if (currentTab === "overview") { loadProjectActivity(); loadRecent(); }
-  if (currentTab === "tasks") { loadRecent(); loadQueue(); }
+  if (currentTab === "overview") { loadProjectActivity(); loadRecent(); loadPlaybooks(); }
+  if (currentTab === "tasks") { loadRecent(); loadQueue(); loadSchedules(); }
   if (currentTab === "run") loadRunPanel();
   if (currentTab === "knowledge") return showKnowledge(currentKnow);
   if (currentTab === "settings") loadSettingsPanel();
@@ -1904,6 +1933,7 @@ async function loadGlobalSettings() {
   } catch (e) { /* fall through to the error state */ }
   if (!data) { box.innerHTML = '<p class="muted">Could not load settings.</p>'; return; }
   renderGlobalSettings(settingsGroupsModel(data));
+  loadGithubStatus();   // status line above the GitHub group's fields
 }
 
 function gsControlHtml(f) {
@@ -2449,6 +2479,7 @@ async function loadPermissionsTab() {
 async function loadDashboard() {
   populateCompareOptions();
   loadProjectsActivity();
+  loadSpend();
   let s;
   try { s = await (await fetch("/api/stats")).json(); } catch (e) { return; }
   $("ds-runs").textContent = s.runs ?? 0;
@@ -2666,6 +2697,36 @@ const SVGNS = "http://www.w3.org/2000/svg";
 let graphData = { nodes: [], edges: [] };
 let graphProjects = null;   // combined-view slugs (null = single-project view)
 
+// ---- KG polish: label filter (dims non-matching) + node-focus mode ----
+let _graphEls = { nodes: {}, edges: [] };   // id -> {circle,label}; [{el,source,target}]
+let _graphNeighbors = {};                   // id -> Set(neighbor ids)
+let graphFocusId = null;                    // focused node id (null = no focus)
+
+function applyGraphView() {
+  const q = ($("graph-filter") ? $("graph-filter").value : "").trim().toLowerCase();
+  const focus = graphFocusId;
+  const nb = focus ? (_graphNeighbors[focus] || new Set()) : null;
+  Object.entries(_graphEls.nodes).forEach(([id, els]) => {
+    const dim = !!q && !id.toLowerCase().includes(q);
+    const fade = !!focus && id !== focus && !nb.has(id);
+    [els.circle, els.label].forEach(el => {
+      el.classList.toggle("g-dim", dim);
+      el.classList.toggle("g-fade", fade);
+    });
+    els.circle.classList.toggle("g-focus", focus === id);
+  });
+  _graphEls.edges.forEach(e => {
+    e.el.classList.toggle("g-fade", !!focus && e.source !== focus && e.target !== focus);
+  });
+}
+
+function clearGraphFocus() {
+  if (!graphFocusId) return false;
+  graphFocusId = null;
+  applyGraphView();
+  return true;
+}
+
 async function loadGraph() {
   const slug = selectedProject();
   if (!slug || slug === "multi") return;
@@ -2703,6 +2764,7 @@ function renderGraph() {
   svg.innerHTML = "";
   const nodes = graphData.nodes.slice(0, 120);
   const ids = new Set(nodes.map(n => n.id));
+  if (graphFocusId && !ids.has(graphFocusId)) graphFocusId = null;
   const edges = graphData.edges.filter(e => ids.has(e.source) && ids.has(e.target));
   $("graph-stats").textContent = `${graphData.nodes.length} nodes · ${graphData.edges.length} edges`;
 
@@ -2725,6 +2787,8 @@ function renderGraph() {
     (adj[e.target] = adj[e.target] || []).push(`← [${e.relation}] ${e.source}`);
   });
 
+  _graphEls = { nodes: {}, edges: [] };
+  _graphNeighbors = {};
   edges.forEach(e => {
     const a = pos[e.source], b = pos[e.target];
     const line = document.createElementNS(SVGNS, "line");
@@ -2732,6 +2796,9 @@ function renderGraph() {
     line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
     line.setAttribute("class", "edge");
     svg.appendChild(line);
+    _graphEls.edges.push({ el: line, source: e.source, target: e.target });
+    (_graphNeighbors[e.source] = _graphNeighbors[e.source] || new Set()).add(e.target);
+    (_graphNeighbors[e.target] = _graphNeighbors[e.target] || new Set()).add(e.source);
   });
 
   // combined view: ring each node with its source project's color
@@ -2751,14 +2818,21 @@ function renderGraph() {
         c.setAttribute("stroke-width", "2.5");
       }
     }
-    c.addEventListener("click", () => showNode(n, adj[n.id] || []));
+    c.addEventListener("click", () => {
+      // node-focus mode: click highlights the neighborhood, click again clears
+      graphFocusId = graphFocusId === n.id ? null : n.id;
+      showNode(n, adj[n.id] || []);
+      applyGraphView();
+    });
     svg.appendChild(c);
     const label = document.createElementNS(SVGNS, "text");
     label.setAttribute("x", p.x + r + 3); label.setAttribute("y", p.y + 3);
     label.setAttribute("class", "nlabel");
     label.textContent = n.id.length > 22 ? n.id.slice(0, 21) + "…" : n.id;
     svg.appendChild(label);
+    _graphEls.nodes[n.id] = { circle: c, label };
   });
+  applyGraphView();
 
   let legend = Object.entries(TYPE_COLOR)
     .map(([t, c]) => `<span><i style="background:${c}"></i>${t}</span>`).join("");
@@ -3029,6 +3103,629 @@ async function stopApp() {
   loadRunPanel();
 }
 
+// =====================================================================
+// Feature wave: playbooks, schedules, spend analytics, command palette,
+// notification center, KB upload, A/B replay, GitHub status, first-run tour.
+// =====================================================================
+
+// ---- Playbooks: strip on the project Overview + typed launch dialog ----
+let _playbooks = null;        // cached /api/playbooks catalog
+let _pbCurrent = null;        // playbook open in the dialog
+
+async function loadPlaybooks() {
+  if (_playbooks === null) {
+    try {
+      const resp = await fetch("/api/playbooks");
+      _playbooks = resp.ok ? await resp.json() : [];
+    } catch (e) { _playbooks = []; }
+  }
+  renderPlaybookStrip();
+}
+
+function renderPlaybookStrip() {
+  const strip = $("pb-strip"), wrap = $("pb-cards");
+  if (!strip || !wrap) return;
+  const list = Array.isArray(_playbooks) ? _playbooks : [];
+  const usable = !!selectedProject() && selectedProject() !== "multi";
+  strip.classList.toggle("hidden", !list.length || !usable);
+  if (!list.length || !usable) { wrap.innerHTML = ""; return; }
+  wrap.innerHTML = "";
+  list.forEach(pb => {
+    const card = document.createElement("div");
+    card.className = "pb-card";
+    card.innerHTML = `<span class="pb-name">${escapeHtml(pb.name)}</span>` +
+      `<span class="pb-desc">${escapeHtml(pb.description || "")}</span>`;
+    makeActivatable(card, () => openPlaybookModal(pb), `Start playbook ${pb.name}`);
+    wrap.appendChild(card);
+  });
+}
+
+function openPlaybookModal(pb) {
+  _pbCurrent = pb;
+  $("pbm-name").textContent = pb.name || pb.id;
+  $("pbm-desc").textContent = pb.description || "";
+  $("pbm-error").classList.add("hidden");
+  $("pbm-error").textContent = "";
+  $("pbm-start").disabled = false;
+  const m = playbookFormModel(pb, {});   // prefill defaults
+  $("pbm-fields").innerHTML = m.fields.map(f => {
+    const id = "pbf-" + escapeAttr(f.key);
+    let control;
+    if (f.control === "select") {
+      control = `<select id="${id}" class="select pbm-control" data-key="${escapeAttr(f.key)}">` +
+        f.choices.map(c => `<option value="${escapeAttr(c)}"${c === f.value ? " selected" : ""}>${escapeHtml(c)}</option>`).join("") +
+        `</select>`;
+    } else if (f.control === "number") {
+      control = `<input id="${id}" type="number" step="1" class="num pbm-control" data-key="${escapeAttr(f.key)}" value="${escapeAttr(f.value)}" />`;
+    } else {
+      control = `<input id="${id}" type="text" class="title-input pbm-control" data-key="${escapeAttr(f.key)}" value="${escapeAttr(f.value)}" />`;
+    }
+    return `<div class="pbm-field"><label class="pm-label" for="${id}">${escapeHtml(f.label)}` +
+      `${f.required && !f.value ? ' <span class="pbm-req" title="required">*</span>' : ""}</label>${control}</div>`;
+  }).join("") || '<p class="muted">This playbook takes no parameters.</p>';
+  openModalEl("playbook-modal");
+}
+
+function closePlaybookModal() { closeModalEl("playbook-modal"); _pbCurrent = null; }
+
+function _pbmFail(msg) {
+  const el = $("pbm-error");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+
+async function startPlaybook() {
+  if (!_pbCurrent) return;
+  const slug = selectedProject();
+  if (!slug || slug === "multi") { _pbmFail("Select a project first."); return; }
+  const values = {};
+  document.querySelectorAll("#pbm-fields .pbm-control").forEach(el => { values[el.dataset.key] = el.value; });
+  const m = playbookFormModel(_pbCurrent, values);
+  if (!m.ok) { _pbmFail(m.errors.join(" · ")); return; }
+  const b = parseFloat($("budget").value);
+  const body = {
+    params: m.params, project: slug,
+    model: segState.model, effort: segState.effort,
+    budget: (b && b > 0) ? b : null,
+  };
+  const btn = $("pbm-start");
+  btn.disabled = true;
+  $("pbm-error").classList.add("hidden");
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/playbooks/" + encodeURIComponent(_pbCurrent.id) + "/run", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _pbmFail("Request failed: " + e); btn.disabled = false; return; }
+  if (!resp.ok || data.error) { _pbmFail(data.error || ("HTTP " + resp.status)); btn.disabled = false; return; }
+  closePlaybookModal();
+  showToast("Playbook started · " + (data.title || _pbCurrent.name), "success");
+  state.budgetUsd = body.budget || serverConfig.budget_usd || 0;
+  attachToRun(data.task_id, data.title || _pbCurrent.name);   // same stream as a normal launch
+  loadQueue();
+}
+
+// ---- Schedules manager (project Tasks tab) ----
+async function loadSchedules() {
+  const slug = selectedProject();
+  const card = $("schedules-card");
+  if (!card) return;
+  const applicable = !!slug && slug !== "multi";
+  card.classList.toggle("hidden", !applicable);
+  if (!applicable) return;
+  let rows = [];
+  try {
+    const resp = await fetch("/api/schedules?project=" + encodeURIComponent(slug));
+    if (resp.ok) rows = await resp.json();
+  } catch (e) { /* leave empty */ }
+  renderSchedules(Array.isArray(rows) ? rows : []);
+}
+
+function renderSchedules(rows) {
+  const ul = $("sched-list");
+  if (!rows.length) { ul.innerHTML = '<li class="muted">No schedules yet — add one below.</li>'; return; }
+  const now = Date.now() / 1000;
+  ul.innerHTML = "";
+  rows.forEach(row => {
+    const m = scheduleRowModel(row, now);
+    const li = document.createElement("li");
+    li.className = "sched-item" + (m.enabled ? "" : " sched-off");
+    li.innerHTML =
+      `<div class="sched-main"><span class="sched-title" title="${escapeAttr(m.prompt)}">${escapeHtml(m.title)}</span>` +
+      `<div class="sched-meta"><span>${escapeHtml(m.everyLabel)}</span>` +
+      `<span class="sched-next">${escapeHtml(m.nextLabel)}</span>` +
+      (m.budgetLabel ? `<span class="r-cost">${escapeHtml(m.budgetLabel)}/run</span>` : "") +
+      (m.lastTaskId ? `<button type="button" class="link-btn sched-last" title="Open the last run this schedule started">last run →</button>` : "") +
+      `</div></div>` +
+      `<span class="sched-acts">` +
+      `<label class="sched-toggle" title="${m.enabled ? "Disable" : "Enable"} this schedule">` +
+      `<input type="checkbox" class="sched-enabled"${m.enabled ? " checked" : ""} aria-label="Schedule enabled" /> on</label>` +
+      `<button type="button" class="q-act sched-delete" title="Delete this schedule" aria-label="Delete schedule">✕</button></span>`;
+    const last = li.querySelector(".sched-last");
+    if (last) last.onclick = () => openTask(m.lastTaskId, null);
+    li.querySelector(".sched-enabled").onchange = (e) => patchScheduleEnabled(m.id, e.target.checked);
+    li.querySelector(".sched-delete").onclick = () => deleteSchedule(m.id, m.title);
+    ul.appendChild(li);
+  });
+}
+
+function _scFail(msg) {
+  const el = $("sc-error");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+
+async function createSchedule() {
+  const m = scheduleFormModel({
+    prompt: $("sc-prompt").value, title: $("sc-title").value,
+    every_hours: $("sc-every").value, budget_usd: $("sc-budget").value,
+  });
+  if (!m.ok) { _scFail(m.errors.join(" · ")); return; }
+  $("sc-error").classList.add("hidden");
+  const btn = $("sc-create");
+  btn.disabled = true;
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/schedules", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...m.body, project: selectedProject() }),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _scFail("Request failed: " + e); btn.disabled = false; return; }
+  btn.disabled = false;
+  if (!resp.ok || data.error) { _scFail(data.error || ("HTTP " + resp.status)); return; }
+  $("sc-prompt").value = ""; $("sc-title").value = "";
+  showToast("Schedule created", "success");
+  loadSchedules();
+}
+
+async function patchScheduleEnabled(sid, enabled) {
+  try {
+    const resp = await fetch("/api/schedules/" + encodeURIComponent(sid), {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!resp.ok) showToast("Could not update the schedule", "warn");
+  } catch (e) { showToast("Could not update the schedule", "warn"); }
+  loadSchedules();
+}
+
+async function deleteSchedule(sid, title) {
+  try {
+    const resp = await fetch("/api/schedules/" + encodeURIComponent(sid), { method: "DELETE" });
+    if (resp.ok) showToast(`Deleted schedule "${title}"`, "warn");
+    else showToast("Delete failed", "error");
+  } catch (e) { showToast("Delete failed", "error"); }
+  loadSchedules();
+}
+
+// ---- Spend analytics (All activity) ----
+async function loadSpend() {
+  let ov = null, oc = null;
+  try {
+    const [r1, r2] = await Promise.all([
+      fetch("/api/analytics/overview?days=30"), fetch("/api/analytics/outcomes"),
+    ]);
+    if (r1.ok) ov = await r1.json();
+    if (r2.ok) oc = await r2.json();
+  } catch (e) { /* leave the section as-is */ }
+  if (ov) renderSpend(spendOverviewModel(ov));
+  if (oc) renderOutcomes(spendOutcomesModel(oc));
+}
+
+function renderSpend(m) {
+  $("sp-window").textContent = m.windowDays;
+  $("sp-total").textContent = m.totalLabel;
+  $("sp-runs").textContent = m.runs;
+  $("sp-tokens").textContent = m.runs ? m.tokensLabel : "—";
+  const bars = $("sp-bars");
+  if (!m.bars.length) {
+    bars.innerHTML = '<p class="muted">No spend in this window.</p>';
+  } else {
+    bars.innerHTML = m.bars.map(b =>
+      `<span class="sp-bar" style="height:${b.hPct}%" title="${escapeAttr(b.label)}"></span>`).join("");
+  }
+  const pt = $("sp-projects");
+  if (!m.projects.length) {
+    pt.innerHTML = '<p class="muted">No spend recorded yet.</p>';
+  } else {
+    pt.innerHTML = `<table class="dsa-table"><thead><tr><th scope="col">Project</th>` +
+      `<th scope="col">USD</th><th scope="col">Runs</th><th scope="col">Avg quality</th></tr></thead><tbody>` +
+      m.projects.map(p => `<tr><td class="dsa-name">${escapeHtml(p.project)}</td>` +
+        `<td class="sp-usd">${escapeHtml(p.usdLabel)}</td><td>${p.runs}</td>` +
+        `<td>${escapeHtml(p.qualityLabel)}</td></tr>`).join("") + `</tbody></table>`;
+  }
+}
+
+function renderOutcomes(m) {
+  $("sp-outcomes").innerHTML =
+    `<table class="dsa-table"><thead><tr><th scope="col">Outcome</th>` +
+    `<th scope="col">USD</th><th scope="col">Count</th></tr></thead><tbody>` +
+    m.rows.map(r => `<tr><td>${escapeHtml(r.label)}</td>` +
+      `<td class="sp-usd">${escapeHtml(r.value)}</td><td>${r.count}</td></tr>`).join("") +
+    `</tbody></table>`;
+}
+
+// ---- Per-run cost breakdown (task detail, collapsible) ----
+async function loadRunCost(taskId) {
+  if (!taskId) return;
+  let data = null;
+  try {
+    const resp = await fetch("/api/analytics/run/" + encodeURIComponent(taskId));
+    if (resp.ok) data = await resp.json();
+  } catch (e) { return; }
+  if (!data) return;
+  const m = runCostModel(data);
+  const card = $("cost-card");
+  if (m.empty) { card.classList.add("hidden"); return; }
+  state.subtaskCosts = m.bySubtask;
+  $("cost-table").innerHTML =
+    `<table class="dsa-table cost-table"><thead><tr><th scope="col">Subtask</th>` +
+    `<th scope="col">Agent</th><th scope="col">USD</th><th scope="col">Tokens</th></tr></thead><tbody>` +
+    m.rows.map(r => `<tr><td class="dsa-name">${escapeHtml(r.subtask)}</td>` +
+      `<td>${escapeHtml(r.agent)}</td><td class="sp-usd">${escapeHtml(r.usdLabel)}</td>` +
+      `<td class="sp-tok">${escapeHtml(r.tokensLabel)}</td></tr>`).join("") +
+    `</tbody></table>` +
+    `<p class="cost-totals muted">attributed ${escapeHtml(m.totalLabel)}` +
+    (m.runTotalLabel ? ` · run total ${escapeHtml(m.runTotalLabel)}` : "") +
+    (m.unattributedLabel ? ` · unattributed ${escapeHtml(m.unattributedLabel)}` : "") + `</p>`;
+  card.classList.remove("hidden");
+  if (!$("timeline-card").classList.contains("hidden")) renderTimeline();  // add cost annotations
+}
+
+// ---- A/B replay smoke (All activity) ----
+async function runAB() {
+  const knob = $("ab-knob").value;
+  const values = $("ab-values").value.split(",").map(s => s.trim()).filter(Boolean);
+  const el = $("ab-result");
+  if (values.length < 2) {
+    el.classList.remove("muted");
+    el.innerHTML = '<p class="pm-error">Enter at least two distinct values, comma-separated.</p>';
+    return;
+  }
+  const btn = $("ab-run");
+  btn.disabled = true;
+  el.classList.remove("muted");
+  el.textContent = "Running replay arms — fully offline, this can take a minute…";
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/ab", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ knob, values }),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { el.innerHTML = `<p class="pm-error">A/B failed: ${escapeHtml(String(e))}</p>`; btn.disabled = false; return; }
+  btn.disabled = false;
+  if (!resp.ok || data.error) {
+    el.innerHTML = `<p class="pm-error">A/B failed: ${escapeHtml(data.error || ("HTTP " + resp.status))}</p>`;
+    return;
+  }
+  const m = abTableModel(data);
+  el.innerHTML =
+    `<table class="cmp-table"><thead><tr><th scope="col">${escapeHtml(m.knob)}</th>` +
+    `<th scope="col">Pass rate</th><th scope="col">Quality</th><th scope="col">Mean cost</th>` +
+    `<th scope="col">Mean wall</th><th scope="col">Attempts</th></tr></thead><tbody>` +
+    m.rows.map(r => `<tr${r.best ? ' class="ab-best"' : ""}><td>${escapeHtml(r.value)}${r.best ? " ★" : ""}</td>` +
+      `<td>${escapeHtml(r.passLabel)}</td><td>${escapeHtml(r.qualityLabel)}</td>` +
+      `<td>${escapeHtml(r.costLabel)}</td><td>${escapeHtml(r.wallLabel)}</td>` +
+      `<td>${r.attempts != null ? r.attempts : "—"}</td></tr>`).join("") +
+    `</tbody></table>` +
+    (m.verdict ? `<p class="ab-verdict">${escapeHtml(m.verdict)} <span class="muted">(replay smoke — validates mechanics, not real quality)</span></p>` : "");
+}
+
+// ---- GitHub status line (global Settings console) ----
+async function loadGithubStatus() {
+  let st = null;
+  try {
+    const resp = await fetch("/api/github/status");
+    if (resp.ok) st = await resp.json();
+  } catch (e) { return; }
+  if (!st) return;
+  const cards = [...document.querySelectorAll("#gs-groups .gs-card")];
+  const ghCard = cards.find(c => {
+    const h = c.querySelector(".section-label");
+    return h && /github/i.test(h.textContent);
+  });
+  if (!ghCard) return;
+  let line = ghCard.querySelector(".gh-status-line");
+  if (!line) {
+    line = document.createElement("div");
+    line.className = "gh-status-line";
+    const h = ghCard.querySelector(".section-label");
+    h.insertAdjacentElement("afterend", line);
+  }
+  const repos = Object.entries(st.repos || {});
+  line.innerHTML =
+    `<span class="gh-state ${st.enabled ? "gh-on" : "gh-off"}">${st.enabled ? "enabled" : "disabled"}</span>` +
+    `<span>${repos.length} repo${repos.length === 1 ? "" : "s"}` +
+    (repos.length ? `: ${repos.map(([r, s]) => escapeHtml(r + " → " + s)).join(", ")}` : "") + `</span>` +
+    `<span>label <code>${escapeHtml(st.label || "ada")}</code></span>` +
+    `<span>${st.tracked || 0} tracked run${st.tracked === 1 ? "" : "s"}</span>` +
+    `<span class="muted gh-token-note">token via <code>ADA_GITHUB_TOKEN</code> env — never stored in settings</span>`;
+}
+
+// ---- KB upload: drop zone + file picker (Knowledge · Memory) ----
+const KB_MAX_BYTES = 2 * 1024 * 1024;
+
+function _kbResult(name, text, isError) {
+  const li = document.createElement("li");
+  li.className = "kb-result" + (isError ? " kb-err" : "");
+  li.innerHTML = `<code>${escapeHtml(name)}</code> <span>${escapeHtml(text)}</span>`;
+  $("kb-results").prepend(li);
+}
+
+async function uploadKbFiles(files) {
+  const slug = selectedProject();
+  if (!slug || slug === "multi") return;
+  for (const file of files) {
+    if (file.size > KB_MAX_BYTES) { _kbResult(file.name, "too large (2MB max)", true); continue; }
+    const fd = new FormData();
+    fd.append("file", file, file.name);
+    let resp, data = {};
+    try {
+      resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/kb/upload",
+                         { method: "POST", body: fd });
+      data = await resp.json().catch(() => ({}));
+    } catch (e) { _kbResult(file.name, "upload failed", true); continue; }
+    if (resp.status === 413) { _kbResult(file.name, "too large (2MB max)", true); continue; }
+    if (!resp.ok || data.error) { _kbResult(file.name, data.error || ("HTTP " + resp.status), true); continue; }
+    _kbResult(file.name, `ingested · ${data.chunks} chunk${data.chunks === 1 ? "" : "s"}`, false);
+  }
+}
+
+function wireKbDrop() {
+  const drop = $("kb-drop"), input = $("kb-file");
+  if (!drop || !input) return;
+  const browse = () => input.click();
+  $("kb-browse").onclick = (e) => { e.stopPropagation(); browse(); };
+  drop.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); browse(); }
+  });
+  drop.addEventListener("click", (e) => { if (!e.target.closest("button")) browse(); });
+  input.onchange = () => { uploadKbFiles([...input.files]); input.value = ""; };
+  ["dragenter", "dragover"].forEach(ev => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.classList.add("kb-over");
+  }));
+  ["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.classList.remove("kb-over");
+  }));
+  drop.addEventListener("drop", (e) => {
+    const files = [...((e.dataTransfer && e.dataTransfer.files) || [])];
+    if (files.length) uploadKbFiles(files);
+  });
+}
+
+// ---- Command palette (cmd+K / ctrl+K): global search + static commands ----
+let _palModel = { groups: [], flat: [], empty: true };
+let _palIdx = 0;
+let _palTimer = null;
+let _palSeq = 0;
+
+function openPalette() {
+  $("palette-input").value = "";
+  renderPaletteHint("Type at least 2 characters to search across every project.");
+  _palModel = { groups: [], flat: [], empty: true };
+  _palIdx = 0;
+  openModalEl("palette-modal");
+  $("palette-input").focus();
+}
+function closePalette() { closeModalEl("palette-modal"); }
+
+function renderPaletteHint(text) {
+  $("palette-results").innerHTML = `<p class="muted pal-hint">${escapeHtml(text)}</p>`;
+}
+
+function schedulePaletteSearch() {
+  clearTimeout(_palTimer);
+  const q = $("palette-input").value.trim();
+  if (q.length < 2) {
+    _palModel = paletteResultsModel(q, [], projectList);
+    _palIdx = 0;
+    if (_palModel.empty) renderPaletteHint("Type at least 2 characters to search across every project.");
+    else renderPalette();
+    return;
+  }
+  _palTimer = setTimeout(() => runPaletteSearch(q), 250);
+}
+
+async function runPaletteSearch(q) {
+  const seq = ++_palSeq;
+  let hits = [];
+  try {
+    const resp = await fetch("/api/search?q=" + encodeURIComponent(q) + "&limit=20");
+    if (resp.ok) hits = await resp.json();
+  } catch (e) { /* show commands only */ }
+  if (seq !== _palSeq) return;   // a newer query superseded this one
+  _palModel = paletteResultsModel(q, hits, projectList);
+  _palIdx = 0;
+  if (_palModel.empty) renderPaletteHint(`No results for “${q}”.`);
+  else renderPalette();
+}
+
+function renderPalette() {
+  const box = $("palette-results");
+  let idx = 0;
+  box.innerHTML = _palModel.groups.map(g =>
+    `<div class="pal-group"><div class="pal-group-label">${escapeHtml(g.label)}</div>` +
+    g.items.map(it => {
+      const i = idx++;
+      const chip = it.project ? `<span class="proj-tag">${escapeHtml(it.project)}</span>` : "";
+      const main = it.type === "command"
+        ? `<span class="pal-title">${escapeHtml(it.label)}</span>`
+        : `<span class="pal-title">${escapeHtml(it.title || "(untitled)")}</span>` +
+          (it.snippet ? `<span class="pal-snippet">${escapeHtml(it.snippet)}</span>` : "");
+      return `<div class="pal-item${i === _palIdx ? " active" : ""}" data-idx="${i}" role="option"` +
+        ` aria-selected="${i === _palIdx ? "true" : "false"}">${main}${chip}</div>`;
+    }).join("") + `</div>`).join("");
+  box.querySelectorAll(".pal-item").forEach(el => {
+    el.onclick = () => activatePaletteItem(_palModel.flat[parseInt(el.dataset.idx, 10)]);
+    el.onmousemove = () => {
+      const i = parseInt(el.dataset.idx, 10);
+      if (i !== _palIdx) { _palIdx = i; _palHighlight(); }
+    };
+  });
+}
+
+function _palHighlight() {
+  document.querySelectorAll("#palette-results .pal-item").forEach(el => {
+    const on = parseInt(el.dataset.idx, 10) === _palIdx;
+    el.classList.toggle("active", on);
+    el.setAttribute("aria-selected", on ? "true" : "false");
+    if (on) el.scrollIntoView({ block: "nearest" });
+  });
+}
+
+async function activatePaletteItem(it) {
+  if (!it) return;
+  closePalette();
+  if (it.type === "command") {
+    if (it.action === "project") selectProject(it.slug, "overview");
+    else if (it.action === "new-project") openProjectModal();
+    else if (it.action === "settings") showGlobalSettings();
+    else if (it.action === "activity") showActivity();
+    return;
+  }
+  const ref = it.ref || {};
+  const proj = it.project && it.project !== "multi" ? it.project : null;
+  if (it.type === "task") {
+    if (proj) selectProject(proj, "tasks");
+    openTask(ref.task_id || ref.id, null);
+  } else if (it.type === "memory" || it.type === "kb") {
+    if (proj) selectProject(proj);
+    currentKnow = "memory";
+    selectProjectTab("knowledge", true);
+  } else if (it.type === "file") {
+    if (proj) selectProject(proj);
+    await openFilesView(ref.task || "");
+    if (ref.path) selectFile(ref.path, null);
+  }
+}
+
+function paletteKeydown(e) {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    const n = _palModel.flat.length;
+    if (!n) return;
+    _palIdx = (_palIdx + (e.key === "ArrowDown" ? 1 : n - 1)) % n;
+    _palHighlight();
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    activatePaletteItem(_palModel.flat[_palIdx]);
+  }
+}
+
+// ---- Notification center (session-scope; captured from run events) ----
+let _notifs = [];
+let _notifSeq = 0;
+
+function notify(kind, text, taskId) {
+  _notifs.push({ id: "n" + (++_notifSeq), ts: Date.now() / 1000, kind,
+                 text: String(text || ""), taskId: taskId || state.taskId || "", read: false });
+  if (_notifs.length > 100) _notifs = _notifs.slice(-100);
+  renderNotifs();
+}
+
+function renderNotifs() {
+  const m = notifCenterModel(_notifs, Date.now() / 1000);
+  const badge = $("notif-badge");
+  badge.classList.toggle("hidden", !m.unread);
+  badge.textContent = m.badge;
+  const ul = $("notif-list");
+  if (m.empty) { ul.innerHTML = '<li class="muted">Nothing yet — run a task.</li>'; return; }
+  ul.innerHTML = "";
+  m.rows.forEach(r => {
+    const li = document.createElement("li");
+    li.className = "notif-item " + r.cls + (r.read ? " notif-read" : "");
+    li.innerHTML = `<span class="notif-icon" aria-hidden="true">${escapeHtml(r.icon)}</span>` +
+      `<span class="notif-body"><span class="notif-text">${escapeHtml(r.text)}</span>` +
+      `<span class="notif-when">${escapeHtml(r.timeLabel)}${r.taskId ? " · " + escapeHtml(r.taskId) : ""}</span></span>`;
+    makeActivatable(li, () => {
+      const n = _notifs.find(x => x.id === r.id);
+      if (n) n.read = true;
+      toggleNotifPanel(false);
+      if (r.taskId) openTask(r.taskId, null);
+      renderNotifs();
+    }, "Open task for notification: " + r.text);
+    ul.appendChild(li);
+  });
+}
+
+function toggleNotifPanel(open) {
+  const panel = $("notif-panel");
+  const show = open !== undefined ? open : panel.classList.contains("hidden");
+  panel.classList.toggle("hidden", !show);
+  $("notif-bell").setAttribute("aria-expanded", show ? "true" : "false");
+  if (show) renderNotifs();
+}
+
+function markAllNotifsRead() {
+  _notifs.forEach(n => { n.read = true; });
+  renderNotifs();
+}
+
+// ---- First-run tour: 4-step spotlight over the empty state ----
+let _tour = null;   // { steps, idx, overlay, pop, ring }
+
+function maybeStartTour() {
+  const m = tourStepsModel(projectList.length, localStorage.getItem("ada-tour-done"));
+  if (!m.show || _tour) return;
+  const overlay = document.createElement("div");
+  overlay.className = "tour-overlay";
+  const ring = document.createElement("div");
+  ring.className = "tour-ring hidden";
+  const pop = document.createElement("div");
+  pop.className = "tour-pop";
+  pop.setAttribute("role", "dialog");
+  pop.setAttribute("aria-label", "First-run tour");
+  overlay.appendChild(ring);
+  overlay.appendChild(pop);
+  document.body.appendChild(overlay);
+  _tour = { steps: m.steps, idx: 0, overlay, pop, ring };
+  renderTourStep();
+}
+
+function renderTourStep() {
+  if (!_tour) return;
+  const step = _tour.steps[_tour.idx];
+  const last = _tour.idx === _tour.steps.length - 1;
+  _tour.pop.innerHTML =
+    `<span class="kicker">Step ${_tour.idx + 1} of ${_tour.steps.length}</span>` +
+    `<h3 class="tour-title">${escapeHtml(step.title)}</h3>` +
+    `<p class="tour-body">${escapeHtml(step.body)}</p>` +
+    `<div class="tour-actions"><button type="button" class="btn-primary tour-next">${last ? "Done" : "Next →"}</button>` +
+    `<button type="button" class="ghost-btn tour-skip">Skip tour</button></div>`;
+  _tour.pop.querySelector(".tour-next").onclick = () => {
+    if (last) endTour();
+    else { _tour.idx++; renderTourStep(); }
+  };
+  _tour.pop.querySelector(".tour-skip").onclick = endTour;
+  // position the popover + spotlight ring near the step's target
+  const target = step.target ? $(step.target) : null;
+  const rect = target ? target.getBoundingClientRect() : null;
+  if (rect && rect.width && rect.height) {
+    Object.assign(_tour.ring.style, {
+      left: (rect.left - 6) + "px", top: (rect.top - 6) + "px",
+      width: (rect.width + 12) + "px", height: (rect.height + 12) + "px",
+    });
+    _tour.ring.classList.remove("hidden");
+    const popLeft = Math.min(Math.max(12, rect.right + 18), window.innerWidth - 332);
+    const popTop = Math.min(Math.max(12, rect.top), window.innerHeight - 220);
+    Object.assign(_tour.pop.style, { left: popLeft + "px", top: popTop + "px", transform: "none" });
+  } else {
+    _tour.ring.classList.add("hidden");
+    Object.assign(_tour.pop.style, { left: "50%", top: "38%", transform: "translate(-50%,-50%)" });
+  }
+  _tour.pop.querySelector(".tour-next").focus({ preventScroll: true });
+}
+
+function endTour() {
+  if (!_tour) return;
+  localStorage.setItem("ada-tour-done", "1");
+  _tour.overlay.remove();
+  _tour = null;
+}
+
 // ---- wire up ----
 $("run-btn").onclick = runTask;
 $("approve-btn").onclick = approvePlan;
@@ -3070,13 +3767,26 @@ $("roster-modal").onclick = (e) => { if (e.target === $("roster-modal")) closeRo
 // a11y: Escape closes the topmost dialog; Tab is trapped inside an open dialog
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  if (!$("project-modal").classList.contains("hidden")) closeProjectModal();
+  if (!$("palette-modal").classList.contains("hidden")) closePalette();
+  else if (!$("playbook-modal").classList.contains("hidden")) closePlaybookModal();
+  else if (!$("notif-panel").classList.contains("hidden")) toggleNotifPanel(false);
+  else if (!$("project-modal").classList.contains("hidden")) closeProjectModal();
   else if (!$("review-modal").classList.contains("hidden")) closeReviewPanel();
   else if (!$("roster-modal").classList.contains("hidden")) closeRosterModal();
   else if (!$("agent-modal").classList.contains("hidden")) closeAgentModal();
-  else closeModalEl("modal");
+  else if (!$("modal").classList.contains("hidden")) closeModalEl("modal");
+  else if (knowVisible("graph")) clearGraphFocus();   // node-focus mode: Esc clears
 });
-["modal", "agent-modal", "roster-modal", "project-modal", "review-modal"].forEach(id =>
+// cmd+K / ctrl+K opens the command palette from anywhere
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+    e.preventDefault();
+    if ($("palette-modal").classList.contains("hidden")) openPalette();
+    else closePalette();
+  }
+});
+["modal", "agent-modal", "roster-modal", "project-modal", "review-modal",
+ "playbook-modal", "palette-modal"].forEach(id =>
   $(id).addEventListener("keydown", (e) => _trapModalTab($(id), e)));
 document.querySelectorAll("#modal .tab").forEach(t => t.onclick = () => selectTab(t.dataset.doc));
 // project tab bar + knowledge sub-tabs + sidebar global nav
@@ -3111,6 +3821,31 @@ $("cmp-btn").onclick = compareRuns;
 // bearer-token prompt (shown on 401 when the server requires auth)
 $("token-save").onclick = saveToken;
 $("token-input").addEventListener("keydown", (e) => { if (e.key === "Enter") saveToken(); });
+// feature wave: playbooks · schedules · A/B · palette · notifications · KB · graph · timeline
+$("playbook-modal-close").onclick = closePlaybookModal;
+$("pbm-cancel").onclick = closePlaybookModal;
+$("pbm-start").onclick = startPlaybook;
+$("playbook-modal").onclick = (e) => { if (e.target === $("playbook-modal")) closePlaybookModal(); };
+$("sc-create").onclick = createSchedule;
+$("sched-refresh").onclick = loadSchedules;
+$("sc-prompt").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); createSchedule(); } });
+$("ab-run").onclick = runAB;
+$("ab-values").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); runAB(); } });
+$("palette-input").addEventListener("input", schedulePaletteSearch);
+$("palette-input").addEventListener("keydown", paletteKeydown);
+$("palette-modal").onclick = (e) => { if (e.target === $("palette-modal")) closePalette(); };
+$("notif-bell").onclick = () => toggleNotifPanel();
+$("notif-read-all").onclick = markAllNotifsRead;
+document.addEventListener("click", (e) => {   // click-away closes the notification panel
+  if ($("notif-panel").classList.contains("hidden")) return;
+  if (!e.target.closest("#notif-panel") && !e.target.closest("#notif-bell")) toggleNotifPanel(false);
+});
+wireKbDrop();
+$("graph-filter").addEventListener("input", applyGraphView);
+$("tl-zoom").addEventListener("input", () => {
+  tlZoom = parseFloat($("tl-zoom").value) || 1;
+  applyTimelineZoom();
+});
 $("fb-accept").onclick = () => sendFeedback({ accepted: true });
 $("fb-reject").onclick = () => sendFeedback({ accepted: false });
 document.querySelectorAll("#fb-stars button").forEach(b => b.onclick = () => {
@@ -3124,7 +3859,7 @@ loadProjects().then(() => {
   // Opening/attaching a task (openTask/attachToRun/launchRun) switches to its detail.
   // With no real projects yet, the main area is the first-run empty state.
   if (currentProject) selectProject(currentProject, "overview");
-  else showEmptyState();
+  else { showEmptyState(); maybeStartTour(); }   // first-run tour over the empty state
 });
 loadQueue();
 setInterval(loadQueue, 4000);  // keep the queue panel + chip fresh

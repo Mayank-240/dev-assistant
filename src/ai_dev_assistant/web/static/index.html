@@ -55,6 +55,11 @@
         </nav>
 
         <div class="sb-foot">
+          <button id="notif-bell" type="button" class="notif-bell" aria-haspopup="true" aria-expanded="false"
+                  title="Notifications (this session)" aria-label="Notifications">
+            <svg aria-hidden="true" width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 2a4 4 0 0 0-4 4v2.5L2.5 11.5h11L12 8.5V6a4 4 0 0 0-4-4z"/><path d="M6.5 13.5a1.5 1.5 0 0 0 3 0"/></svg>
+            <span id="notif-badge" class="notif-badge hidden" aria-hidden="true"></span>
+          </button>
           <span id="queue-chip" class="badge badge-muted hidden" title="Task queue">queue: idle</span>
           <span id="backend-badge" class="badge badge-muted">backend: …</span>
           <span id="conn" class="badge badge-idle" role="status" aria-live="polite">idle</span>
@@ -151,6 +156,11 @@
                 <p class="hint">Runs via your Claude Code login — no API key needed.</p>
               </div>
 
+              <section id="pb-strip" class="pb-strip hidden" aria-label="Playbooks">
+                <h3 class="section-label">Playbooks — one-click, pre-tuned task templates</h3>
+                <div id="pb-cards" class="pb-cards"></div>
+              </section>
+
               <div id="ov-activity" class="proj-activity pa-idle" role="status" aria-live="polite"><span class="pa-dot" aria-hidden="true"></span>idle</div>
 
               <section class="ov-recent">
@@ -182,6 +192,29 @@
                   <button id="tasks-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh task list">⟳</button>
                 </div>
                 <ul id="task-list" class="task-list"><li class="muted">none yet</li></ul>
+              </div>
+
+              <div class="card sched-card" id="schedules-card">
+                <div class="tasks-head">
+                  <h3 class="section-label">Schedules — recurring runs in this project</h3>
+                  <button id="sched-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh schedules">⟳</button>
+                </div>
+                <ul id="sched-list" class="sched-list"><li class="muted">No schedules yet.</li></ul>
+                <div class="sched-form">
+                  <span class="kicker">New schedule</span>
+                  <input id="sc-prompt" class="title-input" type="text" placeholder="Prompt — e.g. run the test suite and fix any failures" aria-label="Schedule prompt" />
+                  <div class="sched-form-row">
+                    <input id="sc-title" class="title-input" type="text" maxlength="80" placeholder="Title (optional)" aria-label="Schedule title" />
+                    <label class="ctl" title="Interval in hours (minimum 0.25 = 15 minutes)">Every&nbsp;h
+                      <input id="sc-every" class="num" type="number" min="0.25" step="0.25" value="24" aria-label="Interval in hours" />
+                    </label>
+                    <label class="ctl" title="Budget cap per scheduled run (blank = none)">Budget&nbsp;$
+                      <input id="sc-budget" class="num" type="number" min="0" step="0.5" placeholder="none" aria-label="Budget per run" />
+                    </label>
+                    <button id="sc-create" class="btn-primary" type="button">Add schedule</button>
+                  </div>
+                  <p id="sc-error" class="pm-error hidden" role="alert"></p>
+                </div>
               </div>
             </div>
 
@@ -227,13 +260,26 @@
                   <p class="know-desc">Durable notes and facts agents saved during their runs.</p>
                   <button id="mem-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh memory list">⟳</button>
                 </div>
+                <div id="kb-add" class="kb-add">
+                  <span class="kicker">Add knowledge — upload text files into this project's knowledge base</span>
+                  <div id="kb-drop" class="kb-drop" tabindex="0" role="button"
+                       aria-label="Drop files here or press Enter to browse for files to upload to the knowledge base">
+                    <span aria-hidden="true">⇪</span> Drop text files here, or
+                    <button type="button" id="kb-browse" class="link-btn">browse…</button>
+                    <span class="kb-cap muted">2 MB max per file</span>
+                  </div>
+                  <input id="kb-file" type="file" multiple class="hidden" aria-hidden="true" tabindex="-1" />
+                  <ul id="kb-results" class="kb-results"></ul>
+                </div>
                 <div id="memory-list" class="mem-list"><p class="muted">No memories yet — run a task.</p></div>
               </div>
 
               <div id="know-graph" class="know-panel hidden" role="tabpanel" aria-labelledby="ktab-graph">
                 <div class="know-head">
-                  <p class="know-desc">Entities and relationships the agents recorded. Click a node to trace its facts.</p>
+                  <p class="know-desc">Entities and relationships the agents recorded. Click a node to focus its neighborhood (Esc clears).</p>
                   <span id="graph-stats" class="muted"></span>
+                  <input id="graph-filter" class="title-input graph-filter" type="search"
+                         placeholder="Filter nodes…" aria-label="Filter graph nodes by label" />
                   <button id="graph-refresh" type="button" class="ghost" title="Refresh" aria-label="Refresh knowledge graph">⟳</button>
                 </div>
                 <div class="graph-wrap"><svg id="graph-svg" viewBox="0 0 800 520" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Knowledge graph of recorded entities and relationships"></svg></div>
@@ -451,9 +497,21 @@
               </div>
 
               <div class="card timeline-card hidden" id="timeline-card">
-                <span class="kicker">Run timeline — when each agent ran</span>
-                <div id="timeline" class="timeline"></div>
+                <div class="tl-head">
+                  <span class="kicker">Run timeline — when each agent ran</span>
+                  <span class="tl-zoom-wrap" title="Horizontal zoom">
+                    <label class="tl-zoom-label" for="tl-zoom">zoom</label>
+                    <input type="range" id="tl-zoom" min="0.5" max="4" step="0.25" value="1" aria-label="Timeline zoom" />
+                    <span id="tl-zoom-val" class="muted">1×</span>
+                  </span>
+                </div>
+                <div class="tl-scroll"><div id="timeline" class="timeline"></div></div>
               </div>
+
+              <details class="card cost-card hidden" id="cost-card">
+                <summary>Cost breakdown — per subtask</summary>
+                <div id="cost-table" class="cost-table-wrap"></div>
+              </details>
 
               <details class="feed card">
                 <summary>Activity feed</summary>
@@ -497,6 +555,45 @@
                 <button id="cmp-btn" class="ghost-btn">Compare</button>
               </div>
               <div id="cmp-result" class="cmp-result muted">Pick two runs from history and press Compare.</div>
+            </div>
+            <div class="card" id="spend-section">
+              <h3 class="section-label">Spend — LLM cost over the last <span id="sp-window">30</span> days</h3>
+              <div class="metrics dash-metrics sp-metrics">
+                <div class="metric"><span class="m-val" id="sp-total">$0.00</span><span class="m-label">total 30d</span></div>
+                <div class="metric"><span class="m-val" id="sp-runs">0</span><span class="m-label">runs</span></div>
+                <div class="metric"><span class="m-val sp-tokens" id="sp-tokens">—</span><span class="m-label">tokens</span></div>
+              </div>
+              <div id="sp-bars" class="sp-bars" role="img" aria-label="Spend by day"></div>
+              <div class="sp-cols">
+                <div class="sp-col">
+                  <span class="kicker">By project</span>
+                  <div id="sp-projects" class="sp-table-wrap"><p class="muted">No spend recorded yet.</p></div>
+                </div>
+                <div class="sp-col">
+                  <span class="kicker">Cost per outcome</span>
+                  <div id="sp-outcomes" class="sp-table-wrap"><p class="muted">No outcomes yet.</p></div>
+                </div>
+              </div>
+            </div>
+            <div class="card" id="ab-card">
+              <h3 class="section-label">A/B (replay smoke) — compare one knob's values offline</h3>
+              <p class="muted ab-note">Replays recorded cassettes to validate <b>mechanics</b> (the pipeline still runs end-to-end under each value) — it does <b>not</b> measure real output quality.</p>
+              <div class="cmp-controls">
+                <select id="ab-knob" class="select" title="ADA_* knob to vary" aria-label="Knob to vary">
+                  <option value="ADA_AGENT_EFFORT">ADA_AGENT_EFFORT</option>
+                  <option value="ADA_ORCHESTRATOR_EFFORT">ADA_ORCHESTRATOR_EFFORT</option>
+                  <option value="ADA_REVIEWER_EFFORT">ADA_REVIEWER_EFFORT</option>
+                  <option value="ADA_MAX_RETRIES">ADA_MAX_RETRIES</option>
+                  <option value="ADA_AGENT_MAX_TURNS">ADA_AGENT_MAX_TURNS</option>
+                  <option value="ADA_MAX_PLAN_SUBTASKS">ADA_MAX_PLAN_SUBTASKS</option>
+                  <option value="ADA_DEGRADE_ON_PARTIAL">ADA_DEGRADE_ON_PARTIAL</option>
+                  <option value="ADA_OBJECTIVE_REVIEW">ADA_OBJECTIVE_REVIEW</option>
+                </select>
+                <input id="ab-values" class="title-input ab-values" type="text"
+                       placeholder="Values, comma-separated — e.g. low, high" aria-label="Knob values, comma-separated" />
+                <button id="ab-run" class="ghost-btn" type="button">Run A/B →</button>
+              </div>
+              <div id="ab-result" class="cmp-result muted">Pick a knob, enter two or more values, and run.</div>
             </div>
           </div>
 
@@ -671,6 +768,46 @@
         </div>
       </div>
     </div>
+  </div>
+
+  <!-- Playbook launcher dialog -->
+  <div id="playbook-modal" class="modal hidden">
+    <div class="modal-box pm-box" role="dialog" aria-modal="true" aria-label="Start a playbook" tabindex="-1">
+      <div class="modal-head">
+        <span class="kicker" id="pbm-name">Playbook</span>
+        <button id="playbook-modal-close" type="button" class="ghost" aria-label="Close dialog">✕</button>
+      </div>
+      <div class="am-body">
+        <p id="pbm-desc" class="rm-text muted"></p>
+        <div id="pbm-fields" class="pbm-fields"></div>
+        <p id="pbm-error" class="pm-error hidden" role="alert"></p>
+        <div class="pe-actions">
+          <button id="pbm-start" class="btn-primary">Start playbook →</button>
+          <button id="pbm-cancel" class="ghost-btn" type="button">Cancel</button>
+        </div>
+        <p class="hint">Runs in the current project with the composer's model, effort and budget selections.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Command palette (cmd+K / ctrl+K) -->
+  <div id="palette-modal" class="modal palette-modal hidden">
+    <div class="modal-box palette-box" role="dialog" aria-modal="true" aria-label="Command palette" tabindex="-1">
+      <input id="palette-input" type="text" class="palette-input" placeholder="Search tasks, memories, knowledge, files… (Esc to close)"
+             aria-label="Search everything" autocomplete="off" role="combobox" aria-expanded="true" aria-controls="palette-results" />
+      <div id="palette-results" class="palette-results" role="listbox" aria-label="Search results">
+        <p class="muted pal-hint">Type at least 2 characters to search across every project.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Notification center panel (session-scope) -->
+  <div id="notif-panel" class="notif-panel hidden" role="region" aria-label="Notifications">
+    <div class="notif-head">
+      <span class="kicker">Notifications — this session</span>
+      <button id="notif-read-all" type="button" class="link-btn">mark all read</button>
+    </div>
+    <ul id="notif-list" class="notif-list"><li class="muted">Nothing yet — run a task.</li></ul>
   </div>
 
   <!-- Bearer-token prompt (shown when the server requires auth and a call 401s) -->

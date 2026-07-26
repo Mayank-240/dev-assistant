@@ -111,3 +111,16 @@ specified in [PLAN.md](PLAN.md) and not yet built.
   graded per child on held-out tests plus a rollup grader.
 - Project-first CLI (`ada project …`, `ada run -p a -p b`) and API; evals run
   through ephemeral projects; per-run repo binding removed.
+
+## Feature wave (shipped)
+- Global settings console (sidebar → Settings): 38 whitelisted settings across 8
+  groups with source badges, per-field reset, live application to new runs.
+- Playbooks: 7 pre-tuned task templates, one click from the project Overview.
+- Scheduled tasks: recurring per-project runs with a 60s server tick.
+- Notifications: webhook + macOS desktop channels, in-app notification center.
+- Global search + cmd+K palette across tasks, memories, KB, and files.
+- Cost analytics: spend dashboard, outcome ratios, per-run subtask breakdowns.
+- GitHub integration: labeled issues → runs → evidence-first PRs (poll-based;
+  token env-only via ADA_GITHUB_TOKEN).
+- A/B replay smoke from the UI; KB drag-and-drop upload; knowledge-graph
+  filter/focus; timeline zoom with per-subtask cost; first-run tour.

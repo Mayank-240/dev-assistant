@@ -929,8 +929,301 @@
     return html;
   }
 
+  // ===========================================================
+  // Feature wave — pure models: command palette, schedules, spend
+  // analytics, A/B replay table, notification center, playbook
+  // forms and the first-run tour. All Node-tested; no DOM access.
+  // ===========================================================
+
+  // Relative time: seconds-epoch -> "in 2h 10m" / "3m ago" / "due now" / "just now".
+  function fmtRelTime(ts, now) {
+    if (ts == null || !isFinite(Number(ts))) return "—";
+    const diff = Number(ts) - (now != null ? Number(now) : Date.now() / 1000);
+    const abs = Math.abs(diff);
+    const unit = abs < 60 ? null
+      : abs < 3600 ? Math.floor(abs / 60) + "m"
+      : abs < 86400 ? Math.floor(abs / 3600) + "h" + (Math.floor((abs % 3600) / 60) ? " " + Math.floor((abs % 3600) / 60) + "m" : "")
+      : Math.floor(abs / 86400) + "d";
+    if (diff >= 0) return unit ? "in " + unit : "due now";
+    return unit ? unit + " ago" : "just now";
+  }
+
+  // ---- Command palette: static commands + /api/search hits -> grouped model ----
+  const _PALETTE_KIND_LABEL = {
+    command: "Commands", task: "Tasks", memory: "Memories",
+    kb: "Knowledge base", file: "Files",
+  };
+  // query: raw input; hits: /api/search rows; projects: /api/projects list.
+  // Returns { groups: [{kind,label,items}], flat, empty }. Text is plain —
+  // the caller escapes before injecting. `flat` drives arrow-key navigation.
+  function paletteResultsModel(query, hits, projects) {
+    const q = String(query || "").trim().toLowerCase();
+    const commands = [];
+    if (q) {
+      visibleProjects(projects).forEach(p => {
+        const name = String(p.name || p.slug);
+        if (name.toLowerCase().includes(q) || String(p.slug).toLowerCase().includes(q)
+            || "go to project".includes(q)) {
+          commands.push({ type: "command", action: "project", slug: String(p.slug),
+                          label: "Go to project " + name });
+        }
+      });
+      [["new-project", "New project"], ["settings", "Settings"],
+       ["activity", "All activity"]].forEach(([action, label]) => {
+        if (label.toLowerCase().includes(q)) commands.push({ type: "command", action, label });
+      });
+    }
+    const byKind = {};
+    (Array.isArray(hits) ? hits : []).forEach(h => {
+      if (!h || !h.kind) return;
+      (byKind[h.kind] = byKind[h.kind] || []).push({
+        type: String(h.kind), project: String(h.project || ""),
+        title: String(h.title || ""), snippet: String(h.snippet || ""),
+        ref: (h.ref && typeof h.ref === "object") ? h.ref : {},
+      });
+    });
+    const groups = [];
+    if (commands.length) groups.push({ kind: "command", label: _PALETTE_KIND_LABEL.command, items: commands });
+    ["task", "memory", "kb", "file"].concat(Object.keys(byKind)).forEach(k => {
+      if (byKind[k]) {
+        groups.push({ kind: k, label: _PALETTE_KIND_LABEL[k] || k, items: byKind[k] });
+        delete byKind[k];
+      }
+    });
+    const flat = [];
+    groups.forEach(g => g.items.forEach(it => flat.push(it)));
+    return { groups, flat, empty: !flat.length };
+  }
+
+  // ---- Schedules: one /api/schedules row -> render model ----
+  function _fmtEvery(hours) {
+    const h = Number(hours) || 0;
+    if (h >= 1) {
+      const s = h % 1 === 0 ? String(h) : h.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+      return "every " + s + "h";
+    }
+    return "every " + Math.round(h * 60) + "m";
+  }
+  function scheduleRowModel(row, now) {
+    row = row || {};
+    const enabled = !!row.enabled;
+    const title = String(row.title || "").trim() || String(row.prompt || "").slice(0, 80);
+    return {
+      id: String(row.id || ""),
+      title,
+      prompt: String(row.prompt || ""),
+      enabled,
+      everyLabel: _fmtEvery(row.every_hours),
+      nextLabel: !enabled ? "paused"
+        : row.next_run_at == null ? "due now"
+        : "next " + fmtRelTime(row.next_run_at, now),
+      lastTaskId: String(row.last_task_id || ""),
+      budgetLabel: Number(row.budget_usd) > 0 ? "$" + Number(row.budget_usd).toFixed(2) : "",
+    };
+  }
+
+  // Create-form values -> { ok, errors, body } for POST /api/schedules.
+  // Mirrors the server's gates (prompt required, every_hours >= 0.25).
+  function scheduleFormModel(f) {
+    f = f || {};
+    const errors = [];
+    const prompt = String(f.prompt || "").trim();
+    if (!prompt) errors.push("prompt is required");
+    const every = Number(String(f.every_hours == null ? "" : f.every_hours).trim());
+    if (!isFinite(every) || every < 0.25) errors.push("every_hours must be a number ≥ 0.25 (15 minutes)");
+    let budget = 0;
+    const rawB = String(f.budget_usd == null ? "" : f.budget_usd).trim();
+    if (rawB) {
+      budget = Number(rawB);
+      if (!isFinite(budget) || budget < 0) errors.push("budget must be a non-negative number");
+    }
+    return {
+      ok: !errors.length, errors,
+      body: {
+        prompt, title: String(f.title || "").trim() || null,
+        every_hours: every, budget_usd: budget || 0,
+      },
+    };
+  }
+
+  // ---- Spend analytics: /api/analytics/overview body -> dashboard model ----
+  function spendOverviewModel(ov) {
+    ov = ov || {};
+    const byDay = Array.isArray(ov.by_day) ? ov.by_day : [];
+    const max = Math.max(0, ...byDay.map(d => Number(d && d.usd) || 0));
+    return {
+      windowDays: Number(ov.window_days) || 30,
+      totalLabel: "$" + Number(ov.total_usd || 0).toFixed(2),
+      runs: Number(ov.runs) || 0,
+      tokensLabel: fmtTok(Number(ov.tokens_in) || 0) + " in + " + fmtTok(Number(ov.tokens_out) || 0) + " out",
+      bars: byDay.map(d => {
+        const usd = Number(d && d.usd) || 0;
+        return {
+          date: String((d && d.date) || ""),
+          usd,
+          hPct: max > 0 ? Math.max(usd > 0 ? 4 : 0, Math.round((usd / max) * 100)) : 0,
+          label: (d && d.date) + " · $" + usd.toFixed(2) + " · " + ((d && d.runs) || 0)
+            + " run" + ((d && d.runs) === 1 ? "" : "s"),
+        };
+      }),
+      projects: (Array.isArray(ov.by_project) ? ov.by_project : []).map(p => ({
+        project: String((p && p.project) || ""),
+        usdLabel: "$" + Number((p && p.usd) || 0).toFixed(2),
+        runs: Number(p && p.runs) || 0,
+        qualityLabel: (p && p.avg_quality != null) ? String(p.avg_quality) : "—",
+      })),
+    };
+  }
+
+  // /api/analytics/outcomes body -> labeled ratio rows (null -> em dash).
+  function spendOutcomesModel(oc) {
+    oc = oc || {};
+    const r = (v) => v != null ? "$" + Number(v).toFixed(4) : "—";
+    return {
+      rows: [
+        { label: "per completed run", value: r(oc.usd_per_completed_run),
+          count: Number(oc.completed_runs) || 0 },
+        { label: "per passed subtask", value: r(oc.usd_per_passed_subtask),
+          count: Number(oc.passed_subtasks) || 0 },
+        { label: "per accepted subtask", value: r(oc.usd_per_accepted_subtask),
+          count: Number(oc.accepted_subtasks) || 0 },
+      ],
+      totalLabel: "$" + Number(oc.total_usd || 0).toFixed(2),
+    };
+  }
+
+  // /api/analytics/run/{id} body -> per-subtask cost table model.
+  function runCostModel(data) {
+    data = data || {};
+    const subs = Array.isArray(data.subtasks) ? data.subtasks : [];
+    const totals = data.totals || {};
+    const bySubtask = {};
+    subs.forEach(s => { if (s && s.subtask) bySubtask[s.subtask] = Number(s.usd) || 0; });
+    return {
+      empty: !subs.length,
+      rows: subs.map(s => ({
+        subtask: String((s && s.subtask) || ""),
+        agent: String((s && s.agent) || "—"),
+        usdLabel: fmtCost(s && s.usd),
+        tokensLabel: fmtTok(Number(s && s.tokens_in) || 0) + " in + "
+          + fmtTok(Number(s && s.tokens_out) || 0) + " out",
+      })),
+      totalLabel: fmtCost(totals.usd),
+      runTotalLabel: data.run_total_usd != null ? fmtCost(data.run_total_usd) : "",
+      unattributedLabel: (data.unattributed_usd != null && data.unattributed_usd > 0.00005)
+        ? fmtCost(data.unattributed_usd) : "",
+      bySubtask,
+    };
+  }
+
+  // ---- A/B replay: POST /api/ab response -> table + verdict model ----
+  function abTableModel(rep) {
+    rep = rep || {};
+    const arms = Array.isArray(rep.arms) ? rep.arms : [];
+    return {
+      knob: String(rep.knob || ""),
+      verdict: arms.length && rep.best != null
+        ? "Best arm: " + rep.knob + " = " + rep.best : "",
+      rows: arms.map(a => ({
+        value: String(a.value),
+        best: rep.best != null && a.value === rep.best,
+        passLabel: Math.round((Number(a.pass_rate) || 0) * 100) + "%",
+        qualityLabel: a.mean_quality != null ? String(a.mean_quality) : "n/a",
+        costLabel: "$" + Number(a.mean_cost_usd || 0).toFixed(4),
+        wallLabel: (Number(a.mean_wall_s) || 0).toFixed(1) + "s",
+        attempts: (a.report && a.report.attempts != null) ? Number(a.report.attempts) : null,
+      })),
+    };
+  }
+
+  // ---- Notification center (session-scope, client-side) ----
+  const _NOTIF_ICON = { ask: "?", permission: "⚠", done: "✓", error: "✗", start: "▶" };
+  // items: [{id, ts (s), kind, text, taskId, read}] -> newest-first rows + badge.
+  function notifCenterModel(items, now) {
+    const rows = (Array.isArray(items) ? items : []).slice()
+      .sort((a, b) => (Number(b && b.ts) || 0) - (Number(a && a.ts) || 0))
+      .map(n => ({
+        id: String((n && n.id) || ""),
+        taskId: String((n && n.taskId) || ""),
+        kind: String((n && n.kind) || "info"),
+        icon: _NOTIF_ICON[n && n.kind] || "·",
+        text: String((n && n.text) || ""),
+        timeLabel: fmtRelTime(n && n.ts, now),
+        read: !!(n && n.read),
+        cls: "nf-" + String((n && n.kind) || "info"),
+      }));
+    const unread = rows.filter(r => !r.read).length;
+    return {
+      rows, unread, empty: !rows.length,
+      badge: unread ? (unread > 9 ? "9+" : String(unread)) : "",
+    };
+  }
+
+  // ---- Playbooks: catalog entry + raw field values -> typed form model ----
+  // Mirrors the server's param validation (str/int/choice, required, default)
+  // so obvious mistakes fail before the request. Blank defaulted/optional
+  // params are omitted from `params` (the server applies its own default).
+  function playbookFormModel(pb, values) {
+    pb = pb || {};
+    values = values || {};
+    const errors = [];
+    const params = {};
+    const fields = (Array.isArray(pb.params) ? pb.params : []).map(spec => {
+      spec = spec || {};
+      const key = String(spec.key || "");
+      const type = spec.type === "int" || spec.type === "choice" ? spec.type : "str";
+      const required = spec.required !== false;
+      const hasDefault = "default" in spec && spec.default != null;
+      const raw = key in values ? values[key] : (hasDefault ? spec.default : "");
+      const s = String(raw == null ? "" : raw).trim();
+      let error = "";
+      if (!s) {
+        if (required && !hasDefault) error = "required";
+      } else if (type === "int") {
+        if (!/^-?\d+$/.test(s)) error = "must be a whole number";
+        else params[key] = parseInt(s, 10);
+      } else if (type === "choice") {
+        const choices = (spec.choices || []).map(String);
+        if (!choices.includes(s)) error = "must be one of: " + choices.join(", ");
+        else params[key] = s;
+      } else {
+        params[key] = s;
+      }
+      if (error) errors.push((spec.label || key) + " — " + error);
+      return {
+        key, type, required,
+        label: String(spec.label || key),
+        control: type === "choice" ? "select" : type === "int" ? "number" : "text",
+        choices: (spec.choices || []).map(String),
+        value: raw == null ? "" : String(raw),
+        error,
+      };
+    });
+    return { fields, ok: !errors.length, errors, params };
+  }
+
+  // ---- First-run tour: 4 spotlight steps, shown once with 0 projects ----
+  function tourStepsModel(projectCount, done) {
+    return {
+      show: !done && (Number(projectCount) || 0) === 0,
+      steps: [
+        { id: "welcome", target: "", title: "Welcome to AI Dev Assistant",
+          body: "Describe work in plain English and a team of specialist agents plans, executes, reviews and documents it. This 20-second tour shows you around." },
+        { id: "projects", target: "project-list", title: "Projects are the navigation",
+          body: "Every task, memory and file lives inside a project. Create an empty one or import an existing repository to get started." },
+        { id: "composer", target: "empty-new", title: "Composer & playbooks",
+          body: "Each project's Overview has a freeform composer plus one-click playbooks — pre-tuned templates like “raise test coverage” or “upgrade a dependency”." },
+        { id: "settings", target: "nav-gsettings", title: "Settings",
+          body: "Assistant-wide configuration lives here: models, budgets, guardrails, schedules and GitHub automation." },
+      ],
+    };
+  }
+
   const AdaUtil = {
     escapeHtml, escapeAttr, fmtTok, fmtSize, fmtCost, fmtDuration, classifyDiffLine,
+    fmtRelTime, paletteResultsModel, scheduleRowModel, scheduleFormModel,
+    spendOverviewModel, spendOutcomesModel, runCostModel, abTableModel,
+    notifCenterModel, playbookFormModel, tourStepsModel,
     makeAgentRecord, initialRunAggregates, reduceRunEvent, runProgress, formatStepLine,
     computeBudgetMeter, timelineRows, compareRowModel, RESUMABLE_STATUSES, isResumable,
     projectStatusLine, activityStripModel,
