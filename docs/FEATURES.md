@@ -212,3 +212,27 @@ specified in [PLAN.md](PLAN.md) and not yet built.
   and redaction as the generic webhook) and stdlib SMTP email (password
   env-only via `ADA_SMTP_PASSWORD`) ride the same notify dispatch as
   webhook/desktop, configurable live from the settings console.
+
+## Away-wave server wiring (shipped)
+- Knowledge graph v2 API: `GET /api/projects/{slug}/graph2`
+  (`?layer=&min_weight=&limit=` → export_view + stats),
+  `GET .../graph2/node/{node_id}` (`?depth=&layer=`, path-style node ids
+  supported) and `GET .../graph2/search?q=` over the same per-project KG file,
+  opened read-only. The legacy `GET /api/graph` shape is unchanged.
+- Workspaces API: `GET/POST /api/workspaces`, `PATCH/DELETE /api/workspaces/{ws}`,
+  member assign/unassign (`POST/DELETE /api/workspaces/{ws}/projects[...]`),
+  `PUT /api/workspaces/{ws}/deps` (validated; 400 with the reason), and
+  `POST /api/workspaces/{ws}/run` — expands via `workspace_run_spec` and
+  re-enters the multi-project `/api/run` path (identical payload plus an
+  additive `workspace` attribution key). `GET /api/projects` items carry an
+  additive `workspace: slug|null` field.
+- Custom agents API: `GET /api/agents` now returns
+  `{builtin, custom, tools}` (builtins with tools/effort, customs as their raw
+  editable specs, plus the toolbox universe); `POST /api/agents {spec}`
+  validates and upserts (400 with the reason);
+  `DELETE /api/agents/{name}` (400 for builtins, 404 when absent). New runs
+  pick customs up automatically via per-engine `build_agents`.
+- Home aggregation: `GET /api/home` — open ask/permission requests across
+  running tasks, running/queued/recent runs, a 30-day spend snapshot,
+  benchmark trend, workspace summaries, and counts; each section degrades to its
+  empty default with an `errors` entry, never a 500.

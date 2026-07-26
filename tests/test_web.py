@@ -44,10 +44,13 @@ def test_health_and_ready(tmp_path):
 
 def test_agents_and_stats(tmp_path):
     c = _client(tmp_path)
-    agents = c.get("/api/agents").json()
-    assert any(a["name"] == "coder" for a in agents)
+    body = c.get("/api/agents").json()
+    builtin = body["builtin"]
+    assert any(a["name"] == "coder" for a in builtin)
     # new tools are exposed to full agents
-    assert "write_file" in next(a for a in agents if a["name"] == "coder")["tools"]
+    assert "write_file" in next(a for a in builtin if a["name"] == "coder")["tools"]
+    assert body["custom"] == []                       # nothing user-defined yet
+    assert "read_file" in body["tools"]               # the toolbox universe
     stats = c.get("/api/stats").json()
     assert "total_cost_usd" in stats and "by_status" in stats
 
@@ -1391,3 +1394,361 @@ def test_notify_config_threads_slack_and_email_settings(tmp_path, monkeypatch):
     assert cfg.smtp_port == 2525 and cfg.smtp_user == "ada@example.com"
     assert cfg.smtp_starttls is False
     assert cfg.webhook_url == "" and cfg.desktop is False
+
+
+# =====================================================================
+# Away wave: knowledge graph v2, workspaces, custom agents, /api/home
+# =====================================================================
+
+# ---- Knowledge graph v2 (/api/projects/{slug}/graph2*) ----
+
+def _seed_kg(c, slug="default"):
+    """Write a small layered/weighted KG into the project's graph file (the same
+    path the server opens read-only), exactly like the engine would."""
+    from ai_dev_assistant.knowledge.graph import NetworkXKnowledgeGraph
+    s = dataclasses.replace(c.app.state.settings, project=slug)
+    kg = NetworkXKnowledgeGraph(s.graph_path)
+    kg.add_fact("auth.py", "implements", "login flow", source="coder")
+    kg.add_fact("auth.py", "implements", "login flow", source="reviewer")  # weight -> 2
+    kg.add_fact("auth.py", "tested_by", "test_auth.py")
+    kg.add_fact("s1", "assigned_to", "coder", layer="run")
+    kg.save()
+    return kg
+
+
+def test_graph2_export_view_layers_and_weights_roundtrip(tmp_path):
+    c = _client(tmp_path)
+    _seed_kg(c)
+    body = c.get("/api/projects/default/graph2").json()
+    assert body["project"] == "default"
+    ids = {n["id"] for n in body["nodes"]}
+    assert {"auth.py", "login-flow", "test-auth.py", "s1", "coder"} <= ids
+    edges = {(e["src"], e["dst"], e["relation"]): e for e in body["edges"]}
+    imp = edges[("auth.py", "login-flow", "implements")]
+    assert imp["weight"] == 2 and imp["layer"] == "domain"
+    assert edges[("s1", "coder", "assigned_to")]["layer"] == "run"
+    stats = body["stats"]
+    assert stats["nodes"] == len(body["nodes"]) and stats["edges"] == 3
+    assert stats["by_layer"] == {"domain": 2, "run": 1}
+
+    # ?layer= filters edges; ?min_weight= keeps only the repeat-asserted fact
+    domain = c.get("/api/projects/default/graph2?layer=domain").json()
+    assert {e["relation"] for e in domain["edges"]} == {"implements", "tested_by"}
+    heavy = c.get("/api/projects/default/graph2?min_weight=2").json()
+    assert [e["relation"] for e in heavy["edges"]] == ["implements"]
+    # ?limit= caps nodes (ranked by weighted degree, top node survives)
+    capped = c.get("/api/projects/default/graph2?limit=1").json()
+    assert [n["id"] for n in capped["nodes"]] == ["auth.py"]
+
+
+def test_graph2_node_neighborhood_with_path_id(tmp_path):
+    c = _client(tmp_path)
+    _seed_kg(c)
+    body = c.get("/api/projects/default/graph2/node/auth.py").json()
+    assert body["node"] == "auth.py"
+    ids = {n["id"] for n in body["nodes"]}
+    assert ids == {"auth.py", "login-flow", "test-auth.py"}
+    # layer filter drops non-matching edges from traversal + result
+    run_only = c.get("/api/projects/default/graph2/node/s1?layer=run").json()
+    assert {n["id"] for n in run_only["nodes"]} == {"s1", "coder"}
+    # unknown node -> empty, not an error
+    missing = c.get("/api/projects/default/graph2/node/nope").json()
+    assert missing["nodes"] == [] and missing["edges"] == []
+
+
+def test_graph2_search(tmp_path):
+    c = _client(tmp_path)
+    _seed_kg(c)
+    hits = c.get("/api/projects/default/graph2/search?q=auth").json()
+    assert {n["id"] for n in hits["nodes"]} == {"auth.py", "test-auth.py"}
+    assert c.get("/api/projects/default/graph2/search?q=").json()["nodes"] == []
+
+
+def test_graph2_unknown_project_is_404(tmp_path):
+    c = _client(tmp_path)
+    assert c.get("/api/projects/nope/graph2").status_code == 404
+    assert c.get("/api/projects/nope/graph2/search?q=x").status_code == 404
+    assert c.get("/api/projects/nope/graph2/node/x").status_code == 404
+
+
+def test_legacy_graph_endpoint_shape_survives_kg_rework(tmp_path):
+    """/api/graph (the shape today's Knowledge tab renders) still returns
+    id/type nodes and source/target/relation edges over the reworked KG."""
+    c = _client(tmp_path)
+    _seed_kg(c)
+    body = c.get("/api/graph?project=default").json()
+    assert body["project"] == "default"
+    assert {"id", "type"} <= set(body["nodes"][0])
+    assert {"source", "target", "relation"} <= set(body["edges"][0])
+    assert any(e["relation"] == "implements" for e in body["edges"])
+
+
+# ---- Workspaces ----
+
+def test_workspace_crud_roundtrip(tmp_path):
+    c = _client(tmp_path)
+    a = c.post("/api/projects", json={"name": "Ws A"}).json()["slug"]
+    r = c.post("/api/workspaces", json={"name": "Platform", "description": "core",
+                                        "projects": [a]})
+    assert r.status_code == 200, r.text
+    ws = r.json()
+    assert ws["slug"] == "platform" and ws["project_slugs"] == [a]
+    assert [w["slug"] for w in c.get("/api/workspaces").json()] == ["platform"]
+    patched = c.patch("/api/workspaces/platform",
+                      json={"name": "Platform 2", "description": "renamed"}).json()
+    assert patched["name"] == "Platform 2" and patched["description"] == "renamed"
+    assert c.patch("/api/workspaces/nope", json={"name": "x"}).status_code == 404
+    assert c.delete("/api/workspaces/platform").json()["ok"] is True
+    assert c.get("/api/workspaces").json() == []
+    # member project survives the workspace deletion
+    assert a in [p["slug"] for p in c.get("/api/projects").json()]
+
+
+def test_workspace_create_unknown_project_is_400(tmp_path):
+    c = _client(tmp_path)
+    r = c.post("/api/workspaces", json={"name": "Bad", "projects": ["nope"]})
+    assert r.status_code == 400 and "unknown project" in r.json()["error"]
+    assert c.get("/api/workspaces").json() == []  # nothing was written
+
+
+def test_workspace_assign_moves_and_projects_expose_workspace(tmp_path):
+    c = _client(tmp_path)
+    a = c.post("/api/projects", json={"name": "Mv A"}).json()["slug"]
+    c.post("/api/workspaces", json={"name": "One", "projects": [a]})
+    c.post("/api/workspaces", json={"name": "Two"})
+    # /api/projects grows an additive workspace field
+    entry = next(p for p in c.get("/api/projects").json() if p["slug"] == a)
+    assert entry["workspace"] == "one"
+    # assigning elsewhere MOVES the project
+    r = c.post("/api/workspaces/two/projects", json={"project": a})
+    assert r.status_code == 200 and r.json()["project_slugs"] == [a]
+    by_slug = {w["slug"]: w for w in c.get("/api/workspaces").json()}
+    assert by_slug["one"]["project_slugs"] == []
+    entry = next(p for p in c.get("/api/projects").json() if p["slug"] == a)
+    assert entry["workspace"] == "two"
+    # unassign -> ungrouped (null workspace)
+    assert c.delete(f"/api/workspaces/two/projects/{a}").status_code == 200
+    entry = next(p for p in c.get("/api/projects").json() if p["slug"] == a)
+    assert entry["workspace"] is None
+    # unknown workspace / unknown project statuses
+    assert c.post("/api/workspaces/nope/projects", json={"project": a}).status_code == 404
+    assert c.post("/api/workspaces/two/projects",
+                  json={"project": "ghost"}).status_code == 400
+
+
+def test_workspace_deps_put_validates(tmp_path):
+    c = _client(tmp_path)
+    a = c.post("/api/projects", json={"name": "Dp A"}).json()["slug"]
+    b = c.post("/api/projects", json={"name": "Dp B"}).json()["slug"]
+    c.post("/api/workspaces", json={"name": "Deps", "projects": [a, b]})
+    ok = c.put("/api/workspaces/deps/deps", json={"deps": {b: [a]}})
+    assert ok.status_code == 200 and ok.json()["default_deps"] == {b: [a]}
+    cyc = c.put("/api/workspaces/deps/deps", json={"deps": {a: [b], b: [a]}})
+    assert cyc.status_code == 400 and "cycle" in cyc.json()["error"]
+    bad = c.put("/api/workspaces/deps/deps", json={"deps": {a: ["ghost"]}})
+    assert bad.status_code == 400
+    assert c.put("/api/workspaces/nope/deps", json={"deps": {}}).status_code == 404
+    # failed PUTs never clobbered the stored map
+    assert c.get("/api/workspaces").json()[0]["default_deps"] == {b: [a]}
+
+
+def test_workspace_run_enqueues_exactly_like_manual_multi_project_run(tmp_path):
+    """POST /api/workspaces/{ws}/run must be indistinguishable from a manual
+    POST /api/run with projects+project_deps, save the additive 'workspace' key."""
+    c = _client(tmp_path)
+    c.app.state.paused = True  # keep the pump from launching anything
+    a = c.post("/api/projects", json={"name": "Wr A"}).json()["slug"]
+    b = c.post("/api/projects", json={"name": "Wr B"}).json()["slug"]
+    c.post("/api/workspaces", json={"name": "Fleet", "projects": [a, b]})
+    assert c.put("/api/workspaces/fleet/deps", json={"deps": {b: [a]}}).status_code == 200
+
+    r = c.post("/api/workspaces/fleet/run",
+               json={"prompt": "upgrade all", "title": "Fleet run", "effort": "low"})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "queued"
+    ws_payload = c.app.state.runs.queue_pending()[0]["payload"]
+    if isinstance(ws_payload, str):
+        ws_payload = json.loads(ws_payload)
+
+    m = c.post("/api/run", json={"prompt": "upgrade all", "title": "Fleet run",
+                                 "effort": "low", "projects": [a, b],
+                                 "project_deps": {b: [a]}})
+    assert m.status_code == 200
+    manual_payload = c.app.state.runs.queue_pending()[1]["payload"]
+    if isinstance(manual_payload, str):
+        manual_payload = json.loads(manual_payload)
+
+    assert ws_payload.pop("workspace") == "fleet"  # additive attribution only
+    assert ws_payload == manual_payload
+    assert manual_payload["projects"] == [a, b]
+    assert manual_payload["project_deps"] == {b: [a]}
+
+
+def test_workspace_run_subset_and_single_member_collapse(tmp_path):
+    c = _client(tmp_path)
+    c.app.state.paused = True
+    a = c.post("/api/projects", json={"name": "Sub A"}).json()["slug"]
+    b = c.post("/api/projects", json={"name": "Sub B"}).json()["slug"]
+    c.post("/api/workspaces", json={"name": "Subset", "projects": [a, b]})
+    # subset of one member behaves exactly like a single-project run
+    r = c.post("/api/workspaces/subset/run", json={"prompt": "just a", "subset": [a]})
+    assert r.status_code == 200
+    payload = c.app.state.runs.queue_pending()[0]["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    assert payload["project"] == a and not payload.get("projects")
+    assert payload["workspace"] == "subset"
+    # non-member subset is a 400; unknown workspace a 404; empty workspace a 400
+    assert c.post("/api/workspaces/subset/run",
+                  json={"prompt": "x", "subset": ["ghost"]}).status_code == 400
+    assert c.post("/api/workspaces/nope/run", json={"prompt": "x"}).status_code == 404
+    c.post("/api/workspaces", json={"name": "Hollow"})
+    r = c.post("/api/workspaces/hollow/run", json={"prompt": "x"})
+    assert r.status_code == 400 and "no member projects" in r.json()["error"]
+
+
+# ---- Custom agents ----
+
+_VALID_AGENT = {
+    "name": "sql_tuner", "description": "Tunes slow SQL.",
+    "when_to_use": "Use for slow queries.",
+    "system_prompt": "You are a SQL tuning agent.",
+    "tools": ["read_file", "grep"],
+}
+
+
+def test_custom_agent_crud_and_roster_pickup(tmp_path):
+    c = _client(tmp_path)
+    r = c.post("/api/agents", json={"spec": _VALID_AGENT})
+    assert r.status_code == 200, r.text
+    assert r.json()["agent"]["name"] == "sql_tuner"
+    body = c.get("/api/agents").json()
+    assert [a["name"] for a in body["custom"]] == ["sql_tuner"]
+    assert body["custom"][0]["system_prompt"] == "You are a SQL tuning agent."
+    assert not any(a["name"] == "sql_tuner" for a in body["builtin"])
+    # new runs pick customs up automatically: build_agents composes them per engine
+    from ai_dev_assistant.agents.registry import build_agents
+    assert "sql_tuner" in build_agents(c.app.state.settings)
+    # upsert by name is an update, not a collision
+    assert c.post("/api/agents", json={"spec": {**_VALID_AGENT,
+                                                "description": "v2"}}).status_code == 200
+    assert c.get("/api/agents").json()["custom"][0]["description"] == "v2"
+    assert c.delete("/api/agents/sql_tuner").json()["ok"] is True
+    assert c.get("/api/agents").json()["custom"] == []
+    assert c.delete("/api/agents/sql_tuner").status_code == 404
+
+
+def test_custom_agent_validation_and_builtin_guard(tmp_path):
+    c = _client(tmp_path)
+    bad_tool = c.post("/api/agents", json={"spec": {**_VALID_AGENT,
+                                                    "tools": ["not_a_tool"]}})
+    assert bad_tool.status_code == 400 and "not_a_tool" in bad_tool.json()["error"]
+    collision = c.post("/api/agents", json={"spec": {**_VALID_AGENT, "name": "coder"}})
+    assert collision.status_code == 400 and "coder" in collision.json()["error"]
+    bad_name = c.post("/api/agents", json={"spec": {**_VALID_AGENT, "name": "Bad Name!"}})
+    assert bad_name.status_code == 400
+    # deleting a builtin is a 400 (not a 404)
+    r = c.delete("/api/agents/coder")
+    assert r.status_code == 400 and "built-in" in r.json()["error"]
+    assert c.get("/api/agents").json()["custom"] == []  # nothing slipped through
+
+
+# ---- /api/home ----
+
+def test_home_empty_everything(tmp_path):
+    c = _client(tmp_path)
+    body = c.get("/api/home").json()
+    assert body["attention"] == [] and body["running"] == [] and body["queued"] == []
+    assert body["recent"] == [] and body["workspaces"] == []
+    assert body["benchmarks"] == {"latest": None, "delta": None, "series": []}
+    assert body["spend"]["total_usd"] == 0.0
+    assert body["counts"] == {"projects": 1, "workspaces": 0, "custom_agents": 0}
+    assert body["errors"] == []
+
+
+def test_home_aggregates_attention_running_queued_recent_benchmarks(tmp_path):
+    from ai_dev_assistant.evals.history import history_path
+    from ai_dev_assistant.orchestration.events import Event
+    from ai_dev_assistant.orchestration.run_control import RunControl
+    from ai_dev_assistant.web.server import Broker
+
+    c = _client(tmp_path)
+    st = c.app.state.runs
+
+    # recent: a terminal run
+    st.start("run-done", "ship it", title="Shipped", project="default")
+    st.finish("run-done", status="completed", quality_score=88, cost_usd=1.25)
+    # running: a live run with an open ask request on its control/broker
+    st.start("run-live", "big task", title="Live", project="default")
+    c.app.state.running.add("run-live")
+    ctrl = RunControl()
+    loop = asyncio.new_event_loop()
+    try:
+        ctrl._pending["ask-1"] = loop.create_future()
+        c.app.state.controls["run-live"] = ctrl
+        broker = Broker()
+        broker.publish(Event("ask", "[coder] Which DB?", {
+            "id": "ask-1", "agent": "coder", "question": "Which DB?",
+            "options": ["sqlite", "postgres"]}))
+        c.app.state.brokers["run-live"] = broker
+        # queued: a pending queue entry
+        st.enqueue("run-wait", "later", "Waiting",
+                   {"prompt": "later", "project": "default"})
+        # benchmarks: one recorded history entry
+        history_path(c.app.state.settings).write_text(json.dumps(
+            {"suite": "replay", "git_sha": "abc123", "ts": "2026-07-26T00:00:00Z",
+             "pass_rate": 1.0, "quality_mean": 90.0, "quality_min": 80.0,
+             "cost_usd": 0.0}) + "\n")
+        # workspaces + counts
+        c.post("/api/workspaces", json={"name": "Home Ws"})
+
+        body = c.get("/api/home").json()
+    finally:
+        c.app.state.controls.pop("run-live", None)
+        loop.close()
+
+    assert body["errors"] == []
+    assert body["attention"] == [{
+        "task_id": "run-live", "project": "default", "kind": "ask", "id": "ask-1",
+        "agent": "coder", "options": ["sqlite", "postgres"], "question": "Which DB?"}]
+    assert [r["task_id"] for r in body["running"]] == ["run-live"]
+    assert [q["task_id"] for q in body["queued"]] == ["run-wait"]
+    assert body["queued"][0]["position"] == 1
+    recent = body["recent"]
+    assert [r["task_id"] for r in recent] == ["run-done"]
+    assert recent[0] == {"task_id": "run-done", "title": "Shipped",
+                         "project": "default", "status": "completed", "quality": 88,
+                         "cost_usd": 1.25, "ended_at": recent[0]["ended_at"]}
+    assert recent[0]["ended_at"] is not None
+    assert body["benchmarks"]["latest"]["git_sha"] == "abc123"
+    assert body["benchmarks"]["series"][0]["sha"] == "abc123"
+    assert body["workspaces"] == [{"slug": "home-ws", "name": "Home Ws", "projects": 0}]
+    assert body["counts"]["workspaces"] == 1
+
+
+def test_home_answered_attention_requests_disappear(tmp_path):
+    from ai_dev_assistant.orchestration.events import Event
+    from ai_dev_assistant.orchestration.run_control import RunControl
+    from ai_dev_assistant.web.server import Broker
+
+    c = _client(tmp_path)
+    c.app.state.runs.start("run-ans", "t", project="default")
+    c.app.state.running.add("run-ans")
+    ctrl = RunControl()
+    loop = asyncio.new_event_loop()
+    try:
+        fut = loop.create_future()
+        ctrl._pending["permission-1"] = fut
+        c.app.state.controls["run-ans"] = ctrl
+        broker = Broker()
+        broker.publish(Event("permission", "[coder] rm -rf?", {
+            "id": "permission-1", "agent": "coder", "request": "delete build dir"}))
+        c.app.state.brokers["run-ans"] = broker
+        body = c.get("/api/home").json()
+        assert body["attention"][0]["kind"] == "permission"
+        assert body["attention"][0]["request"] == "delete build dir"
+        fut.set_result("ALLOW ONCE")  # answered -> no longer needs attention
+        assert c.get("/api/home").json()["attention"] == []
+    finally:
+        c.app.state.controls.pop("run-ans", None)
+        loop.close()

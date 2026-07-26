@@ -32,8 +32,11 @@ from pydantic import BaseModel
 
 from .. import analytics, config, github, notify, playbooks, projects, search, vcs
 from .. import gc as workspace_gc
-from ..agents.registry import build_agents
+from .. import workspaces as workspaces_mod
+from ..agents import custom as custom_agents
+from ..agents.registry import build_agents, builtin_agent_names
 from ..config import Settings
+from ..evals import history as eval_history
 from ..engine import Engine
 from ..knowledge import combine
 from ..knowledge.base import KnowledgeBase
@@ -253,6 +256,10 @@ class RunRequest(BaseModel):
     continue_from: str | None = None  # re-engage: continue this completed task's workspace + context
     # Clean break: repo_path/repo_url/repo_ref are gone — the run's *project* owns the repo.
     git_finalize: bool | None = None  # commit the workspace to a new branch at the end
+    # Additive attribution: set when a workspace run expanded into this request
+    # (POST /api/workspaces/{ws}/run) — carried in the queue payload, never read
+    # by the run machinery itself.
+    workspace: str | None = None
 
 
 class ProjectRequest(BaseModel):
@@ -338,6 +345,38 @@ class ABRequest(BaseModel):
 
 class LoginRequest(BaseModel):
     token: str = ""
+
+
+class WorkspaceCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+    projects: list[str] | None = None   # initial members (must exist; moves them here)
+
+
+class WorkspacePatchRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+
+
+class WorkspaceMemberRequest(BaseModel):
+    project: str
+
+
+class WorkspaceDepsRequest(BaseModel):
+    deps: dict[str, list[str]] | None = None  # {slug: [upstream slugs]}; None/{} clears
+
+
+class WorkspaceRunRequest(BaseModel):
+    prompt: str
+    title: str | None = None
+    effort: str | None = None
+    model: str | None = None
+    budget: float | None = None
+    subset: list[str] | None = None  # run only these members (validated against the ws)
+
+
+class AgentSaveRequest(BaseModel):
+    spec: dict[str, Any]
 
 
 def create_app(settings: Settings | None = None, host: str | None = None,
@@ -755,6 +794,8 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                 "memory_scope": req.memory_scope, "continue_from": req.continue_from,
                 "git_finalize": req.git_finalize,
             }
+        if req.workspace:  # additive workspace attribution (never read by _start)
+            payload["workspace"] = req.workspace
         plan_title = (req.plan or {}).get("title") if req.plan else None
         app.state.runs.enqueue(task_id, req.prompt, req.title or plan_title, payload)
         _pump()  # auto-run if a slot is free
@@ -1033,6 +1074,125 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             "agents": app.state.runs.agent_track_record(),
         })
 
+    # ---- Home aggregation: one read-only JSON for the console's home screen.
+    # Each section is computed independently and never raises — a failing section
+    # yields its empty default plus a line in "errors".
+    @app.get("/api/home")
+    async def get_home() -> JSONResponse:
+        out: dict[str, Any] = {
+            "attention": [], "running": [], "queued": [], "recent": [],
+            "spend": {}, "benchmarks": {}, "workspaces": [], "counts": {},
+            "errors": [],
+        }
+
+        def _err(section: str, exc: Exception) -> None:
+            out["errors"].append(f"{section}: {exc}")
+
+        # Open ask/permission requests across RUNNING tasks: RunControl tracks the
+        # pending ids; the question/agent/options detail lives on the broker's
+        # ask/permission events (engine attention hook), matched by request id.
+        try:
+            for tid, ctrl in list(app.state.controls.items()):
+                pending = {rid for rid, fut in dict(getattr(ctrl, "_pending", {})).items()
+                           if not fut.done()}
+                if not pending:
+                    continue
+                row = app.state.runs.get(tid) or {}
+                broker = app.state.brokers.get(tid)
+                for ev in list(broker.events) if broker is not None else []:
+                    data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
+                    rid = data.get("id")
+                    if ev.get("type") not in ("ask", "permission") or rid not in pending:
+                        continue
+                    pending.discard(rid)
+                    text = (data.get("question") or data.get("request")
+                            or ev.get("message") or "")
+                    item = {"task_id": tid, "project": _project_of_run(row),
+                            "kind": ev["type"], "id": rid,
+                            "agent": str(data.get("agent") or ""),
+                            "options": list(data.get("options") or [])}
+                    item["question" if ev["type"] == "ask" else "request"] = text
+                    out["attention"].append(item)
+        except Exception as exc:  # noqa: BLE001
+            _err("attention", exc)
+
+        try:
+            for tid in sorted(app.state.running):
+                r = app.state.runs.get(tid) or {}
+                item = {"task_id": tid, "title": _title_of(r),
+                        "project": _project_of_run(r)}
+                if r.get("subtasks_total"):  # progress only when cheaply available
+                    item["progress"] = {"passed": r.get("subtasks_passed"),
+                                        "total": r.get("subtasks_total")}
+                out["running"].append(item)
+        except Exception as exc:  # noqa: BLE001
+            _err("running", exc)
+
+        try:
+            positions = app.state.runs.queue_positions()
+            for p in app.state.runs.queue_pending():
+                payload = p.get("payload") or {}
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        payload = {}
+                if len(payload.get("projects") or []) >= 2:
+                    p_slug = _MULTI_PROJECT
+                else:
+                    p_slug = projects.resolve(settings, payload.get("project"))
+                out["queued"].append({"task_id": p["task_id"], "title": _title_of(p),
+                                      "project": p_slug,
+                                      "position": positions.get(p["task_id"])})
+        except Exception as exc:  # noqa: BLE001
+            _err("queued", exc)
+
+        try:
+            recent = []
+            for r in app.state.runs.list(limit=100):
+                if (r.get("status") or "") not in _TERMINAL_STATUSES:
+                    continue
+                recent.append({"task_id": r.get("id"), "title": _title_of(r),
+                               "project": _project_of_run(r), "status": r.get("status"),
+                               "quality": r.get("quality_score"),
+                               "cost_usd": r.get("cost_usd"),
+                               "ended_at": r.get("ended_at")})
+                if len(recent) == 10:
+                    break
+            out["recent"] = recent
+        except Exception as exc:  # noqa: BLE001
+            _err("recent", exc)
+
+        try:
+            out["spend"] = await asyncio.to_thread(
+                analytics.spend_overview, app.state.base_settings, days=30)
+        except Exception as exc:  # noqa: BLE001
+            _err("spend", exc)
+
+        try:  # graceful when empty: {"latest": None, "delta": None, "series": []}
+            out["benchmarks"] = await asyncio.to_thread(eval_history.trend_report, settings)
+        except Exception as exc:  # noqa: BLE001
+            _err("benchmarks", exc)
+
+        ws_entries: list[dict[str, Any]] = []
+        try:
+            ws_entries = workspaces_mod.list_workspaces(settings)
+            out["workspaces"] = [{"slug": w["slug"], "name": w["name"],
+                                  "projects": len(w.get("project_slugs") or [])}
+                                 for w in ws_entries]
+        except Exception as exc:  # noqa: BLE001
+            _err("workspaces", exc)
+
+        try:
+            out["counts"] = {
+                "projects": len(projects.list_projects(settings)),
+                "workspaces": len(ws_entries),
+                "custom_agents": len(custom_agents.list_custom_agents(settings)),
+            }
+        except Exception as exc:  # noqa: BLE001
+            _err("counts", exc)
+        return JSONResponse(out)
+
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
         return JSONResponse({"status": "ok"})
@@ -1234,22 +1394,55 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             "task_branch": r.get("task_branch"), "review_target": r.get("review_target"),
         } for r in rows]})
 
+    # ---- Agents: the built-in roster + user-defined custom agents (agents/custom.py).
+    # New runs pick customs up automatically — Engine.__init__ calls
+    # build_agents(settings) per run, which composes customs with the built-ins.
     @app.get("/api/agents")
     async def list_agents() -> JSONResponse:
-        agents = build_agents(app.state.base_settings)  # tool roster follows console edits
-        return JSONResponse([
-            {
-                "name": a.name,
+        roster = build_agents(app.state.base_settings)  # tool roster follows console edits
+        custom_specs = custom_agents.list_custom_agents(settings)
+        custom_names = {s.name for s in custom_specs}
+        return JSONResponse({
+            "builtin": [{
+                "name": a.profile.name,
                 "description": a.profile.description,
                 "when_to_use": a.profile.when_to_use,
                 "tools": a.profile.tools,
-            }
-            for a in agents.values()
-        ])
+                "effort": a.profile.effort,
+            } for a in roster.values() if a.profile.name not in custom_names],
+            # Raw stored specs (incl. system_prompt/model) so the UI can edit them.
+            "custom": [s.to_dict() for s in custom_specs],
+            "tools": sorted(custom_agents.toolbox_tool_names()),
+        })
+
+    @app.post("/api/agents")
+    async def save_agent(req: AgentSaveRequest) -> JSONResponse:
+        try:
+            saved = custom_agents.save_custom_agent(settings, req.spec)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, "agent": saved.to_dict()})
+
+    @app.delete("/api/agents/{name}")
+    async def delete_agent(name: str) -> JSONResponse:
+        slug = (name or "").strip().lower()
+        if slug in builtin_agent_names():
+            return JSONResponse({"error": f"'{slug}' is a built-in agent and cannot be deleted"},
+                                status_code=400)
+        if not custom_agents.delete_custom_agent(settings, slug):
+            return JSONResponse({"error": f"unknown custom agent: {slug}"}, status_code=404)
+        return JSONResponse({"ok": True})
 
     @app.get("/api/projects")
     async def get_projects() -> JSONResponse:
-        return JSONResponse(projects.list_projects(settings))
+        # Additive "workspace" per item (slug | null) so the sidebar can group.
+        try:
+            ws_of = {m: w["slug"] for w in workspaces_mod.list_workspaces(settings)
+                     for m in w.get("project_slugs", [])}
+        except Exception:  # noqa: BLE001 — grouping is best-effort, never blocks the list
+            ws_of = {}
+        return JSONResponse([{**p, "workspace": ws_of.get(p.get("slug"))}
+                             for p in projects.list_projects(settings)])
 
     @app.post("/api/projects")
     async def add_project(req: ProjectRequest) -> JSONResponse:
@@ -1386,6 +1579,88 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse({"ok": True})
+
+    # ---- Workspaces: named groups of inter-related projects (workspaces.py).
+    # Entries are returned as stored/normalized: {slug, name, description,
+    # created_at, project_slugs, default_deps}. A workspace run expands via
+    # workspace_run_spec and re-enters POST /api/run's own handler, so it is
+    # byte-identical to a manual projects+project_deps run (plus the additive
+    # "workspace" payload key for attribution).
+
+    def _ws_error(exc: ValueError) -> JSONResponse:
+        msg = str(exc)
+        code = 404 if msg.startswith("unknown workspace") else 400
+        return JSONResponse({"error": msg}, status_code=code)
+
+    @app.get("/api/workspaces")
+    async def list_workspaces_endpoint() -> JSONResponse:
+        return JSONResponse(workspaces_mod.list_workspaces(settings))
+
+    @app.post("/api/workspaces")
+    async def create_workspace_endpoint(req: WorkspaceCreateRequest) -> JSONResponse:
+        if not (req.name or "").strip():
+            return JSONResponse({"error": "name required"}, status_code=400)
+        try:
+            entry = workspaces_mod.create_workspace(
+                settings, req.name, description=req.description or "",
+                projects=req.projects)
+        except ValueError as exc:
+            return _ws_error(exc)
+        return JSONResponse(entry)
+
+    @app.patch("/api/workspaces/{ws}")
+    async def patch_workspace_endpoint(ws: str, req: WorkspacePatchRequest) -> JSONResponse:
+        try:
+            entry = workspaces_mod.update_workspace(
+                settings, ws, name=req.name, description=req.description)
+        except ValueError as exc:
+            return _ws_error(exc)
+        return JSONResponse(entry)
+
+    @app.delete("/api/workspaces/{ws}")
+    async def delete_workspace_endpoint(ws: str) -> JSONResponse:
+        workspaces_mod.delete_workspace(settings, ws)  # no-op on unknown; projects survive
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/workspaces/{ws}/projects")
+    async def assign_workspace_project(ws: str, req: WorkspaceMemberRequest) -> JSONResponse:
+        try:
+            entry = workspaces_mod.assign_project(settings, ws, req.project)
+        except ValueError as exc:
+            return _ws_error(exc)
+        return JSONResponse(entry)
+
+    @app.delete("/api/workspaces/{ws}/projects/{project_slug}")
+    async def unassign_workspace_project(ws: str, project_slug: str) -> JSONResponse:
+        try:
+            entry = workspaces_mod.unassign_project(settings, ws, project_slug)
+        except ValueError as exc:
+            return _ws_error(exc)
+        return JSONResponse(entry)
+
+    @app.put("/api/workspaces/{ws}/deps")
+    async def set_workspace_deps_endpoint(ws: str, req: WorkspaceDepsRequest) -> JSONResponse:
+        try:
+            entry = workspaces_mod.set_workspace_deps(settings, ws, req.deps)
+        except ValueError as exc:
+            return _ws_error(exc)  # unknown slug / self-dep / cycle -> 400 with the message
+        return JSONResponse(entry)
+
+    @app.post("/api/workspaces/{ws}/run")
+    async def run_workspace(ws: str, req: WorkspaceRunRequest):
+        try:
+            spec = workspaces_mod.workspace_run_spec(settings, ws, subset=req.subset)
+        except ValueError as exc:
+            return _ws_error(exc)
+        if not spec["projects"]:
+            return JSONResponse({"error": f"workspace '{ws}' has no member projects"},
+                                status_code=400)
+        # Re-enter the exact multi-project run path (validation, payload, enqueue,
+        # pump) — one member collapses to a plain single-project run, same as /api/run.
+        return await start_run(RunRequest(
+            prompt=req.prompt, title=req.title, effort=req.effort, model=req.model,
+            budget=req.budget, projects=spec["projects"],
+            project_deps=(spec["deps"] or None), workspace=ws))
 
     # ---- F4: project home — recent runs (feeds the quality-trend sparkline) ----
     @app.get("/api/projects/{slug}/runs")
@@ -1712,6 +1987,56 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             for tr in kg.all_triples()
         ]
         return JSONResponse({"project": s.project, "nodes": nodes, "edges": edges})
+
+    # ---- Knowledge graph v2: layered/weighted views over the SAME per-project KG
+    # file /api/graph reads (settings.graph_path for the resolved project slug),
+    # opened read-only — these endpoints never call save().
+    _KG_LAYERS = {"domain", "run"}
+
+    def _open_kg(slug: str) -> NetworkXKnowledgeGraph:
+        s = dataclasses.replace(settings, project=projects.resolve(settings, slug))
+        return NetworkXKnowledgeGraph(s.graph_path)
+
+    def _kg_layer(layer: str | None) -> str | None:
+        layer = (layer or "").strip().lower()
+        return layer if layer in _KG_LAYERS else None  # anything else = all layers
+
+    @app.get("/api/projects/{slug}/graph2")
+    async def get_graph2(slug: str, layer: str | None = None, min_weight: int = 1,
+                         limit: int = 250) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+
+        def _view() -> dict[str, Any]:
+            kg = _open_kg(slug)
+            view = kg.export_view(layer=_kg_layer(layer),
+                                  min_weight=max(1, int(min_weight)),
+                                  limit_nodes=max(1, min(int(limit), 2000)))
+            return {"project": slug, **view, "stats": kg.stats()}
+
+        return JSONResponse(await asyncio.to_thread(_view))
+
+    @app.get("/api/projects/{slug}/graph2/search")
+    async def graph2_search(slug: str, q: str = "", limit: int = 20) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        query = (q or "").strip()
+        if not query:
+            return JSONResponse({"project": slug, "query": "", "nodes": []})
+        nodes = await asyncio.to_thread(
+            lambda: _open_kg(slug).search_nodes(query, limit=max(1, min(int(limit), 200))))
+        return JSONResponse({"project": slug, "query": query, "nodes": nodes})
+
+    # :path so canonical node ids containing "/" (file paths) resolve.
+    @app.get("/api/projects/{slug}/graph2/node/{node_id:path}")
+    async def graph2_node(slug: str, node_id: str, depth: int = 1,
+                          layer: str | None = None) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        hood = await asyncio.to_thread(
+            lambda: _open_kg(slug).neighborhood(
+                node_id, depth=max(0, min(int(depth), 5)), layer=_kg_layer(layer)))
+        return JSONResponse({"project": slug, "node": node_id, **hood})
 
     def _read_memory(path: Path, mem_scope: str) -> list[dict[str, Any]]:
         if not path.exists():
