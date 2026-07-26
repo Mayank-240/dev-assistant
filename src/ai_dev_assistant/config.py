@@ -151,6 +151,11 @@ class Settings:
     # --- GitHub poller (token is ENV-ONLY: ADA_GITHUB_TOKEN / GITHUB_TOKEN) ---
     github_repos: str = ""          # "owner/repo=project-slug,..." mapping the poller watches
     github_label: str = "ada"       # only open issues with this label become tasks
+    github_pr_followups: bool = False  # opt-in: reviewer comments on own PRs -> follow-up runs
+
+    # --- Workspace GC (gc.py; nothing is ever deleted automatically — the web/CLI
+    # cleanup actions are explicit, this is just their default retention) ---
+    gc_keep_days: int = 14          # keep finished-task worktrees/branches this many days
 
     # --- Storage / embeddings ---
     embeddings_backend: str = "fastembed"  # "fastembed" | "hash"
@@ -229,6 +234,8 @@ class Settings:
             notify_smtp_starttls=_bool("ADA_NOTIFY_SMTP_STARTTLS", True),
             github_repos=_get("ADA_GITHUB_REPOS", ""),
             github_label=_get("ADA_GITHUB_LABEL", "ada"),
+            github_pr_followups=_bool("ADA_GITHUB_PR_FOLLOWUPS", False),
+            gc_keep_days=_int("ADA_GC_KEEP_DAYS", 14),
             embeddings_backend=_get("ADA_EMBEDDINGS_BACKEND", "fastembed"),
             embed_model=_get("ADA_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
             data_dir=Path(_get("ADA_DATA_DIR", ".ada_data")),
@@ -395,6 +402,12 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "worktree_per_subtask", "group": "Execution & Safety",
      "label": "Worktree per subtask",
      "help": "Isolate parallel subtasks in git worktrees, merged on pass.", "type": "bool"},
+    {"key": "gc_keep_days", "group": "Execution & Safety", "label": "GC retention (days)",
+     "help": "Workspace GC collects the worktrees of finished runs (completed/failed/"
+             "cancelled) and fully-accepted ada/* task branches older than this many days "
+             "— never ada/integration, never resumable runs. Persist-for-review is the "
+             "default: nothing is deleted until you run the explicit cleanup action.",
+     "type": "int"},
     # --- Verification ---
     {"key": "verify_run_tests", "group": "Verification", "label": "Run generated tests",
      "help": "Run generated tests in the workspace after a task.", "type": "bool"},
@@ -459,6 +472,11 @@ SETTINGS_SCHEMA: list[dict] = [
      "type": "str"},
     {"key": "github_label", "group": "GitHub", "label": "Issue label",
      "help": "Only open issues carrying this label are turned into tasks.", "type": "str"},
+    {"key": "github_pr_followups", "group": "GitHub", "label": "PR-comment follow-ups",
+     "help": "Opt-in: watch the assistant's own open PRs (ada/* head branches) for new "
+             "reviewer comments and turn each new comment batch into a follow-up run on "
+             "the existing branch. Every batch starts a billed run — leave off unless you "
+             "want that.", "type": "bool"},
 ]
 
 _SCHEMA_BY_KEY: dict[str, dict] = {e["key"]: e for e in SETTINGS_SCHEMA}

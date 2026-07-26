@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import analytics, config, github, notify, playbooks, projects, search, vcs
+from .. import gc as workspace_gc
 from ..agents.registry import build_agents
 from ..config import Settings
 from ..engine import Engine
@@ -39,7 +40,13 @@ from ..knowledge.base import KnowledgeBase
 from ..knowledge.graph import NetworkXKnowledgeGraph
 from ..llm.errors import LLMError
 from ..llm.schemas import Plan
-from ..memory.store import MemoryStore
+from ..memory.store import (
+    MemoryStore,
+    count_project_memories,
+    delete_project_memory,
+    list_project_memories,
+    update_project_memory,
+)
 from ..orchestration.events import Event
 from ..orchestration.run_control import RunControl
 from ..orchestration.run_store import RunStore, derive_title
@@ -295,7 +302,10 @@ class ScheduleCreateRequest(BaseModel):
     project: str | None = None
     prompt: str
     title: str | None = None
-    every_hours: float
+    # Recurrence is exactly one of every_hours (interval) or cron (5-field
+    # expression) — the ScheduleStore validates and 400s on bad/ambiguous input.
+    every_hours: float | None = None
+    cron: str | None = None
     budget_usd: float = 0.0
 
 
@@ -304,8 +314,18 @@ class SchedulePatchRequest(BaseModel):
     prompt: str | None = None
     title: str | None = None
     every_hours: float | None = None
+    cron: str | None = None  # explicit null reverts a cron row to its interval
     budget_usd: float | None = None
     enabled: bool | None = None
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: str
+
+
+class GcRequest(BaseModel):
+    keep_days: int | None = None   # default: the gc_keep_days setting
+    ids: list[str] | None = None   # restrict removal to these task ids
 
 
 class ABRequest(BaseModel):
@@ -453,17 +473,34 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         events = tuple(e.strip().lower() for e in (live.notify_events or "").split(",")
                        if e.strip())
         desktop = bool(live.notify_desktop) and sys.platform == "darwin"
-        webhook = (live.notify_webhook or "").strip()
+        try:
+            smtp_port = int(live.notify_smtp_port or 587)
+        except (TypeError, ValueError):
+            smtp_port = 587
+        kwargs: dict[str, Any] = dict(
+            webhook_url=(live.notify_webhook or "").strip(),
+            slack_webhook_url=(live.notify_slack_webhook or "").strip(),
+            desktop=desktop,
+            email_to=(live.notify_email_to or "").strip(),
+            smtp_host=(live.notify_smtp_host or "").strip(),
+            smtp_port=smtp_port,
+            smtp_user=(live.notify_smtp_user or "").strip(),
+            smtp_starttls=bool(live.notify_smtp_starttls),
+        )
         if events:
-            return notify.NotifyConfig(webhook_url=webhook, desktop=desktop, events=events)
-        return notify.NotifyConfig(webhook_url=webhook, desktop=desktop)
+            kwargs["events"] = events
+        return notify.NotifyConfig(**kwargs)
+
+    def _notify_channels_configured(cfg: notify.NotifyConfig) -> bool:
+        return bool(cfg.webhook_url or cfg.slack_webhook_url or cfg.desktop
+                    or (cfg.email_to and cfg.smtp_host))
 
     def _dispatch_notify(event: Event, task_id: str, project_slug: str) -> None:
         """Fan a run event out to the configured notify channels. Fire-and-forget:
         the webhook/osascript work runs in a thread, and nothing here ever raises."""
         try:
             cfg = _notify_config(app.state.base_settings)
-            if not (cfg.webhook_url or cfg.desktop):
+            if not _notify_channels_configured(cfg):
                 return
             if not notify.should_notify(cfg, event.type):
                 return
@@ -1544,17 +1581,21 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         if not merge_commit:
             return JSONResponse(
                 {"error": "subtask has no merge commit to accept"}, status_code=409)
-        # projects.accept_commit routes owned checkouts to an in-checkout cherry-pick
-        # and in-place projects to the temp-worktree path; older trees fall back to
-        # vcs.cherry_pick_merge, and with neither landed the action answers 501.
+        # projects.accept_subtask records the cherry-pick sha (accepted_commit) on the
+        # review row — which is what rollback later reverts. Older trees fall back to
+        # accept_commit / vcs.cherry_pick_merge, and with none landed the action is 501.
+        use_accept_subtask = hasattr(projects, "accept_subtask")
         use_accept = hasattr(projects, "accept_commit")
-        if not ((use_accept or hasattr(vcs, "cherry_pick_merge"))
+        if not ((use_accept_subtask or use_accept or hasattr(vcs, "cherry_pick_merge"))
                 and hasattr(app.state.runs, "set_subtask_review")):
             return JSONResponse(
                 {"error": "per-subtask acceptance is not available yet"}, status_code=501)
         slug = _project_of_run(row)
         try:
-            if use_accept:
+            if use_accept_subtask:
+                res = await asyncio.to_thread(
+                    projects.accept_subtask, settings, slug, task_id, subtask_id)
+            elif use_accept:
                 res = await asyncio.to_thread(
                     projects.accept_commit, settings, slug, merge_commit)
             else:
@@ -1576,8 +1617,33 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         if not res.get("merged"):
             return JSONResponse({**res, "error": res.get("error") or "merge failed"},
                                 status_code=409)
-        app.state.runs.set_subtask_review(task_id, subtask_id, "accepted", "")
+        if not use_accept_subtask:  # the wrapper already recorded decision + sha
+            app.state.runs.set_subtask_review(task_id, subtask_id, "accepted", "")
         return JSONResponse({**res, "decision": "accepted"})
+
+    @app.post("/api/runs/{task_id}/subtasks/{subtask_id}/rollback")
+    async def rollback_subtask(task_id: str, subtask_id: str) -> JSONResponse:
+        """Revert a previously accepted subtask's commit on the review target.
+
+        projects.rollback_accept owns the git work and the bookkeeping (decision
+        'rolled_back' + rollback_commit); its dict comes back verbatim — 200 on
+        ok, 409 when there is nothing to roll back or the revert conflicts."""
+        row = app.state.runs.get(task_id)
+        if row is None:
+            return JSONResponse({"error": "unknown task"}, status_code=404)
+        if not hasattr(projects, "rollback_accept"):
+            return JSONResponse({"error": "rollback is not available yet"}, status_code=501)
+        slug = _project_of_run(row)
+        res = await asyncio.to_thread(
+            projects.rollback_accept, settings, slug, task_id, subtask_id)
+        if not res.get("ok"):
+            return JSONResponse(res, status_code=409)
+        b = app.state.brokers.get(task_id)
+        if b is not None:  # a live viewer sees the review state change immediately
+            b.publish(Event("control", f"Subtask {subtask_id} rolled back.",
+                            {"subtask": subtask_id, "decision": "rolled_back",
+                             "rollback_commit": res.get("rollback_commit")}))
+        return JSONResponse(res)
 
     @app.post("/api/tasks/{task_id}/subtasks/{subtask_id}/reject")
     async def reject_subtask(task_id: str, subtask_id: str,
@@ -1669,6 +1735,41 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         out = _read_memory(s.db_path, "project") + _read_memory(s.global_db_path, "global")
         out.sort(key=lambda m: m["created_at"], reverse=True)
         return JSONResponse(out[:300])
+
+    # ---- Memory curation: list / edit / forget a project's memories ----
+    @app.get("/api/projects/{slug}/memories")
+    async def list_memories_endpoint(slug: str, scope: str | None = None,
+                                     limit: int = 200, offset: int = 0) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        limit = max(1, min(int(limit), 1000))
+        offset = max(0, int(offset))
+        rows = await asyncio.to_thread(
+            list_project_memories, settings, slug, scope=scope, limit=limit, offset=offset)
+        total = await asyncio.to_thread(count_project_memories, settings, slug, scope=scope)
+        return JSONResponse({"project": slug, "total": total, "memories": rows})
+
+    @app.patch("/api/projects/{slug}/memories/{mem_id}")
+    async def update_memory_endpoint(slug: str, mem_id: int,
+                                     req: MemoryUpdateRequest) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        content = (req.content or "").strip()
+        if not content:
+            return JSONResponse({"error": "content must not be empty"}, status_code=400)
+        ok = await asyncio.to_thread(update_project_memory, settings, slug, mem_id, content)
+        if not ok:
+            return JSONResponse({"error": "unknown memory"}, status_code=404)
+        return JSONResponse({"ok": True, "id": mem_id, "content": content})
+
+    @app.delete("/api/projects/{slug}/memories/{mem_id}")
+    async def delete_memory_endpoint(slug: str, mem_id: int) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        ok = await asyncio.to_thread(delete_project_memory, settings, slug, mem_id)
+        if not ok:
+            return JSONResponse({"error": "unknown memory"}, status_code=404)
+        return JSONResponse({"ok": True, "id": mem_id})
 
     _WS_HIDDEN = {".git", ".ada_worktrees", ".ada_deps", "__pycache__", ".pytest_cache",
                   "node_modules", ".venv"}
@@ -1897,7 +1998,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             row = app.state.schedules.create(
                 project=projects.resolve(settings, req.project), prompt=req.prompt,
                 title=(req.title or None), every_hours=req.every_hours,
-                budget_usd=float(req.budget_usd or 0.0))
+                cron=req.cron, budget_usd=float(req.budget_usd or 0.0))
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(_schedule_row(row))
@@ -2020,6 +2121,29 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         chunks = await asyncio.to_thread(_ingest)
         return JSONResponse({"chunks": chunks})
 
+    # ---- Workspace GC: dry-run report + explicit cleanup (nothing is automatic;
+    # persist-for-review stays the default — gc_keep_days is only the retention
+    # these two explicit actions use) ----
+    @app.get("/api/projects/{slug}/gc")
+    async def gc_report(slug: str, keep_days: int | None = None) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        keep = max(0, int(keep_days if keep_days is not None
+                          else app.state.base_settings.gc_keep_days))
+        report = await asyncio.to_thread(
+            workspace_gc.cleanup_report, app.state.base_settings, slug, keep)
+        return JSONResponse({**report, "keep_days": keep})
+
+    @app.post("/api/projects/{slug}/gc")
+    async def gc_cleanup(slug: str, req: GcRequest) -> JSONResponse:
+        if not _project_known(slug):
+            return JSONResponse({"error": "unknown project"}, status_code=404)
+        keep = max(0, int(req.keep_days if req.keep_days is not None
+                          else app.state.base_settings.gc_keep_days))
+        res = await asyncio.to_thread(
+            workspace_gc.cleanup, app.state.base_settings, slug, keep, req.ids)
+        return JSONResponse({**res, "keep_days": keep})
+
     # ---- GitHub poller: labeled issues -> runs; finished runs -> PRs ----
     _gh_state_path = settings.data_dir / "github_seen.json"
 
@@ -2029,11 +2153,16 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         except (OSError, ValueError):
             data = None
         if not isinstance(data, dict):
-            return {"seen": [], "tracked": {}}
+            return {"seen": [], "tracked": {}, "pr_seen": {}}
         seen = data.get("seen")
         tracked = data.get("tracked")
+        # pr_seen ("owner/repo#number" -> last-seen comment created_at) is additive:
+        # files written before PR follow-ups landed simply have none.
+        pr_seen = data.get("pr_seen")
         return {"seen": [str(m) for m in seen] if isinstance(seen, list) else [],
-                "tracked": dict(tracked) if isinstance(tracked, dict) else {}}
+                "tracked": dict(tracked) if isinstance(tracked, dict) else {},
+                "pr_seen": ({str(k): str(v) for k, v in pr_seen.items()}
+                            if isinstance(pr_seen, dict) else {})}
 
     def _gh_save_state(state: dict[str, Any]) -> None:
         try:
@@ -2108,6 +2237,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         state = _gh_load_state()
         seen = set(state["seen"])
         tracked: dict[str, Any] = state["tracked"]
+        pr_seen: dict[str, str] = state["pr_seen"]
         dirty = False
         started = 0
         for repo, slug in cfg.repo_map.items():
@@ -2141,6 +2271,58 @@ def create_app(settings: Settings | None = None, host: str | None = None,
                 started += 1
                 await asyncio.to_thread(client.comment, repo, issue.get("number"),
                                         f"ADA started task {task_id}")
+        # Follow-up pass (opt-in via github_pr_followups): new reviewer comments on
+        # the assistant's own open PRs (ada/* head branches) become follow-up runs.
+        # A branch named ada/<task-id> of a known run RE-ENGAGES that task — the
+        # payload's continue_from is the same lineage path POST /api/run uses
+        # (set_parent + workspace/context continuation); otherwise the follow-up is
+        # a fresh run on the repo's mapped project. Dedupe: pr_seen keeps the last
+        # comment timestamp per PR, and list_pr_comments(since=...) is strict.
+        if app.state.base_settings.github_pr_followups:
+            for repo, slug in cfg.repo_map.items():
+                prs = await asyncio.to_thread(client.list_open_prs, repo)
+                for pr in prs:
+                    if not github.is_own_pr(pr):
+                        continue
+                    number = pr.get("number")
+                    if number is None:
+                        continue
+                    key = f"{repo}#{number}"
+                    comments = await asyncio.to_thread(
+                        client.list_pr_comments, repo, number, pr_seen.get(key))
+                    if not comments:
+                        continue
+                    latest = max(str(c.get("created_at") or "") for c in comments)
+                    prompt = github.comments_to_followup(pr, comments)
+                    if not prompt:  # junk batch — advance the cursor, never retry it
+                        if latest:
+                            pr_seen[key] = latest
+                            dirty = True
+                        continue
+                    branch = str(pr.get("head") or "")
+                    parent = branch.removeprefix(github.OWN_BRANCH_PREFIX)
+                    parent_row = app.state.runs.get(parent) if parent else None
+                    continue_from = parent if parent_row is not None else None
+                    proj = _project_of_run(parent_row) if parent_row is not None else slug
+                    title = f"Follow-up: {str(pr.get('title') or '').strip() or branch}"
+                    task_id = new_task_id()
+                    payload = {
+                        "prompt": prompt, "plan": None, "effort": None, "model": None,
+                        "budget": None, "title": title, "project": proj,
+                        "memory_scope": None, "continue_from": continue_from,
+                        "git_finalize": None,
+                    }
+                    try:
+                        app.state.brokers[task_id] = Broker()
+                        app.state.runs.enqueue(task_id, prompt, title, payload)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[ai-dev-assistant] github: follow-up enqueue for {key} "
+                              f"failed: {exc}", flush=True)
+                        continue
+                    if latest:
+                        pr_seen[key] = latest
+                    dirty = True
+                    started += 1
         # Completion pass: finished tracked runs -> branch push + PR, then untrack.
         for task_id in list(tracked):
             ref = tracked.get(task_id) or {}
@@ -2155,7 +2337,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
             tracked.pop(task_id, None)
             dirty = True
         if dirty:
-            _gh_save_state({"seen": sorted(seen), "tracked": tracked})
+            _gh_save_state({"seen": sorted(seen), "tracked": tracked, "pr_seen": pr_seen})
         if started:
             _pump()
 

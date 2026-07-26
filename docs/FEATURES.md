@@ -129,3 +129,33 @@ specified in [PLAN.md](PLAN.md) and not yet built.
   token env-only via ADA_GITHUB_TOKEN).
 - A/B replay smoke from the UI; KB drag-and-drop upload; knowledge-graph
   filter/focus; timeline zoom with per-subtask cost; first-run tour.
+
+## QoL wave (shipped)
+- Memory curation API: `GET/PATCH/DELETE /api/projects/{slug}/memories[/{id}]`
+  — paginated listing (limit/offset/scope), edit (re-embeds), forget (drops the
+  vector too); 404 on unknown project or memory id.
+- Workspace GC: `GET /api/projects/{slug}/gc` (dry-run report) and
+  `POST /api/projects/{slug}/gc` (`{keep_days?, ids?}`) reclaim worktrees of
+  finished runs and fully-accepted `ada/*` branches older than the retention
+  (`gc_keep_days` setting, default 14; env `ADA_GC_KEEP_DAYS`). Conservative by
+  design: persist-for-review stays the default, `ada/integration` and resumable
+  runs are never collected, and nothing runs automatically.
+- Rollback of accepted subtasks: Accept now records the cherry-pick sha
+  (`accepted_commit`), and `POST /api/runs/{task_id}/subtasks/{subtask_id}/rollback`
+  reverts exactly that commit on the review target (owned checkouts in place;
+  in-place projects via `ada/integration` temp worktree) — 409 with the error on
+  conflict, never forced.
+- GitHub PR-comment follow-ups (opt-in `github_pr_followups` /
+  `ADA_GITHUB_PR_FOLLOWUPS`): the poller watches the assistant's own open PRs;
+  each new reviewer comment batch becomes a follow-up run — re-engaging the
+  original task (continue_from lineage, same workspace + `ada/<task-id>` branch)
+  when the head branch maps to a known run, else a fresh run on the repo's
+  project. Per-PR last-seen timestamps persist in `github_seen.json`; every
+  batch is a billed run.
+- Cron schedules: schedule create/update accept a 5-field `cron` expression as
+  an alternative to `every_hours` (mutually exclusive; validated with a clear
+  400 on bad expressions); the 60s tick fires on matching local-time minutes.
+- Slack + email notification channels: Slack incoming webhook (same SSRF guard
+  and redaction as the generic webhook) and stdlib SMTP email (password
+  env-only via `ADA_SMTP_PASSWORD`) ride the same notify dispatch as
+  webhook/desktop, configurable live from the settings console.

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import json
 import subprocess
 
@@ -374,31 +376,26 @@ def test_accept_unknown_subtask_is_404(tmp_path):
 
 
 def _stub_accept_contracts(monkeypatch, c, tid, result):
-    """Pin the concurrent contracts: subtask rows w/ merge_commit, the review
-    recorder, and projects.accept_commit returning `result`."""
-    states = {"s1": {"status": "passed", "attempts": 1, "result": "done",
-                     "verdict": json.dumps({"passed": True, "score": 92}),
-                     "merge_commit": "abc1234def", "changed": json.dumps(["a.py"])}}
-    monkeypatch.setattr(c.app.state.runs, "get_subtask_states",
-                        lambda rid: states if rid == tid else {}, raising=False)
-    recorded = {}
-    monkeypatch.setattr(
-        c.app.state.runs, "set_subtask_review",
-        lambda rid, sid, decision, comment: recorded.update(
-            run=rid, sid=sid, decision=decision, comment=comment),
-        raising=False)
+    """Pin the accept contracts: a subtask row with a merge commit in the real
+    store, plus projects.accept_commit (the git half) returning `result`. The
+    endpoint routes through projects.accept_subtask, which calls accept_commit
+    and records the decision + cherry-pick sha on subtask_reviews itself."""
+    c.app.state.runs.checkpoint_subtask(
+        tid, "s1", status="passed", attempts=1, result="done",
+        verdict_json=json.dumps({"passed": True, "score": 92}),
+        merge_commit="abc1234def", changed_json=json.dumps(["a.py"]))
     calls = {}
     def fake_accept(settings, slug, sha):
         calls.update(slug=slug, sha=sha)
         return result
     monkeypatch.setattr(projects, "accept_commit", fake_accept, raising=False)
-    return recorded, calls
+    return calls
 
 
 def test_accept_success_merges_and_records_decision(tmp_path, monkeypatch):
     c = _client(tmp_path)
     _seed_terminal_run(c)
-    recorded, calls = _stub_accept_contracts(
+    calls = _stub_accept_contracts(
         monkeypatch, c, "task-r",
         {"merged": True, "conflict": False, "files": ["a.py"], "commit": "deadbeef"})
     r = c.post("/api/tasks/task-r/subtasks/s1/accept")
@@ -406,20 +403,23 @@ def test_accept_success_merges_and_records_decision(tmp_path, monkeypatch):
     body = r.json()
     assert body["merged"] is True and body["decision"] == "accepted"
     assert calls == {"slug": "default", "sha": "abc1234def"}
-    assert recorded == {"run": "task-r", "sid": "s1", "decision": "accepted", "comment": ""}
+    review = c.app.state.runs.get_subtask_reviews("task-r")["s1"]
+    assert review["decision"] == "accepted"
+    # rollback bookkeeping: the cherry-pick sha the acceptance created is recorded
+    assert review["accepted_commit"] == "deadbeef"
 
 
 def test_accept_conflict_is_409_with_files(tmp_path, monkeypatch):
     c = _client(tmp_path)
     _seed_terminal_run(c)
-    recorded, _calls = _stub_accept_contracts(
+    _stub_accept_contracts(
         monkeypatch, c, "task-r",
         {"merged": False, "conflict": True, "files": ["a.py", "b.py"]})
     r = c.post("/api/tasks/task-r/subtasks/s1/accept")
     assert r.status_code == 409
     body = r.json()
     assert body["conflict"] is True and body["files"] == ["a.py", "b.py"]
-    assert recorded == {}  # a conflicted merge records no decision
+    assert c.app.state.runs.get_subtask_reviews("task-r") == {}  # no decision recorded
 
 
 def test_reject_records_review_and_feedback(tmp_path, monkeypatch):
@@ -932,3 +932,337 @@ def test_landing_and_console_open_with_auth_enabled(tmp_path):
     assert c.get("/").status_code == 200
     assert c.get("/app").status_code == 200
     assert c.get("/api/projects").status_code == 401
+
+
+# ---- QoL wave: memory curation API ----
+
+def _mem_store(c, slug="default"):
+    from ai_dev_assistant.memory.store import MemoryStore
+    return MemoryStore(dataclasses.replace(c.app.state.settings, project=slug))
+
+
+def test_project_memories_list_update_delete_roundtrip(tmp_path):
+    c = _client(tmp_path)
+    store = _mem_store(c)
+    store.remember("longterm", "prefer recursive descent parsers")
+    store.remember("longterm", "tests live under tests/")
+    store.remember("episodic", "run 42 fixed the tokenizer")
+    store.close()
+
+    body = c.get("/api/projects/default/memories").json()
+    assert body["project"] == "default" and body["total"] == 3
+    rows = body["memories"]  # newest-first
+    assert [r["content"] for r in rows] == ["run 42 fixed the tokenizer",
+                                            "tests live under tests/",
+                                            "prefer recursive descent parsers"]
+    assert all(r["project"] == "default" for r in rows)
+    assert {"id", "scope", "key", "content", "metadata", "created_at"} <= set(rows[0])
+
+    # scope filter and pagination
+    lt = c.get("/api/projects/default/memories", params={"scope": "longterm"}).json()
+    assert lt["total"] == 2 and all(r["scope"] == "longterm" for r in lt["memories"])
+    page = c.get("/api/projects/default/memories",
+                 params={"limit": 1, "offset": 1}).json()
+    assert page["total"] == 3 and len(page["memories"]) == 1
+    assert page["memories"][0]["content"] == "tests live under tests/"
+
+    # edit round-trips
+    mid = rows[-1]["id"]
+    r = c.patch(f"/api/projects/default/memories/{mid}",
+                json={"content": "prefer PEG parsers"})
+    assert r.status_code == 200 and r.json() == {"ok": True, "id": mid,
+                                                 "content": "prefer PEG parsers"}
+    listed = c.get("/api/projects/default/memories").json()["memories"]
+    assert any(m["id"] == mid and m["content"] == "prefer PEG parsers" for m in listed)
+
+    # delete removes the row
+    assert c.delete(f"/api/projects/default/memories/{mid}").json()["ok"] is True
+    after = c.get("/api/projects/default/memories").json()
+    assert after["total"] == 2 and all(m["id"] != mid for m in after["memories"])
+
+
+def test_project_memories_404s_and_validation(tmp_path):
+    c = _client(tmp_path)
+    # unknown project on every verb
+    assert c.get("/api/projects/ghost/memories").status_code == 404
+    assert c.patch("/api/projects/ghost/memories/1",
+                   json={"content": "x"}).status_code == 404
+    assert c.delete("/api/projects/ghost/memories/1").status_code == 404
+    # known project without a memory database yet: empty listing, never an error
+    assert c.get("/api/projects/default/memories").json() == {
+        "project": "default", "total": 0, "memories": []}
+    # known project, unknown memory id
+    store = _mem_store(c)
+    store.remember("longterm", "seed")
+    store.close()
+    r = c.patch("/api/projects/default/memories/999", json={"content": "x"})
+    assert r.status_code == 404 and "memory" in r.json()["error"]
+    assert c.delete("/api/projects/default/memories/999").status_code == 404
+    # blank content is rejected before touching the store
+    r = c.patch("/api/projects/default/memories/1", json={"content": "   "})
+    assert r.status_code == 400 and "content" in r.json()["error"]
+
+
+# ---- QoL wave: workspace GC endpoints ----
+
+def test_gc_report_and_cleanup_endpoints(tmp_path):
+    from test_gc_rollback import _make_task
+    c = _client(tmp_path)
+    settings = c.app.state.settings
+    slug = projects.create_project(settings, "Gcweb")["slug"]
+    repo = projects.project_checkout(settings, slug)
+    _make_task(settings, slug, repo, "t-old")
+
+    assert c.get("/api/projects/ghost/gc").status_code == 404
+    assert c.post("/api/projects/ghost/gc", json={}).status_code == 404
+
+    # the default retention (gc_keep_days=14) keeps a fresh terminal run
+    body = c.get(f"/api/projects/{slug}/gc").json()
+    assert body["keep_days"] == 14
+    assert body["worktrees"] == [] and body["branches"] == []
+    # keep_days=0 lists the worktree (branch kept: subtask never accepted)
+    body = c.get(f"/api/projects/{slug}/gc", params={"keep_days": 0}).json()
+    assert [w["task_id"] for w in body["worktrees"]] == ["t-old"]
+    assert body["branches"] == []
+
+    res = c.post(f"/api/projects/{slug}/gc", json={"keep_days": 0}).json()
+    assert [w["task_id"] for w in res["removed"]["worktrees"]] == ["t-old"]
+    assert res["skipped"] == []
+    assert not (settings.workspace_dir / slug / "worktrees" / "t-old").exists()
+    # idempotent: a second pass (even asking for the id) removes nothing
+    res2 = c.post(f"/api/projects/{slug}/gc",
+                  json={"keep_days": 0, "ids": ["t-old"]}).json()
+    assert res2["removed"] == {"worktrees": [], "branches": []}
+    assert res2["skipped"] and res2["skipped"][0]["task_id"] == "t-old"
+
+
+def test_gc_keep_days_setting_is_the_default(tmp_path):
+    from test_gc_rollback import _make_task
+    c = _client(tmp_path)
+    settings = c.app.state.settings
+    slug = projects.create_project(settings, "Gcs")["slug"]
+    repo = projects.project_checkout(settings, slug)
+    _make_task(settings, slug, repo, "t-x")
+    # a console edit applies live: GET without a param uses the setting
+    assert c.patch("/api/settings", json={"gc_keep_days": 0}).status_code == 200
+    body = c.get(f"/api/projects/{slug}/gc").json()
+    assert body["keep_days"] == 0
+    assert [w["task_id"] for w in body["worktrees"]] == ["t-x"]
+
+
+# ---- QoL wave: accept records the sha; rollback endpoint ----
+
+def test_accept_and_rollback_roundtrip_real_repo(tmp_path):
+    from test_gc_rollback import _make_task
+    c = _client(tmp_path)
+    settings = c.app.state.settings
+    slug = projects.create_project(settings, "Rbw")["slug"]
+    repo = projects.project_checkout(settings, slug)
+    _make_task(settings, slug, repo, "t1", filename="feat.txt", content="feature\n")
+
+    # rollback before any accept: nothing recorded -> 409
+    r = c.post("/api/runs/t1/subtasks/s1/rollback")
+    assert r.status_code == 409 and "no recorded accept commit" in r.json()["error"]
+
+    r = c.post("/api/tasks/t1/subtasks/s1/accept")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["merged"] is True and body["decision"] == "accepted"
+    review = c.app.state.runs.get_subtask_reviews("t1")["s1"]
+    assert review["decision"] == "accepted"
+    assert review["accepted_commit"] == body["commit"]  # sha recorded for rollback
+    assert (repo / "feat.txt").exists()
+
+    r = c.post("/api/runs/t1/subtasks/s1/rollback")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True and body["reverted"] and body["rollback_commit"]
+    assert not (repo / "feat.txt").exists()
+    review = c.app.state.runs.get_subtask_reviews("t1")["s1"]
+    assert review["decision"] == "rolled_back"
+    assert review["rollback_commit"] == body["rollback_commit"]
+
+    # a second rollback has nothing accepted left to revert
+    r = c.post("/api/runs/t1/subtasks/s1/rollback")
+    assert r.status_code == 409 and "not in an accepted state" in r.json()["error"]
+    # unknown task
+    assert c.post("/api/runs/ghost/subtasks/s1/rollback").status_code == 404
+
+
+def test_rollback_endpoint_conflict_is_409(tmp_path):
+    from test_gc_rollback import _make_task, git
+    c = _client(tmp_path)
+    settings = c.app.state.settings
+    slug = projects.create_project(settings, "Rbc")["slug"]
+    repo = projects.project_checkout(settings, slug)
+    (repo / "file.txt").write_text("one\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "seed")
+    _make_task(settings, slug, repo, "t1", filename="file.txt", content="two\n")
+    assert c.post("/api/tasks/t1/subtasks/s1/accept").status_code == 200
+    # a later commit rewrites the same content -> the revert conflicts
+    (repo / "file.txt").write_text("three\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "later change")
+
+    r = c.post("/api/runs/t1/subtasks/s1/rollback")
+    assert r.status_code == 409
+    body = r.json()
+    assert body["ok"] is False and body.get("conflict") is True and body["error"]
+    # not forced: the accept decision survives and the repo is left clean
+    assert c.app.state.runs.get_subtask_reviews("t1")["s1"]["decision"] == "accepted"
+    assert git(repo, "status", "--porcelain") == ""
+
+
+# ---- QoL wave: cron schedules over the API ----
+
+def test_schedule_create_with_cron_and_validation(tmp_path):
+    c = _client(tmp_path)
+    r = c.post("/api/schedules", json={"prompt": "nightly audit", "cron": "0 3 * * *"})
+    assert r.status_code == 200, r.text
+    row = r.json()
+    assert row["cron"] == "0 3 * * *" and row["every_hours"] is None
+    assert row["next_run_at"] is not None
+    # interval creation still works exactly as before
+    r = c.post("/api/schedules", json={"prompt": "hourly", "every_hours": 1})
+    assert r.status_code == 200 and r.json()["cron"] is None
+    # mutually exclusive with every_hours
+    r = c.post("/api/schedules",
+               json={"prompt": "x", "cron": "0 3 * * *", "every_hours": 4})
+    assert r.status_code == 400 and "not both" in r.json()["error"]
+    # neither recurrence given
+    r = c.post("/api/schedules", json={"prompt": "x"})
+    assert r.status_code == 400
+    # invalid expressions surface the validator's message
+    r = c.post("/api/schedules", json={"prompt": "x", "cron": "61 * * * *"})
+    assert r.status_code == 400 and "out of range" in r.json()["error"]
+    r = c.post("/api/schedules", json={"prompt": "x", "cron": "* *"})
+    assert r.status_code == 400 and "5 fields" in r.json()["error"]
+
+
+def test_schedule_patch_cron(tmp_path):
+    c = _client(tmp_path)
+    sid = c.post("/api/schedules",
+                 json={"prompt": "x", "every_hours": 24}).json()["id"]
+    patched = c.patch(f"/api/schedules/{sid}", json={"cron": "*/15 * * * *"}).json()
+    assert patched["cron"] == "*/15 * * * *"
+    assert patched["next_run_at"] is not None
+    r = c.patch(f"/api/schedules/{sid}", json={"cron": "bogus"})
+    assert r.status_code == 400 and "cron" in r.json()["error"]
+
+
+# ---- QoL wave: GitHub PR-comment follow-ups ----
+
+def _qpayload(entry):
+    payload = entry["payload"]
+    return json.loads(payload) if isinstance(payload, str) else payload
+
+
+def _followup_client(tmp_path, monkeypatch, *, enable=True):
+    monkeypatch.setenv("ADA_GITHUB_TOKEN", "gh-test-token")
+    c = _client(tmp_path)
+    c.app.state.paused = True  # keep the pump from ever launching a real engine
+    patch = {"github_repos": "acme/widget=default"}
+    if enable:
+        patch["github_pr_followups"] = True
+    assert c.patch("/api/settings", json=patch).status_code == 200
+    calls = []
+
+    comments = [{"id": 11, "user": {"login": "reviewer"},
+                 "body": "please rename the helper",
+                 "created_at": "2026-07-20T10:00:00Z"}]
+
+    def transport(method, url, headers, body):
+        calls.append((method, url, body))
+        assert "gh-test-token" in headers.get("Authorization", "")
+        if "/repos/acme/widget/issues?" in url:
+            return 200, []
+        if url.endswith("/user"):
+            return 200, {"login": "ada-bot"}
+        if "/repos/acme/widget/pulls?" in url:
+            return 200, [
+                {"number": 5, "title": "feat: caching",
+                 "head": {"ref": "ada/task-known"}, "body": ""},
+                {"number": 6, "title": "chore: cleanup",
+                 "head": {"ref": "ada/task-unknown"}, "body": ""},
+                {"number": 7, "title": "human PR",
+                 "head": {"ref": "feature/human"}, "body": ""},
+            ]
+        if "/issues/5/comments" in url or "/issues/6/comments" in url:
+            return 200, comments
+        if "/pulls/5/comments" in url or "/pulls/6/comments" in url:
+            return 200, []
+        if "/issues/7/comments" in url or "/pulls/7/comments" in url:
+            raise AssertionError("comments fetched for a PR that is not our own")
+        return 200, []
+
+    c.app.state.github_transport = transport
+    return c, calls
+
+
+def test_github_pr_followups_reengage_fresh_and_dedupe(tmp_path, monkeypatch):
+    c, _calls = _followup_client(tmp_path, monkeypatch)
+    # the branch ada/task-known maps to a known finished run on 'default'
+    st = c.app.state.runs
+    st.start("task-known", "original work", title="Original", project="default")
+    st.set_status("task-known", "completed")
+
+    asyncio.run(c.app.state.github_tick())
+    pending = c.app.state.runs.queue_pending()
+    assert len(pending) == 2
+    payloads = sorted((_qpayload(p) for p in pending),
+                      key=lambda p: p["prompt"])
+    reengage = next(p for p in payloads if "PR #5" in p["prompt"])
+    fresh = next(p for p in payloads if "PR #6" in p["prompt"])
+    # known branch -> re-engagement of the original task (continue_from lineage)
+    assert reengage["continue_from"] == "task-known"
+    assert reengage["project"] == "default"
+    assert reengage["title"] == "Follow-up: feat: caching"
+    assert reengage["prompt"].startswith('Address reviewer feedback on PR #5')
+    assert "please rename the helper" in reengage["prompt"]
+    assert "ada/task-known" in reengage["prompt"]
+    # unknown branch -> a fresh run on the repo's mapped project
+    assert fresh["continue_from"] is None and fresh["project"] == "default"
+    # per-PR last-seen timestamps persisted (existing state shape, extended)
+    state = json.loads((tmp_path / "data" / "github_seen.json").read_text())
+    assert state["pr_seen"] == {"acme/widget#5": "2026-07-20T10:00:00Z",
+                                "acme/widget#6": "2026-07-20T10:00:00Z"}
+    assert state["seen"] == [] and state["tracked"] == {}
+
+    # second tick: the same comments are older than the cursor -> no new runs
+    asyncio.run(c.app.state.github_tick())
+    assert len(c.app.state.runs.queue_pending()) == 2
+
+
+def test_github_pr_followups_disabled_by_default(tmp_path, monkeypatch):
+    c, calls = _followup_client(tmp_path, monkeypatch, enable=False)
+    asyncio.run(c.app.state.github_tick())
+    assert c.app.state.runs.queue_pending() == []
+    assert not any("/pulls?" in u for (_m, u, _b) in calls)  # PRs never listed
+
+
+# ---- QoL wave: Slack/email notify settings reach the dispatch config ----
+
+def test_notify_config_threads_slack_and_email_settings(tmp_path, monkeypatch):
+    from ai_dev_assistant import notify
+    from ai_dev_assistant.orchestration.events import Event
+    c = _client(tmp_path)
+    assert c.patch("/api/settings", json={
+        "notify_slack_webhook": "https://hooks.slack.com/services/T/B/x",
+        "notify_email_to": "dev@example.com",
+        "notify_smtp_host": "smtp.example.com",
+        "notify_smtp_port": 2525,
+        "notify_smtp_user": "ada@example.com",
+        "notify_smtp_starttls": False,
+    }).status_code == 200
+    seen = []
+    monkeypatch.setattr(notify, "notify_event",
+                        lambda cfg, **kw: seen.append(cfg) or True)
+    c.app.state.notify_dispatch(Event("done", "Run ended.", {}), "t-1", "default")
+    assert len(seen) == 1  # slack/email alone count as configured channels
+    cfg = seen[0]
+    assert cfg.slack_webhook_url == "https://hooks.slack.com/services/T/B/x"
+    assert cfg.email_to == "dev@example.com" and cfg.smtp_host == "smtp.example.com"
+    assert cfg.smtp_port == 2525 and cfg.smtp_user == "ada@example.com"
+    assert cfg.smtp_starttls is False
+    assert cfg.webhook_url == "" and cfg.desktop is False
