@@ -389,12 +389,18 @@ def delete_project(settings: Settings, slug: str) -> None:
     """Remove the project's data dir and — ONLY for non-local origins — its
     checkout under workspace_dir/<slug>. A user's own directory (origin
     "local") is NEVER deleted. Refuses to delete the default project.
+    Also unassigns the project from its workspace, if it belongs to one.
     """
     if slug == DEFAULT_PROJECT:
         raise ValueError("refusing to delete the default project")
     entry = get_project(settings, slug)
     if entry is None:
         return
+    from . import workspaces  # late import: workspaces imports this module
+
+    ws_slug = workspaces.workspace_of(settings, slug)
+    if ws_slug is not None:
+        workspaces.unassign_project(settings, ws_slug, slug)
     data = settings.projects_dir / slug
     if data.is_dir():
         shutil.rmtree(data, ignore_errors=True)
