@@ -97,6 +97,8 @@ class Settings:
     verify_timeout: float = 120.0
     objective_review: bool = True   # gate verdicts on file contents + per-subtask tests
     lint_check: bool = True         # include ruff/pyflakes signal in the objective gate
+    objective_static: bool = True   # gate verdicts on lint/typecheck baseline deltas
+                                    # (ruff/eslint/tsc) — new diagnostics demote the verdict
 
     # --- Planning (Tier 3) ---
     adaptive_replan: bool = True    # amend the DAG between batches (bounded self-heal of
@@ -209,6 +211,7 @@ class Settings:
             verify_timeout=_float("ADA_VERIFY_TIMEOUT", 120.0),
             objective_review=_bool("ADA_OBJECTIVE_REVIEW", True),
             lint_check=_bool("ADA_LINT_CHECK", True),
+            objective_static=_bool("ADA_OBJECTIVE_STATIC", True),
             adaptive_replan=_bool("ADA_ADAPTIVE_REPLAN", True),
             max_plan_subtasks=_int("ADA_MAX_PLAN_SUBTASKS", 24),
             budget_usd=_float("ADA_BUDGET_USD", 0.0),
@@ -470,6 +473,12 @@ SETTINGS_SCHEMA: list[dict] = [
      "help": "Gate verdicts on file contents plus per-subtask tests.", "type": "bool"},
     {"key": "lint_check", "group": "Verification", "label": "Lint check",
      "help": "Include ruff/pyflakes signal in the objective gate.", "type": "bool"},
+    {"key": "objective_static", "group": "Verification", "label": "Static-analysis gate",
+     "help": "Gate review verdicts on lint/typecheck deltas versus the pre-run baseline "
+             "(ruff, eslint, tsc where detected): a subtask whose diff adds new "
+             "diagnostics fails review even when its tests pass; zero/negative deltas "
+             "are noted only. Checks whose tools are absent are skipped silently.",
+     "type": "bool"},
     {"key": "degrade_on_partial", "group": "Verification", "label": "Degrade on partial",
      "help": "A subtask with real output that failed review passes with caveats "
              "so dependents still run.", "type": "bool"},

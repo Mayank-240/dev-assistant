@@ -204,7 +204,9 @@ class Engine:
             try:
                 self._baseline = await asyncio.to_thread(
                     capture_baseline, run_ws, run_tests=self.settings.verify_run_tests,
-                    lint=self.settings.lint_check, timeout=self.settings.verify_timeout)
+                    lint=self.settings.lint_check, timeout=self.settings.verify_timeout,
+                    static=(self.settings.objective_static
+                            and self.settings.objective_review))
                 base_t = self._baseline.get("tests")
                 if base_t is not None:
                     emit(status(f"Baseline: workspace tests {'pass' if base_t.passed else 'FAIL'} "
@@ -1150,7 +1152,13 @@ class Engine:
                     gather_signals, run_ws, files,
                     run_tests=self.settings.verify_run_tests and bool(test_paths),
                     lint=self.settings.lint_check,
-                    timeout=self.settings.verify_timeout, test_paths=test_paths)
+                    timeout=self.settings.verify_timeout, test_paths=test_paths,
+                    # Static gate: re-count the run-baseline's detected checks in this
+                    # subtask's post-change workspace; deltas fold into the same
+                    # objective_note/demotion channel as the test gate. Detection empty
+                    # or setting off → key absent → nothing appended anywhere.
+                    static_checks=(self._baseline.get("static_checks")
+                                   if self.settings.objective_static else None))
                 verdict = apply_objective_gate(verdict, signals, baseline=self._baseline)
             self.kg.add_fact(state.id, "review_status", "passed" if verdict.passed else "failed",
                              layer="run", run_id=run.id)

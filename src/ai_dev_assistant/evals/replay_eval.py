@@ -127,6 +127,7 @@ def replay_base_settings(**overrides) -> Settings:
         anthropic_api_key="",
         embeddings_backend="hash",
         verify_run_tests=False, objective_review=False, lint_check=False,
+        objective_static=False,  # pinned like adaptive_replan: no host-tool variance in evals
         adaptive_replan=False, git_finalize=False, max_retries=0,
         **overrides,
     )

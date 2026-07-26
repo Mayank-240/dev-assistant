@@ -30,6 +30,7 @@ from pathlib import Path
 
 from .execution import ExecutionResult, run_command_sync, run_workspace_tests_sync
 from .llm.schemas import Verdict
+from .static_checks import Check, detect_static_checks, run_static_checks, static_delta_note
 
 logger = logging.getLogger("ada.verify")
 
@@ -228,11 +229,14 @@ def run_signal_providers(workspace: Path, changed_files: list[str],
     return extra
 
 
-def capture_baseline(workspace: Path, *, run_tests: bool, lint: bool, timeout: float) -> dict:
+def capture_baseline(workspace: Path, *, run_tests: bool, lint: bool, timeout: float,
+                     static: bool = False) -> dict:
     """Snapshot test + lint state BEFORE agents touch anything, so gating works on the delta.
 
     For a repo-backed run this answers "did we break something" — tests that were already
-    red are not attributed to a subtask.
+    red are not attributed to a subtask. With ``static`` on, detected static checks
+    (ruff/eslint/tsc) are counted once here too; per-subtask verification re-counts and
+    gates on the delta. No tools detected → no keys added (byte-identical behavior).
     """
     baseline: dict = {}
     try:
@@ -241,6 +245,11 @@ def capture_baseline(workspace: Path, *, run_tests: bool, lint: bool, timeout: f
         if lint:
             baseline["lint"] = lint_workspace(workspace)
             baseline["lint_errors"] = _lint_error_count(baseline.get("lint"))
+        if static:
+            checks = detect_static_checks(workspace)
+            if checks:
+                baseline["static_checks"] = checks
+                baseline["static"] = run_static_checks(workspace, checks)
         extra = run_signal_providers(workspace, [], timeout)
         if extra:
             baseline["extra"] = extra
@@ -250,12 +259,14 @@ def capture_baseline(workspace: Path, *, run_tests: bool, lint: bool, timeout: f
 
 
 def gather_signals(workspace: Path, files: list[str], *, run_tests: bool, lint: bool,
-                   timeout: float, test_paths: list[str] | None = None) -> dict:
+                   timeout: float, test_paths: list[str] | None = None,
+                   static_checks: list[Check] | None = None) -> dict:
     """Collect objective signals for one subtask.
 
     ``test_paths`` scopes the test run to the subtask's changed files (V2): passing it
     avoids re-running the whole workspace suite per subtask and stops sibling subtasks
-    from failing each other.
+    from failing each other. ``static_checks`` is the run-baseline's detected check list;
+    when given, each check is re-counted post-change so the gate sees the delta.
     """
     signals: dict = {"files": collect_file_contents(workspace, files)}
     if run_tests:
@@ -263,6 +274,10 @@ def gather_signals(workspace: Path, files: list[str], *, run_tests: bool, lint: 
         signals["scoped"] = bool(test_paths)
     if lint:
         signals["lint"] = lint_workspace(workspace)
+    if static_checks:
+        counts = run_static_checks(workspace, static_checks)
+        if counts:
+            signals["static"] = counts
     extra = run_signal_providers(workspace, files, timeout)
     if extra:
         signals["extra"] = extra
@@ -279,12 +294,25 @@ def apply_objective_gate(verdict: Verdict, signals: dict, *, baseline: dict | No
     - new lint errors versus baseline → score penalty, not just a note.
     - a typecheck/build signal that was PASSING at baseline and now FAILS → -15 score and a
       note (never a hard fail on its own).
+    - static checks (ruff/eslint/tsc counts) with a positive delta versus the run baseline →
+      same demotion as newly-failing tests ("tests pass but the diff added 40 lint errors"
+      fails honestly); zero/negative deltas add the compact note only.
     """
     baseline = baseline or {}
     tests: ExecutionResult | None = signals.get("tests")
     base_tests: ExecutionResult | None = baseline.get("tests")
     notes: list[str] = []
     updates: dict = {}
+
+    # Static-check delta first so every early-return path carries the note. Detection-empty
+    # runs put no "static" key in signals — nothing is appended anywhere.
+    static_note, static_regressed = "", False
+    post_static: dict = signals.get("static") or {}
+    if post_static:
+        static_note, static_regressed = static_delta_note(post_static,
+                                                          baseline.get("static") or {})
+        if static_note:
+            notes.append(static_note)
 
     if tests is not None:
         notes.append(f"tests: {'PASS' if tests.passed else 'FAIL'} (exit {tests.return_code})")
@@ -300,7 +328,7 @@ def apply_objective_gate(verdict: Verdict, signals: dict, *, baseline: dict | No
                     "objective_note": "; ".join(notes),
                 })
         elif not verdict.passed:
-            if signals.get("scoped"):
+            if signals.get("scoped") and not static_regressed:
                 # Green tests that exercise this subtask's changes — soft pass, capped (V1).
                 notes.append("LLM flagged issues but the subtask's tests pass → soft pass (capped)")
                 return verdict.model_copy(update={
@@ -310,8 +338,22 @@ def apply_objective_gate(verdict: Verdict, signals: dict, *, baseline: dict | No
                                 "Objective override: the subtask's own tests pass; treated as a soft pass."],
                     "objective_note": "; ".join(notes),
                 })
-            # Unscoped green tests prove nothing about THIS subtask's criteria — no override.
-            notes.append("tests pass but are not scoped to this subtask → no override of the review")
+            if signals.get("scoped"):
+                notes.append("subtask tests pass but static checks regressed → no soft-pass override")
+            else:
+                # Unscoped green tests prove nothing about THIS subtask's criteria — no override.
+                notes.append("tests pass but are not scoped to this subtask → no override of the review")
+
+    if static_regressed:
+        # Same demotion as the newly-failing-test path: the diff objectively made the
+        # workspace worse, whatever the LLM thought of the prose.
+        return verdict.model_copy(update={
+            "passed": False,
+            "score": min(verdict.score, 20),
+            "reasons": [*verdict.reasons,
+                        f"Objective: static checks regressed vs the pre-run baseline ({static_note})."],
+            "objective_note": "; ".join(notes),
+        })
 
     penalty = 0
     lint: ExecutionResult | None = signals.get("lint")
