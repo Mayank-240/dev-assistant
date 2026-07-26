@@ -206,14 +206,24 @@
                   <input id="sc-prompt" class="title-input" type="text" placeholder="Prompt — e.g. run the test suite and fix any failures" aria-label="Schedule prompt" />
                   <div class="sched-form-row">
                     <input id="sc-title" class="title-input" type="text" maxlength="80" placeholder="Title (optional)" aria-label="Schedule title" />
-                    <label class="ctl" title="Interval in hours (minimum 0.25 = 15 minutes)">Every&nbsp;h
+                    <div class="ctl" title="Repeat on a fixed interval, or on a cron expression (local time)">Repeat
+                      <div id="sc-mode" class="seg" role="group" aria-label="Recurrence mode">
+                        <button type="button" class="seg-opt" data-v="hours" aria-pressed="true">Every N hours</button>
+                        <button type="button" class="seg-opt" data-v="cron" aria-pressed="false">Cron</button>
+                      </div>
+                    </div>
+                    <label class="ctl" id="sc-every-wrap" title="Interval in hours (minimum 0.25 = 15 minutes)">Every&nbsp;h
                       <input id="sc-every" class="num" type="number" min="0.25" step="0.25" value="24" aria-label="Interval in hours" />
+                    </label>
+                    <label class="ctl ctl-grow hidden" id="sc-cron-wrap" title="5-field cron expression — local time">Cron
+                      <input id="sc-cron" class="title-input sc-cron" type="text" placeholder="0 9 * * 1-5" aria-label="Cron expression" />
                     </label>
                     <label class="ctl" title="Budget cap per scheduled run (blank = none)">Budget&nbsp;$
                       <input id="sc-budget" class="num" type="number" min="0" step="0.5" placeholder="none" aria-label="Budget per run" />
                     </label>
                     <button id="sc-create" class="btn-primary" type="button">Add schedule</button>
                   </div>
+                  <p id="sc-cron-hint" class="hint sc-cron-hint hidden">m h dom mon dow — e.g. <code>0 9 * * 1-5</code> is 9:00 on weekdays</p>
                   <p id="sc-error" class="pm-error hidden" role="alert"></p>
                 </div>
               </div>
@@ -273,6 +283,16 @@
                   <ul id="kb-results" class="kb-results"></ul>
                 </div>
                 <div id="memory-list" class="mem-list"><p class="muted">No memories yet — run a task.</p></div>
+
+                <!-- QoL: memory curation — edit / forget this project's stored memories -->
+                <section id="mem-curation" class="mem-curation hidden" aria-label="Curate memories">
+                  <div class="know-head memc-head">
+                    <p class="know-desc">Curate — edit or forget what the assistant remembers about this project.</p>
+                    <span id="memc-count" class="muted"></span>
+                  </div>
+                  <div id="memc-list" class="mem-list"><p class="muted">Loading…</p></div>
+                  <button id="memc-more" type="button" class="ghost-btn memc-more hidden">Load more</button>
+                </section>
               </div>
 
               <div id="know-graph" class="know-panel hidden" role="tabpanel" aria-labelledby="ktab-graph">
@@ -350,6 +370,22 @@
                     <button id="ph-policy-save" class="btn-primary">Save policy</button>
                   </div>
                 </div>
+              </div>
+
+              <!-- QoL: workspace GC — dry-run report + explicit cleanup, never automatic -->
+              <div class="card settings-card" id="gc-card">
+                <h3 class="section-label">Workspace cleanup</h3>
+                <p class="muted">Finished task worktrees — and fully-accepted <code>ada/*</code> branches — older than the retention window can be reclaimed. Nothing is ever removed automatically.</p>
+                <div class="gc-controls">
+                  <label class="ctl" title="Retention window — task workspaces younger than this are always kept">Keep&nbsp;days
+                    <input id="gc-keep" class="num" type="number" min="0" step="1" aria-label="Keep days" />
+                  </label>
+                  <button id="gc-refresh" type="button" class="ghost-btn" title="Re-check what is collectible with the current retention">⟳ Re-check</button>
+                  <button id="gc-clean" type="button" class="btn-danger" disabled>Clean up</button>
+                </div>
+                <div id="gc-list" class="gc-list"><p class="muted">Checking…</p></div>
+                <p id="gc-result" class="gc-result muted hidden" role="status" aria-live="polite"></p>
+                <p id="gc-error" class="pm-error hidden" role="alert"></p>
               </div>
 
               <div class="card settings-card danger-card">

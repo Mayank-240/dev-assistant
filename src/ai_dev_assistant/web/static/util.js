@@ -407,7 +407,8 @@
       const met = c.met != null ? !!c.met : (c.passed != null ? !!c.passed : null);
       return { name: String(c.name || c.criterion || ""), met };
     }).filter(c => c.name);
-    const decision = s.decision === "accepted" || s.decision === "rejected" ? s.decision : null;
+    const decision = s.decision === "accepted" || s.decision === "rejected"
+      || s.decision === "rolled_back" ? s.decision : null;
     return {
       id: String(s.id || ""), title: String(s.title || ""), agent: String(s.agent || ""),
       status: String(s.status || ""),
@@ -419,6 +420,7 @@
       changed: Array.isArray(s.changed) ? s.changed : [],
       attempts: s.attempts != null ? s.attempts : null,
       decision,
+      decisionLabel: decision ? decision.replace(/_/g, " ") : "",
       mergeShort: String(s.merge_commit || "").slice(0, 7),
       hasDiff: !!s.diff,
       canAccept: !!s.merge_commit && decision !== "accepted",
@@ -1035,6 +1037,7 @@
       (byKind[h.kind] = byKind[h.kind] || []).push({
         type: String(h.kind), project: String(h.project || ""),
         title: String(h.title || ""), snippet: String(h.snippet || ""),
+        semantic: !!h.semantic,   // vector-similarity hit -> subtle "≈" badge
         ref: (h.ref && typeof h.ref === "object") ? h.ref : {},
       });
     });
@@ -1064,12 +1067,14 @@
     row = row || {};
     const enabled = !!row.enabled;
     const title = String(row.title || "").trim() || String(row.prompt || "").slice(0, 80);
+    const cron = String(row.cron || "").trim();   // cron rows render their expression
     return {
       id: String(row.id || ""),
       title,
       prompt: String(row.prompt || ""),
       enabled,
-      everyLabel: _fmtEvery(row.every_hours),
+      cron,
+      everyLabel: cron ? "cron " + cron : _fmtEvery(row.every_hours),
       nextLabel: !enabled ? "paused"
         : row.next_run_at == null ? "due now"
         : "next " + fmtRelTime(row.next_run_at, now),
@@ -1079,14 +1084,29 @@
   }
 
   // Create-form values -> { ok, errors, body } for POST /api/schedules.
-  // Mirrors the server's gates (prompt required, every_hours >= 0.25).
+  // Mirrors the server's gates (prompt required, every_hours >= 0.25). With
+  // mode "cron" the body carries {cron} INSTEAD of {every_hours}; the cron
+  // check here is a shallow shape gate (5 fields) — the server's parser is the
+  // real validator and its 400 message is surfaced inline by the caller.
+  const CRON_HINT = "m h dom mon dow — e.g. 0 9 * * 1-5";
   function scheduleFormModel(f) {
     f = f || {};
     const errors = [];
     const prompt = String(f.prompt || "").trim();
     if (!prompt) errors.push("prompt is required");
-    const every = Number(String(f.every_hours == null ? "" : f.every_hours).trim());
-    if (!isFinite(every) || every < 0.25) errors.push("every_hours must be a number ≥ 0.25 (15 minutes)");
+    const mode = f.mode === "cron" ? "cron" : "hours";
+    let recurrence;
+    if (mode === "cron") {
+      const cron = String(f.cron || "").trim().replace(/\s+/g, " ");
+      if (!cron) errors.push("cron expression is required (" + CRON_HINT + ")");
+      else if (cron.split(" ").length !== 5)
+        errors.push("cron needs exactly 5 fields (" + CRON_HINT + ")");
+      recurrence = { cron };
+    } else {
+      const every = Number(String(f.every_hours == null ? "" : f.every_hours).trim());
+      if (!isFinite(every) || every < 0.25) errors.push("every_hours must be a number ≥ 0.25 (15 minutes)");
+      recurrence = { every_hours: every };
+    }
     let budget = 0;
     const rawB = String(f.budget_usd == null ? "" : f.budget_usd).trim();
     if (rawB) {
@@ -1094,10 +1114,10 @@
       if (!isFinite(budget) || budget < 0) errors.push("budget must be a non-negative number");
     }
     return {
-      ok: !errors.length, errors,
+      ok: !errors.length, errors, mode,
       body: {
         prompt, title: String(f.title || "").trim() || null,
-        every_hours: every, budget_usd: budget || 0,
+        ...recurrence, budget_usd: budget || 0,
       },
     };
   }
@@ -1258,6 +1278,105 @@
     return { fields, ok: !errors.length, errors, params };
   }
 
+  // ===========================================================
+  // QoL wave — memory curation, workspace GC, subtask rollback.
+  // Pure view models; the endpoints live in web/server.py.
+  // ===========================================================
+
+  // One GET /api/projects/{slug}/memories row -> curation-row model.
+  // Long content is clamped to a preview with an expand affordance; text is
+  // plain — the caller escapes before injecting. createdAt stays numeric
+  // (epoch seconds) so date formatting is the caller's locale concern.
+  const MEMORY_CLAMP_CHARS = 240;
+  function memoryRowModel(m) {
+    m = m || {};
+    const content = String(m.content || "");
+    const clamped = content.length > MEMORY_CLAMP_CHARS;
+    return {
+      id: m.id != null ? Number(m.id) : null,
+      scope: String(m.scope || ""),
+      key: String(m.key || ""),
+      content,
+      clamped,
+      preview: clamped ? clipText(content, MEMORY_CLAMP_CHARS) : content,
+      createdAt: (m.created_at != null && isFinite(Number(m.created_at)))
+        ? Number(m.created_at) : null,
+    };
+  }
+
+  // Paging state for the curation list: total (server) vs. loaded (client).
+  function memoryPageModel(total, loaded) {
+    total = Math.max(0, Number(total) || 0);
+    loaded = Math.max(0, Number(loaded) || 0);
+    const remaining = Math.max(0, total - loaded);
+    return {
+      countLabel: total + (total === 1 ? " memory" : " memories"),
+      hasMore: remaining > 0,
+      nextOffset: loaded,
+      moreLabel: remaining > 0 ? "Load more (" + remaining + " remaining)" : "",
+    };
+  }
+
+  // GET /api/projects/{slug}/gc report -> {count, label, items, emptyText}.
+  // Worktrees and branches merge into one list; keep_days (echoed by the
+  // server) feeds both the retention input and the empty-state copy.
+  function gcSummary(report) {
+    report = report || {};
+    const keep = Math.max(0, Number(report.keep_days) || 0);
+    const items = [];
+    (Array.isArray(report.worktrees) ? report.worktrees : []).forEach(w => items.push({
+      taskId: String((w && w.task_id) || ""), kind: "worktree",
+      detail: String((w && w.path) || ""),
+      status: String((w && w.status) || ""),
+      ageLabel: (w && w.age_days != null) ? Number(w.age_days).toFixed(1) + "d old" : "",
+    }));
+    (Array.isArray(report.branches) ? report.branches : []).forEach(b => items.push({
+      taskId: String((b && b.task_id) || ""), kind: "branch",
+      detail: String((b && b.branch) || ""),
+      status: String((b && b.status) || ""),
+      ageLabel: (b && b.age_days != null) ? Number(b.age_days).toFixed(1) + "d old" : "",
+    }));
+    const count = items.length;
+    return {
+      count, items, keepDays: keep,
+      label: count ? "Clean up " + count + " item" + (count === 1 ? "" : "s") : "",
+      emptyText: count ? "" : "Nothing to clean — task workspaces are kept "
+        + keep + " day" + (keep === 1 ? "" : "s") + " after completion.",
+    };
+  }
+
+  // POST /api/projects/{slug}/gc response -> one result line + skipped rows.
+  function gcResultModel(res) {
+    res = res || {};
+    const removed = (res.removed && typeof res.removed === "object") ? res.removed : {};
+    const rw = Array.isArray(removed.worktrees) ? removed.worktrees.length : 0;
+    const rb = Array.isArray(removed.branches) ? removed.branches.length : 0;
+    const skipped = (Array.isArray(res.skipped) ? res.skipped : []).map(s => ({
+      taskId: String((s && s.task_id) || ""),
+      reason: String((s && s.reason) || ""),
+    }));
+    return {
+      removedCount: rw + rb,
+      skipped,
+      text: "Removed " + rw + " worktree" + (rw === 1 ? "" : "s")
+        + " · " + rb + " branch" + (rb === 1 ? "" : "es")
+        + (skipped.length ? " · " + skipped.length + " skipped" : ""),
+    };
+  }
+
+  // One review-subtask row -> rollback affordance. Only an accepted subtask
+  // can be rolled back (the server reverts its recorded accepted_commit and
+  // records decision "rolled_back"); a rolled-back row shows its state.
+  function rollbackStateModel(s) {
+    s = s || {};
+    const decision = String(s.decision || "");
+    return {
+      canRollback: decision === "accepted",
+      rolledBack: decision === "rolled_back",
+      label: decision === "rolled_back" ? "rolled back" : "Roll back",
+    };
+  }
+
   // ---- S8: cookie-session auth gate ----
   // /api/auth/status response -> which screen boots first. Only a server that
   // requires auth AND hasn't authorized this browser gates on the login screen;
@@ -1316,6 +1435,8 @@
     combinedBannerModel, projectColorMap,
     settingsGroupsModel, fieldControlModel, coerceFieldInput,
     renderMarkdown,
+    MEMORY_CLAMP_CHARS, memoryRowModel, memoryPageModel,
+    gcSummary, gcResultModel, rollbackStateModel, CRON_HINT,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = AdaUtil;

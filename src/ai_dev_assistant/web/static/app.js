@@ -18,6 +18,7 @@ const {
   spendOverviewModel, spendOutcomesModel, runCostModel, abTableModel,
   notifCenterModel, playbookFormModel, tourStepsModel,
   authGate, loginFormModel, loginErrorMessage,
+  memoryRowModel, memoryPageModel, gcSummary, gcResultModel, rollbackStateModel,
 } = window.AdaUtil;
 
 // Respect the user's reduced-motion preference for programmatic scrolling.
@@ -2216,7 +2217,109 @@ async function loadSettingsPanel() {
   const entry = currentProjectEntry(slug) || { slug, name: slug };
   renderSettingsPolicy(entry);
   renderSettingsDanger(entry);
+  loadGcReport();        // QoL: workspace-cleanup card
   loadProjectStatus();   // fills the repository card + header chips
+}
+
+// ---- QoL: workspace GC (Settings tab) — dry-run report + explicit cleanup ----
+let _gcReport = null;
+
+async function loadGcReport(keepOverride) {
+  const slug = selectedProject();
+  if (!slug || slug === "multi") return;
+  const card = $("gc-card");
+  if (!card) return;
+  $("gc-error").classList.add("hidden");
+  $("gc-list").innerHTML = '<p class="muted">Checking…</p>';
+  const q = keepOverride != null ? "?keep_days=" + encodeURIComponent(keepOverride) : "";
+  let resp, data = null;
+  try {
+    resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/gc" + q);
+    data = await resp.json().catch(() => null);
+  } catch (e) {
+    $("gc-list").innerHTML = '<p class="muted">Could not reach the server.</p>';
+    return;
+  }
+  if (resp.status === 404 || resp.status === 501) { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  if (!resp.ok || !data || data.error) {
+    $("gc-list").innerHTML = "";
+    const err = $("gc-error");
+    err.textContent = (data && data.error) || ("HTTP " + resp.status);
+    err.classList.remove("hidden");
+    return;
+  }
+  _gcReport = data;
+  if (keepOverride == null) $("gc-keep").value = String(data.keep_days);
+  renderGcReport(data);
+}
+
+function renderGcReport(report) {
+  const m = gcSummary(report);
+  const btn = $("gc-clean");
+  btn.disabled = !m.count;
+  btn.dataset.armed = "";
+  btn.textContent = m.count ? m.label : "Clean up";
+  const list = $("gc-list");
+  if (!m.count) {
+    list.innerHTML = `<p class="muted">${escapeHtml(m.emptyText)}</p>`;
+    return;
+  }
+  list.innerHTML = m.items.map(it =>
+    `<div class="gc-item"><span class="chip">${escapeHtml(it.taskId)}</span>` +
+    `<span class="gc-kind gc-kind-${escapeAttr(it.kind)}">${escapeHtml(it.kind)}</span>` +
+    `<code class="gc-detail" title="${escapeAttr(it.detail)}">${escapeHtml(it.detail)}</code>` +
+    `<span class="gc-meta">${escapeHtml(it.status)}${it.ageLabel ? " · " + escapeHtml(it.ageLabel) : ""}</span></div>`
+  ).join("");
+}
+
+async function runGcCleanup() {
+  const slug = selectedProject();
+  if (!slug || slug === "multi" || !_gcReport) return;
+  const btn = $("gc-clean");
+  const m = gcSummary(_gcReport);
+  if (!m.count) return;
+  // Two-step arm/confirm — consistent with "Accept all & deliver", no dialogs.
+  if (!btn.dataset.armed) {
+    btn.dataset.armed = "1";
+    btn.textContent = "Confirm: remove " + m.count + " item" + (m.count === 1 ? "" : "s") + "?";
+    setTimeout(() => {
+      if (btn.dataset.armed) { btn.dataset.armed = ""; btn.textContent = m.label; }
+    }, 6000);
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = "Cleaning…";
+  $("gc-error").classList.add("hidden");
+  const keep = parseInt($("gc-keep").value, 10);
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/projects/" + encodeURIComponent(slug) + "/gc", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ keep_days: isFinite(keep) ? keep : null }),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) {
+    $("gc-error").textContent = "Cleanup failed: " + e;
+    $("gc-error").classList.remove("hidden");
+    btn.disabled = false; btn.dataset.armed = ""; btn.textContent = m.label;
+    return;
+  }
+  if (!resp.ok || data.error) {
+    $("gc-error").textContent = data.error || ("HTTP " + resp.status);
+    $("gc-error").classList.remove("hidden");
+    btn.disabled = false; btn.dataset.armed = ""; btn.textContent = m.label;
+    return;
+  }
+  const res = gcResultModel(data);
+  const out = $("gc-result");
+  out.innerHTML = escapeHtml(res.text) + (res.skipped.length
+    ? "<br>" + res.skipped.map(s =>
+        `<span class="gc-skip">${escapeHtml(s.taskId)} — ${escapeHtml(s.reason)}</span>`).join("<br>")
+    : "");
+  out.classList.remove("hidden");
+  showToast(res.removedCount ? "Workspace cleanup · " + res.text : "Nothing removed", res.removedCount ? "success" : "warn");
+  loadGcReport(isFinite(keep) ? keep : undefined);   // re-check — a second pass finds nothing
 }
 
 // The Settings tab's repository card (fed by the header's status poll).
@@ -2434,19 +2537,22 @@ async function loadReviewTab() {
   el.querySelectorAll(".review-card").forEach(card => {
     const accept = card.querySelector(".rc-accept");
     const reject = card.querySelector(".rc-reject");
+    const rollback = card.querySelector(".rc-rollback");
     if (accept) accept.onclick = () => acceptSubtask(card, accept.dataset.sid);
     if (reject) reject.onclick = () => rejectSubtask(card, reject.dataset.sid);
+    if (rollback) rollback.onclick = () => rollbackSubtask(card, rollback.dataset.sid);
   });
 }
 
 function reviewCardHtml(s) {
   const m = reviewCardModel(s);
+  const rb = rollbackStateModel(s);
   const badgeCls = m.badge === "passed" ? "pill-done" : m.badge === "failed" ? "pill-err" : "";
   const score = m.score != null ? `<span class="rc-meta-bit">score ${escapeHtml(m.score)}</span>` : "";
   const attempts = m.attempts != null
     ? `<span class="rc-meta-bit">${escapeHtml(m.attempts)} attempt${m.attempts === 1 ? "" : "s"}</span>` : "";
   const decision = m.decision
-    ? `<span class="rc-decision rc-decision-${escapeAttr(m.decision)}">${escapeHtml(m.decision)}</span>` : "";
+    ? `<span class="rc-decision rc-decision-${escapeAttr(m.decision)}">${escapeHtml(m.decisionLabel)}</span>` : "";
   const criteria = m.criteria.length
     ? `<ul class="rc-criteria">` + m.criteria.map(c =>
         `<li class="${c.met === true ? "rc-crit-ok" : c.met === false ? "rc-crit-bad" : ""}">` +
@@ -2474,6 +2580,9 @@ function reviewCardHtml(s) {
     `title="${m.canAccept ? "Merge this subtask's commit into the review target" : "No merge commit, or already accepted"}">✓ Accept</button>` +
     `<button type="button" class="rc-reject ghost-btn" data-sid="${escapeAttr(m.id)}"${m.canReject ? "" : " disabled"} ` +
     `title="Record rejection feedback; the commit stays on the task branch">✗ Reject</button>` +
+    (rb.canRollback
+      ? `<button type="button" class="rc-rollback ghost-btn" data-sid="${escapeAttr(m.id)}" ` +
+        `title="Revert this accepted subtask's commit on the review target">↶ ${escapeHtml(rb.label)}</button>` : "") +
     `<input type="text" class="rc-comment title-input" maxlength="280" ` +
     `placeholder="Rejection comment (optional) — feeds future planning" aria-label="Rejection comment for subtask ${escapeAttr(m.id)}" />` +
     `</div><p class="rc-error pm-error hidden" role="alert"></p></div>`;
@@ -2529,6 +2638,34 @@ async function rejectSubtask(card, sid) {
   if (!resp.ok) { _rcShowError(card, data.error || ("HTTP " + resp.status)); btn.disabled = false; return; }
   showToast(`Rejected ${sid} — feedback recorded`, "warn");
   loadReviewTab();
+}
+
+// QoL: revert an accepted subtask's commit on the review target. The server
+// records decision "rolled_back" (kept in the review listing); 409 carries a
+// conflict/nothing-to-revert explanation which is shown inline on the card.
+async function rollbackSubtask(card, sid) {
+  const btn = card.querySelector(".rc-rollback");
+  btn.disabled = true;
+  let resp, data = {};
+  try {
+    resp = await fetch(`/api/runs/${encodeURIComponent(reviewTaskId)}/subtasks/${encodeURIComponent(sid)}/rollback`,
+                       { method: "POST" });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _rcShowError(card, "Rollback failed: " + e); btn.disabled = false; return; }
+  if (resp.status === 501) {
+    showToast("Rollback is not available yet on this server", "warn", 6000);
+    btn.disabled = false;
+    return;
+  }
+  if (!resp.ok) {   // 409: revert conflict or nothing recorded to roll back
+    const files = (data.files || []).length ? " · conflicts: " + data.files.join(", ") : "";
+    _rcShowError(card, (data.error || ("HTTP " + resp.status)) + files);
+    btn.disabled = false;
+    return;
+  }
+  showToast(`Rolled back ${sid}`
+    + (data.rollback_commit ? ` · revert ${String(data.rollback_commit).slice(0, 7)}` : ""), "warn");
+  loadReviewTab();  // re-render — the row now shows the "rolled back" decision
 }
 
 async function loadPermissionsTab() {
@@ -2746,6 +2883,7 @@ async function loadMemory() {
   const slug = selectedProject();
   if (!slug || slug === "multi") return;
   renderCombineRow();
+  loadMemoryCuration(true);   // QoL: the curation section refreshes alongside recall
   const param = combinedProjectsParam(slug, [...combineSelected]);
   let items = null, combinedProjects = null;
   if (param) {
@@ -2787,6 +2925,151 @@ async function loadMemory() {
       <div class="mem-content">${escapeHtml(m.content)}</div>`;
     wrap.appendChild(el);
   });
+}
+
+// ---- QoL: memory curation (Knowledge · Memory) — edit / forget stored memories ----
+// Backed by GET/PATCH/DELETE /api/projects/{slug}/memories[/{id}]. Single-project
+// by design (curation writes to one project's store); "Load more" pages by offset.
+const MEMC_PAGE = 50;
+let _memCur = { slug: null, rows: [], total: 0 };
+
+async function loadMemoryCuration(reset) {
+  const slug = selectedProject();
+  const box = $("mem-curation");
+  if (!box) return;
+  const applicable = !!slug && slug !== "multi";
+  box.classList.toggle("hidden", !applicable);
+  if (!applicable) return;
+  if (reset || _memCur.slug !== slug) _memCur = { slug, rows: [], total: 0 };
+  let data = null;
+  try {
+    const resp = await fetch("/api/projects/" + encodeURIComponent(slug)
+      + "/memories?limit=" + MEMC_PAGE + "&offset=" + _memCur.rows.length);
+    if (resp.status === 404 || resp.status === 501) { box.classList.add("hidden"); return; }
+    if (resp.ok) data = await resp.json();
+  } catch (e) { /* leave the section as-is */ }
+  if (!data || !Array.isArray(data.memories)) {
+    if (!_memCur.rows.length) $("memc-list").innerHTML = '<p class="muted">Could not load stored memories.</p>';
+    return;
+  }
+  _memCur.total = Number(data.total) || 0;
+  _memCur.rows = _memCur.rows.concat(data.memories);
+  renderMemoryCuration();
+}
+
+function renderMemoryCuration() {
+  const page = memoryPageModel(_memCur.total, _memCur.rows.length);
+  $("memc-count").textContent = page.countLabel;
+  const more = $("memc-more");
+  more.classList.toggle("hidden", !page.hasMore);
+  if (page.hasMore) more.textContent = page.moreLabel;
+  const wrap = $("memc-list");
+  if (!_memCur.rows.length) {
+    wrap.innerHTML = '<p class="muted">No stored memories yet — run a task.</p>';
+    return;
+  }
+  wrap.innerHTML = "";
+  _memCur.rows.forEach(raw => wrap.appendChild(memoryCurationRow(raw)));
+}
+
+function _memcError(el, msg) {
+  const err = el.querySelector(".memc-error");
+  err.textContent = msg;
+  err.classList.remove("hidden");
+}
+
+function memoryCurationRow(raw) {
+  const m = memoryRowModel(raw);
+  const el = document.createElement("div");
+  el.className = "mem-item memc-item";
+  const when = m.createdAt ? new Date(m.createdAt * 1000).toLocaleDateString() : "";
+  el.innerHTML =
+    `<div class="mem-meta"><span class="mem-scope-tag mem-scope-project">${escapeHtml(m.scope || "memory")}</span>` +
+    (m.key ? `<span title="Memory key">· ${escapeHtml(m.key)}</span>` : "") +
+    (when ? `<span>· ${escapeHtml(when)}</span>` : "") +
+    `<span class="memc-acts">` +
+    `<button type="button" class="q-act memc-edit" title="Edit this memory's text">Edit</button>` +
+    `<button type="button" class="q-act memc-delete" title="Forget this memory (click twice to confirm)">Delete</button>` +
+    `</span></div>` +
+    `<div class="mem-content memc-content"></div>` +
+    (m.clamped ? `<button type="button" class="link-btn memc-expand" aria-expanded="false">Show all</button>` : "") +
+    `<div class="memc-editor hidden">` +
+    `<textarea class="memc-textarea" rows="4" aria-label="Memory content"></textarea>` +
+    `<div class="pe-actions"><button type="button" class="btn-primary memc-save">Save</button>` +
+    `<button type="button" class="ghost-btn memc-cancel">Cancel</button></div></div>` +
+    `<p class="pm-error memc-error hidden" role="alert"></p>`;
+  el.querySelector(".memc-content").textContent = m.clamped ? m.preview : m.content;
+  const expand = el.querySelector(".memc-expand");
+  if (expand) expand.onclick = () => {
+    const open = expand.getAttribute("aria-expanded") === "true";
+    el.querySelector(".memc-content").textContent = open ? m.preview : m.content;
+    expand.setAttribute("aria-expanded", String(!open));
+    expand.textContent = open ? "Show all" : "Show less";
+  };
+  const editor = el.querySelector(".memc-editor");
+  el.querySelector(".memc-edit").onclick = () => {
+    const opening = editor.classList.contains("hidden");
+    editor.classList.toggle("hidden", !opening);
+    el.querySelector(".memc-error").classList.add("hidden");
+    if (opening) {
+      const ta = editor.querySelector(".memc-textarea");
+      ta.value = String(raw.content || "");
+      ta.focus();
+    }
+  };
+  el.querySelector(".memc-cancel").onclick = () => editor.classList.add("hidden");
+  el.querySelector(".memc-save").onclick = () => saveMemoryEdit(el, raw, editor);
+  // Two-click Delete → Confirm (no browser dialogs); disarms after 5s.
+  const del = el.querySelector(".memc-delete");
+  del.onclick = () => {
+    if (!del.dataset.armed) {
+      del.dataset.armed = "1";
+      del.textContent = "Confirm delete";
+      del.classList.add("memc-arm");
+      setTimeout(() => {
+        if (del.dataset.armed) { del.dataset.armed = ""; del.textContent = "Delete"; del.classList.remove("memc-arm"); }
+      }, 5000);
+      return;
+    }
+    deleteMemoryRow(el, raw);
+  };
+  return el;
+}
+
+async function saveMemoryEdit(el, raw, editor) {
+  const content = editor.querySelector(".memc-textarea").value.trim();
+  if (!content) { _memcError(el, "Memory content must not be empty."); return; }
+  const btn = el.querySelector(".memc-save");
+  btn.disabled = true;
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/projects/" + encodeURIComponent(_memCur.slug)
+      + "/memories/" + encodeURIComponent(raw.id), {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _memcError(el, "Save failed: " + e); btn.disabled = false; return; }
+  btn.disabled = false;
+  if (!resp.ok || data.error) { _memcError(el, data.error || ("HTTP " + resp.status)); return; }
+  raw.content = content;   // keep the cached row current, then re-render in place
+  showToast("Memory updated", "success", 2500);
+  const fresh = memoryCurationRow(raw);
+  el.replaceWith(fresh);
+}
+
+async function deleteMemoryRow(el, raw) {
+  let resp, data = {};
+  try {
+    resp = await fetch("/api/projects/" + encodeURIComponent(_memCur.slug)
+      + "/memories/" + encodeURIComponent(raw.id), { method: "DELETE" });
+    data = await resp.json().catch(() => ({}));
+  } catch (e) { _memcError(el, "Delete failed: " + e); return; }
+  if (!resp.ok || data.error) { _memcError(el, data.error || ("HTTP " + resp.status)); return; }
+  _memCur.rows = _memCur.rows.filter(r => r !== raw);
+  _memCur.total = Math.max(0, _memCur.total - 1);
+  showToast("Memory forgotten", "warn", 2500);
+  renderMemoryCuration();
 }
 
 // ---- Knowledge graph (dependency-free force layout) ----
@@ -3354,9 +3637,21 @@ function _scFail(msg) {
   el.classList.remove("hidden");
 }
 
+// QoL: recurrence mode — "Every N hours" (interval) | "Cron" (5-field expression).
+let schedMode = "hours";
+function setSchedMode(mode) {
+  schedMode = mode === "cron" ? "cron" : "hours";
+  $("sc-mode").querySelectorAll(".seg-opt").forEach(b =>
+    b.setAttribute("aria-pressed", b.dataset.v === schedMode ? "true" : "false"));
+  $("sc-every-wrap").classList.toggle("hidden", schedMode === "cron");
+  $("sc-cron-wrap").classList.toggle("hidden", schedMode !== "cron");
+  $("sc-cron-hint").classList.toggle("hidden", schedMode !== "cron");
+}
+
 async function createSchedule() {
   const m = scheduleFormModel({
     prompt: $("sc-prompt").value, title: $("sc-title").value,
+    mode: schedMode, cron: $("sc-cron").value,
     every_hours: $("sc-every").value, budget_usd: $("sc-budget").value,
   });
   if (!m.ok) { _scFail(m.errors.join(" · ")); return; }
@@ -3649,9 +3944,12 @@ function renderPalette() {
     g.items.map(it => {
       const i = idx++;
       const chip = it.project ? `<span class="proj-tag">${escapeHtml(it.project)}</span>` : "";
+      // QoL: "≈" marks hits found by semantic similarity rather than token overlap
+      const sem = it.semantic
+        ? `<span class="pal-sem" title="semantic match" aria-label="semantic match">≈</span>` : "";
       const main = it.type === "command"
         ? `<span class="pal-title">${escapeHtml(it.label)}</span>`
-        : `<span class="pal-title">${escapeHtml(it.title || "(untitled)")}</span>` +
+        : `${sem}<span class="pal-title">${escapeHtml(it.title || "(untitled)")}</span>` +
           (it.snippet ? `<span class="pal-snippet">${escapeHtml(it.snippet)}</span>` : "");
       return `<div class="pal-item${i === _palIdx ? " active" : ""}" data-idx="${i}" role="option"` +
         ` aria-selected="${i === _palIdx ? "true" : "false"}">${main}${chip}</div>`;
@@ -3932,6 +4230,19 @@ $("playbook-modal").onclick = (e) => { if (e.target === $("playbook-modal")) clo
 $("sc-create").onclick = createSchedule;
 $("sched-refresh").onclick = loadSchedules;
 $("sc-prompt").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); createSchedule(); } });
+// QoL: schedule recurrence mode toggle + cron enter-to-create
+$("sc-mode").querySelectorAll(".seg-opt").forEach(b => b.onclick = () => setSchedMode(b.dataset.v));
+$("sc-cron").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); createSchedule(); } });
+// QoL: workspace-cleanup card (project Settings)
+const _gcKeepInput = () => {   // blank input -> undefined -> the server's default
+  const v = parseInt($("gc-keep").value, 10);
+  return isFinite(v) && v >= 0 ? v : undefined;
+};
+$("gc-refresh").onclick = () => loadGcReport(_gcKeepInput());
+$("gc-keep").addEventListener("change", () => loadGcReport(_gcKeepInput()));
+$("gc-clean").onclick = runGcCleanup;
+// QoL: memory-curation "Load more" paging
+$("memc-more").onclick = () => loadMemoryCuration(false);
 $("ab-run").onclick = runAB;
 $("ab-values").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); runAB(); } });
 $("palette-input").addEventListener("input", schedulePaletteSearch);
