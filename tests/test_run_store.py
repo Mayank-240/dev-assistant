@@ -150,6 +150,52 @@ def test_agent_track_record_empty(store):
     assert store.agent_track_record() == {}
 
 
+# ---- agent stats (roster pre-filtering priors) ----
+def test_agent_stats_aggregate_and_per_project(store):
+    store.start("r1", "p", project="alpha")
+    store.start("r2", "p", project="beta")
+    store.record_agent_outcome("r1", "coder", True, 90)
+    store.record_agent_outcome("r1", "coder", False, 40)
+    store.record_agent_outcome("r2", "coder", True, 80)
+    store.record_agent_outcome("r2", "devops", True, None)  # score-less outcome
+
+    stats = store.agent_stats()
+    assert stats["coder"] == {"n": 3, "passed": 2, "avg_score": 70.0}
+    assert stats["devops"] == {"n": 1, "passed": 1, "avg_score": 0.0}
+
+    alpha = store.agent_stats(project="alpha")
+    assert alpha["coder"] == {"n": 2, "passed": 1, "avg_score": 65.0}
+    assert "devops" not in alpha           # beta's outcomes don't leak in
+    assert store.agent_stats(project="nope") == {}
+    assert store.agent_stats() != {}       # aggregate default unaffected
+
+
+def test_agent_stats_exact_signature_for_getattr_callers(store):
+    """A concurrent server calls this via getattr with a fallback — the exact
+    signature (project=None keyword) is load-bearing."""
+    import inspect
+
+    fn = getattr(store, "agent_stats", None)
+    assert callable(fn)
+    sig = inspect.signature(RunStore.agent_stats)
+    assert list(sig.parameters) == ["self", "project"]
+    assert sig.parameters["project"].default is None
+    assert fn() == {}  # empty store: still a dict
+
+
+def test_agent_recent_project_outcomes_newest_first_and_scoped(store):
+    store.start("r1", "p", project="alpha")
+    store.start("r2", "p", project="beta")
+    for passed in (True, False, False, False):  # oldest -> newest
+        store.record_agent_outcome("r1", "coder", passed, 50)
+    store.record_agent_outcome("r2", "coder", True, 90)  # other project: ignored
+
+    recent = store.agent_recent_project_outcomes("alpha")
+    assert recent["coder"] == [False, False, False]  # last 3, newest first
+    assert store.agent_recent_project_outcomes("beta")["coder"] == [True]
+    assert store.agent_recent_project_outcomes("empty") == {}
+
+
 # ---- schema migration idempotence ----
 def test_reopening_same_db_is_idempotent_and_preserves_data(tmp_path):
     path = tmp_path / "runs.db"

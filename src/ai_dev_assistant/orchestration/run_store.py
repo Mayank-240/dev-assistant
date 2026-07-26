@@ -313,6 +313,46 @@ class RunStore:
             out[r["agent"]] = {"n": n, "passed": p, "pass_rate": round(p / n, 3) if n else 0.0}
         return out
 
+    def agent_stats(self, project=None) -> dict[str, dict[str, float | int]]:
+        """Per-role review-outcome aggregates: {role: {"n", "passed", "avg_score"}}.
+
+        Aggregate over every recorded outcome by default; with ``project`` given,
+        only outcomes from runs of that project (via the runs table) count.
+        ``avg_score`` averages the non-null scores (0.0 when none exist).
+        """
+        if project:
+            rows = self._conn.execute(
+                "SELECT a.agent, COUNT(*) n, SUM(a.passed) p, AVG(a.score) s "
+                "FROM agent_outcomes a JOIN runs r ON r.id = a.run_id "
+                "WHERE COALESCE(r.project, 'default') = ? GROUP BY a.agent",
+                (project,)).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT agent, COUNT(*) n, SUM(passed) p, AVG(score) s "
+                "FROM agent_outcomes GROUP BY agent").fetchall()
+        return {r["agent"]: {"n": int(r["n"]), "passed": int(r["p"] or 0),
+                             "avg_score": round(float(r["s"] or 0.0), 2)} for r in rows}
+
+    def agent_recent_project_outcomes(self, project: str,
+                                      limit: int = 3) -> dict[str, list[bool]]:
+        """The last ``limit`` review outcomes per role IN THIS PROJECT, newest first.
+
+        Feeds the planner's per-project demotion: a role whose last 3 outcomes here
+        were all failures is dropped from the ranked catalog slots (core roles get a
+        warning note instead).
+        """
+        rows = self._conn.execute(
+            "SELECT a.agent, a.passed FROM agent_outcomes a "
+            "JOIN runs r ON r.id = a.run_id "
+            "WHERE COALESCE(r.project, 'default') = ? "
+            "ORDER BY a.created_at DESC, a.id DESC", (project,)).fetchall()
+        out: dict[str, list[bool]] = {}
+        for r in rows:
+            seq = out.setdefault(r["agent"], [])
+            if len(seq) < limit:
+                seq.append(bool(r["passed"]))
+        return out
+
     def quality_trend(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT id, created_at, quality_score, status FROM runs "

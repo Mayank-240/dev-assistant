@@ -2,19 +2,127 @@
 
 It makes one structured-output call to produce a Plan, then sanitizes it (valid agent
 names, valid dependency ids) before the scheduler runs it.
+
+Roster pre-filtering: the PLANNING catalog no longer lists every agent. Each agent is
+scored by similarity between the task text and its description+when_to_use (embedding
+cosine blended with lexical token overlap, degrading to lexical-only on the hash
+backend or any embedding failure — the repo-wide convention), and the catalog keeps a
+core set + every custom agent + the top-ranked others up to ``settings.roster_max``
+(0 = no filtering). Filtering affects only the catalog TEXT the planner reads: agents
+stay fully constructed and routable if a plan names them, and the scheduler is
+untouched. Selection is deterministic for identical inputs.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 
 from ..config import Settings
 from ..llm.provider import LLMProvider
 from ..llm.schemas import Plan
+from ..memory.embeddings import _tokenize, active_embedder_name, get_embedder
 from .base import BaseAgent
-from .registry import capability_catalog
+from .registry import builtin_agent_names, capability_catalog
 
 logger = logging.getLogger("ada.orchestrator")
+
+# Roles the planning catalog always lists (when present in the roster), no matter how
+# the task-similarity ranking scores them — the dev-lifecycle spine planning leans on.
+CORE_ROSTER = ("coder", "researcher", "test_engineer", "debugger", "documenter")
+
+# Blend weights: semantic cosine dominates, lexical overlap breaks vocabulary misses.
+_SEMANTIC_WEIGHT = 0.6
+_LEXICAL_WEIGHT = 0.4
+
+# A role is demoted (per project) after this many consecutive review failures there.
+_DEMOTION_STREAK = 3
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _agent_text(agent: BaseAgent) -> str:
+    p = agent.profile
+    return f"{p.description} {p.when_to_use}"
+
+
+def score_agents(prompt: str, agents: dict[str, BaseAgent], settings: Settings, *,
+                 embedder=None) -> dict[str, float]:
+    """Task-relevance score per agent: embedding cosine blended with lexical overlap.
+
+    The query is embedded ONCE (a single batched ``embed`` call covers query + all
+    agent texts). On the hash backend / hash fallback / any embedding failure the
+    semantic leg is dropped and the lexical overlap alone ranks (the same degradation
+    convention as memory/KB/code-index retrieval). Deterministic for identical inputs.
+    ``embedder`` is an injection point for tests; None uses the process-wide one.
+    """
+    texts = {name: _agent_text(agent) for name, agent in agents.items()}
+    q_tokens = set(_tokenize(prompt))
+    lex: dict[str, float] = {}
+    for name, text in texts.items():
+        toks = set(_tokenize(text))
+        lex[name] = (len(q_tokens & toks) / len(q_tokens)) if q_tokens and toks else 0.0
+    emb = embedder
+    if emb is None:
+        try:
+            emb = get_embedder(settings)
+            if active_embedder_name().startswith("hash"):
+                emb = None  # hash backend/fallback: lexical-only quality by convention
+        except Exception:  # noqa: BLE001 — ranking must never break planning
+            emb = None
+    if emb is None:
+        return lex
+    try:
+        names = list(texts)
+        vecs = emb.embed([prompt] + [texts[n] for n in names])
+        qv, avs = vecs[0], vecs[1:]
+        sem = {n: max(0.0, _cosine(qv, av)) for n, av in zip(names, avs)}
+    except Exception:  # noqa: BLE001 — embedder down mid-flight: lexical leg alone
+        logger.debug("roster embedding failed; lexical-only ranking", exc_info=True)
+        return lex
+    return {n: _SEMANTIC_WEIGHT * sem[n] + _LEXICAL_WEIGHT * lex[n] for n in texts}
+
+
+def select_roster(prompt: str, agents: dict[str, BaseAgent], settings: Settings, *,
+                  demoted: frozenset[str] | set[str] = frozenset(),
+                  embedder=None) -> dict[str, BaseAgent]:
+    """The subset of ``agents`` the planning catalog lists (original roster order).
+
+    Always kept: the core set (CORE_ROSTER) and every custom agent (any name not in
+    the built-in registry). Remaining slots up to ``settings.roster_max`` go to the
+    top-scoring other agents (ties broken by name — deterministic). ``roster_max=0``
+    — or a roster that already fits — disables filtering entirely. ``demoted`` roles
+    are excluded from the ranked slots (always-kept roles are never excluded here;
+    the catalog builder appends a warning note to them instead).
+    """
+    limit = int(getattr(settings, "roster_max", 10) or 0)
+    if limit <= 0 or len(agents) <= limit:
+        return dict(agents)
+    builtins = builtin_agent_names()
+    always = {n for n in agents if n in CORE_ROSTER or n not in builtins}
+    scores = score_agents(prompt, agents, settings, embedder=embedder)
+    candidates = [n for n in agents if n not in always and n not in demoted]
+    ranked = sorted(candidates, key=lambda n: (-scores.get(n, 0.0), n))
+    keep = always | set(ranked[:max(0, limit - len(always))])
+    return {n: a for n, a in agents.items() if n in keep}
+
+
+def demoted_roles(project_recent: dict[str, list[bool]] | None) -> frozenset[str]:
+    """Roles whose last ``_DEMOTION_STREAK`` outcomes in this project all failed."""
+    recent = project_recent or {}
+    return frozenset(
+        role for role, seq in recent.items()
+        if len(seq) >= _DEMOTION_STREAK and not any(seq[:_DEMOTION_STREAK])
+    )
 
 _SYSTEM = (
     "You are the Orchestrator of a team of specialized AI agents. Given a task, you break it "
@@ -68,11 +176,44 @@ class Orchestrator:
         self._settings = settings
         self._provider = provider
 
+    def _planning_catalog(
+        self, prompt: str, agents: dict[str, BaseAgent], *,
+        agent_stats: dict[str, dict] | None = None,
+        project_recent: dict[str, list[bool]] | None = None,
+    ) -> str:
+        """The pre-filtered, track-record-annotated catalog for the PLANNING prompt.
+
+        Per listed agent, one line in the registry's format, plus:
+          - " (recent: <passed>/<n> passed)" when its aggregate outcome count n >= 5;
+          - a warning note when the role's last 3 outcomes in this project all failed
+            but the role is always-kept (core/custom) — ranked roles in that state are
+            excluded from the ranked slots by ``select_roster`` instead.
+        Formatting is stable and deterministic for identical inputs.
+        """
+        stats = agent_stats or {}
+        demoted = demoted_roles(project_recent)
+        selected = select_roster(prompt, agents, self._settings, demoted=demoted)
+        lines: list[str] = []
+        for name, agent in selected.items():
+            line = capability_catalog({name: agent})
+            rec = stats.get(name) or {}
+            n = int(rec.get("n") or 0)
+            if n >= 5:
+                line += f" (recent: {int(rec.get('passed') or 0)}/{n} passed)"
+            if name in demoted:
+                line += (" (warning: this role's last 3 subtasks in this project "
+                         "failed review — prefer another agent where reasonable)")
+            lines.append(line)
+        return "\n".join(lines)
+
     async def make_plan(
         self, prompt: str, agents: dict[str, BaseAgent], prior_knowledge: str = "",
         repo_context: str = "", track_record: str = "",
+        agent_stats: dict[str, dict] | None = None,
+        project_recent: dict[str, list[bool]] | None = None,
     ) -> Plan:
-        catalog = capability_catalog(agents)
+        catalog = self._planning_catalog(prompt, agents, agent_stats=agent_stats,
+                                         project_recent=project_recent)
         if track_record:
             catalog += f"\n\nAGENT TRACK RECORD (empirical pass rates from past runs):\n{track_record}"
         prior = (

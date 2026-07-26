@@ -45,7 +45,9 @@ from .orchestration.run_control import RunControl
 from .orchestration.run_store import RunStore
 from .orchestration.scheduler import BudgetExceeded, Scheduler
 from .orchestration.session_pool import Session, SessionPool
-from .orchestration.task import DAGError, RunStatus, SubTaskState, TaskRun, new_task_id
+from .orchestration.task import (
+    SATISFYING, DAGError, RunStatus, SubTaskState, TaskRun, new_task_id,
+)
 from .orchestration.trace import Tracer
 from .security.redaction import AuditLog, redact, untrusted
 from .tools.registry import ToolBox, ToolContext
@@ -74,6 +76,51 @@ _SIBLING_SECTION_CHARS = 1500  # total budget for the whole sibling section
 # Wall-clock cap on the run-start code-index pass; past it the run proceeds while the
 # indexing thread finishes in the background (retrieval sees a partial index until then).
 _CODE_INDEX_MAX_SECONDS = 60.0
+
+# Upstream result digests: dependent subtasks inherit each completed upstream's result
+# TEXT (not just its files via the worktree merge) as one bounded context part.
+_UPSTREAM_ITEM_CHARS = 500     # per-upstream digest cap
+_UPSTREAM_SECTION_CHARS = 1500  # whole "Upstream results" part cap
+
+
+def upstream_results_part(run: TaskRun, state: SubTaskState) -> tuple[str, str] | None:
+    """One "Upstream results" context part for a subtask with dependencies.
+
+    Per upstream, one entry prefixed ``[<upstream id> <title>]``: a digest of its
+    result text (~500 chars each, ~1500 total) for completed upstreams — with a
+    caveat marker for soft-passes — or a status line (no text inherited) for
+    failed/blocked ones. Returns None for dependency-free subtasks, so plans without
+    depends_on assemble prompts byte-identical to the pre-feature behavior.
+    """
+    deps = state.spec.depends_on
+    if not deps:
+        return None
+    lines: list[str] = []
+    used = 0
+    for dep_id in deps:
+        dep = run.subtasks.get(dep_id)
+        if dep is None:
+            continue
+        prefix = f"[{dep_id} {dep.spec.title}]"
+        if dep.status in SATISFYING and (dep.result or "").strip():
+            digest = dep.result.strip()
+            if len(digest) > _UPSTREAM_ITEM_CHARS:
+                digest = digest[:_UPSTREAM_ITEM_CHARS].rstrip() + "…"
+            caveat = (" (passed with caveats — verify before relying on it)"
+                      if dep.status is RunStatus.PASSED_WITH_CAVEATS else "")
+            entry = f"{prefix}{caveat} {digest}"
+        else:
+            entry = f"{prefix} status: {dep.status.value} — no result inherited"
+        remaining = _UPSTREAM_SECTION_CHARS - used
+        if remaining <= len(prefix):  # not even the prefix fits — stop cleanly
+            break
+        if len(entry) > remaining:
+            entry = entry[:remaining - 1].rstrip() + "…"
+        lines.append(entry)
+        used += len(entry) + 1
+    if not lines:
+        return None
+    return ("Upstream results", "\n".join(lines))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -138,9 +185,11 @@ class Engine:
             parent_ws = self.settings.run_workspace(continue_from)
             rmap = await asyncio.to_thread(build_repo_map, parent_ws)
             repo_context = self._continuation_summary(continue_from) + (rmap or "")
+        stats, recent = self._routing_signals()
         return await self.orchestrator.make_plan(
             prompt, self.agents, prior_knowledge=self._recall_prior(prompt),
             repo_context=repo_context, track_record=self._track_record_text(),
+            agent_stats=stats, project_recent=recent,
         )
 
     async def refine_plan(self, prompt: str, plan: Plan, instruction: str) -> Plan:
@@ -367,9 +416,11 @@ class Engine:
                 emit(status(f"Recalled {len(prior.splitlines())} relevant lesson(s) from past runs."))
             emit(status("Orchestrator: decomposing the task…"))
             with self._tracer.span("phase", "plan"):
+                stats, recent = self._routing_signals()
                 plan = await self.orchestrator.make_plan(
                     prompt, self.agents, prior_knowledge=prior, repo_context=repo_context,
-                    track_record=self._track_record_text())
+                    track_record=self._track_record_text(),
+                    agent_stats=stats, project_recent=recent)
         else:
             plan = Orchestrator._sanitize(plan, self.agents)  # validate an edited/approved plan
 
@@ -737,6 +788,20 @@ class Engine:
                 lines.append(f"- [{desc}] task '{(r.get('prompt') or '')[:60]}': {note}".rstrip(": "))
         return "\n".join(lines)
 
+    def _routing_signals(self) -> tuple[dict[str, dict], dict[str, list[bool]]]:
+        """Per-role outcome aggregates + this project's recent outcomes, for the
+        planning catalog's record notes and per-project demotion. Best-effort."""
+        try:
+            stats = self.runs.agent_stats()
+        except Exception:
+            stats = {}
+        try:
+            recent = self.runs.agent_recent_project_outcomes(
+                self.settings.project or "default")
+        except Exception:
+            recent = {}
+        return stats, recent
+
     def _track_record_text(self) -> str:
         try:
             tr = self.runs.agent_track_record()
@@ -1060,8 +1125,12 @@ class Engine:
             )
             parts: list[tuple[str, str]] = [
                 ("Overall task", run.prompt), ("Plan summary", run.plan.summary)]
-            for dep_id, dep_result in deps.items():
-                parts.append((f"Result of dependency {dep_id}", dep_result))
+            # Upstream result digests: dependents inherit upstream REASONING (bounded
+            # per-item/section digests), not just merged files. Absent entirely for
+            # dependency-free subtasks — their prompts stay byte-identical.
+            up_part = upstream_results_part(run, state)
+            if up_part is not None:
+                parts.append(up_part)
             if state.verdict and not state.verdict.passed and state.verdict.suggestions:
                 parts.append(("Your previous attempt failed review — fix these",
                               "\n".join(f"- {s}" for s in state.verdict.suggestions)))
@@ -1085,9 +1154,12 @@ class Engine:
             # so this block adds nothing there (byte-identical prompts, cassette rule).
             if self._code_index is not None:
                 try:
+                    # role-weighted: the subtask's agent role biases retrieval toward
+                    # its path affinities (score boost only, never a hard filter).
                     code_part = await asyncio.to_thread(
                         self._code_index.retrieval_context,
-                        f"{state.spec.title} {state.spec.description}")
+                        f"{state.spec.title} {state.spec.description}",
+                        role=state.agent)
                     if code_part:
                         parts.append(("Relevant code (indexed)",
                                       untrusted(code_part, source="code-index")))

@@ -54,10 +54,13 @@ class FlakyProvider:
                         effort=None, max_tokens=8000, max_iterations=8, workdir=None,
                         on_step=None, **_kw):
         await asyncio.sleep(0.01)
+        # A subtask's own task text starts with its title; upstream-result digests in a
+        # dependent's context also MENTION upstream titles ("[s1 Research approach] …"),
+        # so match the prompt head only — "did this subtask itself run".
         for title in ("Research approach", "Implement change", "Document it"):
-            if title in prompt:
+            if prompt.startswith(title):
                 self.executed.append(title)
-        if "Implement change" in prompt and not self.healed:
+        if prompt.startswith("Implement change") and not self.healed:
             raise RuntimeError("transient tool crash")
         return "Done — satisfies the acceptance criteria."
 

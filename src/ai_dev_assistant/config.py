@@ -104,6 +104,9 @@ class Settings:
     adaptive_replan: bool = True    # amend the DAG between batches (bounded self-heal of
                                     # failed subtasks); on by default
     max_plan_subtasks: int = 24     # reject a plan larger than this (hallucination guard)
+    roster_max: int = 10            # cap on agents listed in the planning catalog: core set
+                                    # + all customs + top task-relevant others up to this
+                                    # many total (0 = no filtering; routing is unaffected)
 
     # --- Cost guardrail ---
     budget_usd: float = 0.0         # 0 = no cap; otherwise stop scheduling new work past this
@@ -221,6 +224,7 @@ class Settings:
             objective_static=_bool("ADA_OBJECTIVE_STATIC", True),
             adaptive_replan=_bool("ADA_ADAPTIVE_REPLAN", True),
             max_plan_subtasks=_int("ADA_MAX_PLAN_SUBTASKS", 24),
+            roster_max=_int("ADA_ROSTER_MAX", 10),
             budget_usd=_float("ADA_BUDGET_USD", 0.0),
             monthly_budget_usd=_float("ADA_MONTHLY_BUDGET_USD", 0.0),
             agent_max_turns=_int("ADA_AGENT_MAX_TURNS", 24),
@@ -408,6 +412,13 @@ SETTINGS_SCHEMA: list[dict] = [
     {"key": "reviewer_effort", "group": "LLM & Models", "label": "Reviewer effort",
      "help": "Reasoning effort for verdict review.", "type": "choice",
      "choices": _EFFORT_CHOICES},
+    {"key": "roster_max", "group": "LLM & Models", "label": "Planning roster size",
+     "help": "Cap on how many agents the orchestrator's planning catalog lists: a core "
+             "set (coder, researcher, test_engineer, debugger, documenter), every custom "
+             "agent, and the top task-relevant specialists up to this many total — ranked "
+             "by embedding + lexical similarity between the task and each agent's "
+             "description. 0 lists the full roster. Agents stay fully routable even when "
+             "not listed.", "type": "int"},
     {"key": "request_timeout", "group": "LLM & Models", "label": "Request timeout (s)",
      "help": "Per-LLM-call HTTP timeout in seconds.", "type": "float"},
     {"key": "llm_max_retries", "group": "LLM & Models", "label": "LLM max retries",

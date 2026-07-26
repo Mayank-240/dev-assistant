@@ -59,6 +59,33 @@ _LOCKFILES = {
 _MAX_FILE_BYTES = 400_000   # larger files are almost never hand-written source
 _MAX_LINE_CHARS = 2000      # any longer single line = minified/generated -> skip file
 
+# Role-weighted retrieval: per-agent-role path affinities. A retrieved chunk whose
+# path matches its requesting role's patterns gets a score BOOST (never a hard
+# filter — off-affinity chunks still rank, just lower). Patterns starting with "."
+# are suffix (extension) matches; anything else is a substring match on the
+# lowercased relative path. Roles absent from the map get no bias at all.
+_ROLE_PATH_AFFINITY: dict[str, tuple[str, ...]] = {
+    "frontend": (".html", ".css", ".js", ".jsx", ".tsx", "static", "components"),
+    "database": (".sql", "migrations", "schema", "models"),
+    "devops": ("dockerfile", ".yml", ".yaml", "ci", "deploy"),
+    "test_engineer": ("tests/", "test_", "spec"),
+    "api_designer": ("routes", "api", "openapi"),
+}
+_ROLE_BOOST = 1.5           # score multiplier for affinity-matching paths
+_ROLE_POOL_K = 16           # wider candidate pool when a role bias applies
+
+
+def _path_matches_role(path: str, patterns: tuple[str, ...]) -> bool:
+    p = path.lower()
+    for pat in patterns:
+        if pat.startswith("."):
+            if p.endswith(pat):
+                return True
+        elif pat in p:
+            return True
+    return False
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
     path TEXT PRIMARY KEY,
@@ -273,8 +300,14 @@ class CodeIndex:
                         "text": text, "score": round(float(score), 4)})
         return out
 
-    def retrieval_context(self, query: str, budget_chars: int = 2000) -> str | None:
+    def retrieval_context(self, query: str, budget_chars: int = 2000,
+                          role: str = "") -> str | None:
         """A budget-bounded "relevant code" block for the engine's context assembly.
+
+        ``role`` (the requesting subtask's agent role) applies the role's path
+        affinities from ``_ROLE_PATH_AFFINITY`` as a ×1.5 score boost on matching
+        paths over a wider candidate pool, then re-ranks — a bias, never a hard
+        filter. A role with no affinity entry (or "") behaves exactly as before.
 
         Exact format (the engine appends this verbatim as an UNTRUSTED context part
         next phase — retrieved file content must never be treated as instructions)::
@@ -291,7 +324,17 @@ class CodeIndex:
         line don't fit is dropped. Returns None when nothing was retrieved or the
         budget can't fit a single chunk line.
         """
-        hits = self.search(query, top_k=8)
+        patterns = _ROLE_PATH_AFFINITY.get(role)
+        if patterns:
+            hits = self.search(query, top_k=_ROLE_POOL_K)
+            for hit in hits:
+                if _path_matches_role(hit["path"], patterns):
+                    hit["score"] = round(hit["score"] * _ROLE_BOOST, 4)
+            # stable sort: equal boosted scores keep their original (best-first) order
+            hits.sort(key=lambda h: -h["score"])
+            hits = hits[:8]
+        else:
+            hits = self.search(query, top_k=8)
         if not hits:
             return None
         parts = ["relevant code (from the project code index; may be stale):"]
