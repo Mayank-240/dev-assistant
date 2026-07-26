@@ -18,7 +18,21 @@ specified in [PLAN.md](PLAN.md) and not yet built.
   cancellation kills the full child-process tree.
 
 ## Agents & tools
-- 14 specialists + reviewer/reflector/orchestrator.
+- 19 built-in specialists + reviewer/reflector/orchestrator: the dev-lifecycle
+  spine (product_manager, architect, researcher, coder, test_engineer,
+  documenter), quality roles (debugger, refactorer, security_auditor,
+  accessibility_auditor, ux_reviewer), domain roles (devops, database,
+  frontend, performance, integrator), and delivery roles (api_designer,
+  migrator, release_manager). Review-oriented roles (documenter,
+  security_auditor, accessibility_auditor, ux_reviewer) run read-only.
+- Custom agents: operator-defined specialists in
+  `<data_dir>/custom_agents.json` (name, description, when_to_use,
+  system_prompt, tools, optional effort/model) join the roster next to
+  built-ins and are routable by the orchestrator like any other role.
+  Entries are validated on load (slug name, no collision with built-ins,
+  tools must exist in the toolbox, effort tier checked); bad entries are
+  skipped with a logged warning, and a missing/corrupt file simply means no
+  customs. `role_models` routing and per-role effort apply to customs too.
 - Tools: memory/KB/KG; file read (offset/limit) / write / edit (uniqueness,
   replace-all) / 3-way patch / list / ripgrep grep; `symbols` /
   `find_references`; sandboxed `run_command`, validated `install_packages`,
@@ -129,6 +143,16 @@ specified in [PLAN.md](PLAN.md) and not yet built.
   `--- Upstream results ---` section. Unknown slugs and cycles are rejected up
   front (HTTP 400); without deps, behavior and child prompts are unchanged. The
   rollup report records the dependency order.
+- Workspaces: a named group of inter-related projects, stored in
+  `workspaces.json` next to the project registry. A project belongs to at most
+  ONE workspace — assigning it elsewhere moves it; deleting a workspace removes
+  only the group (projects survive ungrouped), and deleting a project
+  unassigns it. Each workspace carries default dependencies
+  (`{slug: [upstream slugs]}`, validated against members and acyclic via the
+  fan-out's own validator), and `workspace_run_spec(settings, ws_slug, subset)`
+  expands the workspace — or a validated subset, dropping edges to excluded
+  members — into the `projects` + `deps` payload fed straight into the
+  existing cross-project fan-out run path.
 - Cross-project golden eval task (`cross_logging_fix`): two sub-repo fixtures
   imported as two ephemeral projects, driven through the real fan-out path and
   graded per child on held-out tests plus a rollup grader.

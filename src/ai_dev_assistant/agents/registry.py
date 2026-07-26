@@ -233,6 +233,20 @@ _SPECS: list[_Spec] = [
         readonly=True,
     ),
     _Spec(
+        "ux_reviewer",
+        "Reviews user-facing copy, flows, and interaction states for usability.",
+        "Use for reviewing user-facing text, screens, or flows — wording and tone, confusing "
+        "steps, and missing empty/loading/error states. For WCAG/ARIA depth use "
+        "accessibility_auditor; not for building UI.",
+        "You are a UX Reviewer agent. You review user-facing surfaces — copy, flows, and "
+        "interaction states — for clarity and usability: wording and tone, confusing or "
+        "redundant steps, missing empty/loading/error states, unhelpful error messages, and "
+        "inconsistent terminology. Report concrete findings with the exact location, why it "
+        "hurts the user, severity, and the specific improved wording or flow change. Be "
+        "specific, not generic.",
+        readonly=True,
+    ),
+    _Spec(
         "migrator",
         "Plans and executes framework, version, and dependency migrations safely.",
         "Use for upgrading frameworks/languages/dependencies, replacing deprecated APIs, or "
@@ -255,14 +269,24 @@ _SPECS: list[_Spec] = [
 ]
 
 
+def builtin_agent_names() -> set[str]:
+    """Names reserved by the built-in roster (plus the reviewer role key)."""
+    return {spec.name for spec in _SPECS} | {"reviewer"}
+
+
 def build_agents(settings: Settings) -> dict[str, BaseAgent]:
+    from .custom import load_custom_specs
+
     model = settings.agent_model
     effort = settings.agent_effort
+    # User-defined specialists from <data_dir>/custom_agents.json join the roster
+    # alongside built-ins (invalid/missing entries already filtered out).
+    custom_specs = load_custom_specs(settings)
     # Per-role routing (role_models, e.g. "documenter=claude-haiku-4-5"): a mapped role
     # gets its own model; unmapped roles keep the single default. "reviewer" is a valid
     # key too but is consumed by agents/reviewer.py, not the routable roster.
     role_models = settings.role_models_map
-    known = {spec.name for spec in _SPECS} | {"reviewer"}
+    known = builtin_agent_names() | {spec.name for spec in custom_specs}
     for role in role_models.keys() - known:
         logger.warning("role_models: unknown role %r ignored (valid roles: %s)",
                        role, ", ".join(sorted(known)))
@@ -280,6 +304,21 @@ def build_agents(settings: Settings) -> dict[str, BaseAgent]:
             ),
             system_prompt=prompt,
             model=role_models.get(spec.name, model),
+        )
+    for cspec in custom_specs:
+        # Same construction as built-ins: the author's system_prompt verbatim, then the
+        # shared collaboration/safety preamble. role_models (the operator's console
+        # routing) wins over the spec's own model; a blank effort inherits the default.
+        agents[cspec.name] = BaseAgent(
+            AgentProfile(
+                name=cspec.name,
+                description=cspec.description,
+                when_to_use=cspec.when_to_use,
+                tools=list(cspec.tools),
+                effort=cspec.effort or effort,
+            ),
+            system_prompt=cspec.system_prompt + " " + _COLLAB,
+            model=role_models.get(cspec.name, cspec.model or model),
         )
     return agents
 
