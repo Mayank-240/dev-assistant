@@ -909,3 +909,26 @@ def test_ws_accepts_session_cookie(tmp_path):
     with c.websocket_connect("/ws/whatever",
                              headers={"cookie": f"ada_token={_TOKEN}"}) as ws:
         assert ws.receive_json()["type"] == "error"  # unknown task, but authenticated
+
+
+# ---- landing page vs console shell ----
+
+def test_root_serves_landing_and_app_serves_console(tmp_path):
+    c = _client(tmp_path)
+    landing = c.get("/")
+    assert landing.status_code == 200
+    assert "Open console" in landing.text and 'href="/app"' in landing.text
+    console = c.get("/app")
+    assert console.status_code == 200
+    assert 'id="palette-modal"' in console.text  # the SPA shell, not the landing
+
+
+def test_landing_and_console_open_with_auth_enabled(tmp_path):
+    settings = Settings(
+        llm_backend="anthropic", anthropic_api_key="", embeddings_backend="hash",
+        data_dir=tmp_path / "data", docs_dir=tmp_path / "docs", workspace_dir=tmp_path / "ws",
+    )
+    c = TestClient(create_app(settings, api_token="sekrit-token"))
+    assert c.get("/").status_code == 200
+    assert c.get("/app").status_code == 200
+    assert c.get("/api/projects").status_code == 401

@@ -79,7 +79,7 @@ uv pip install -e ".[dev]"
 # run the test suite (no login needed — offline fakes)
 uv run pytest -q
 
-# launch the web UI  →  http://127.0.0.1:8000
+# launch the web UI  →  landing at http://127.0.0.1:8000, console at /app
 uv run ai-dev-assistant server
 
 # …or run a task headless from the terminal

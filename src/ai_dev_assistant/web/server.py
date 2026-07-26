@@ -416,7 +416,7 @@ def create_app(settings: Settings | None = None, host: str | None = None,
     @app.middleware("http")
     async def no_cache(request, call_next):  # static assets should never be cached in dev
         response = await call_next(request)
-        if request.url.path.startswith("/static") or request.url.path == "/":
+        if request.url.path.startswith("/static") or request.url.path in ("/", "/app"):
             response.headers["Cache-Control"] = "no-store, max-age=0"
         return response
 
@@ -2200,6 +2200,15 @@ def create_app(settings: Settings | None = None, host: str | None = None,
         app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 
     @app.get("/")
+    async def landing() -> FileResponse:
+        # Public product page; the console shell lives at /app. Data stays behind
+        # the /api/* auth middleware either way, so both shells are safe to serve.
+        target = _STATIC / "landing.html"
+        if not target.is_file():  # older static bundles: fall back to the console
+            target = _STATIC / "index.html"
+        return FileResponse(str(target))
+
+    @app.get("/app")
     async def index() -> FileResponse:
         return FileResponse(str(_STATIC / "index.html"))
 

@@ -59,7 +59,8 @@ Then:
 curl -H "Authorization: Bearer <token>" http://localhost:8000/api/tasks
 ```
 
-The web UI is at `http://localhost:8000/` (the page and `/static` are open;
+The landing page is at `http://localhost:8000/` and the console at
+`http://localhost:8000/app` (both shells and `/static` are open;
 every `/api/*` call and WebSocket needs the token). The UI shows a sign-in
 screen: paste the token once and an HttpOnly `ada_token` session cookie takes
 over for all fetches, WebSockets and downloads. Non-browser clients keep using

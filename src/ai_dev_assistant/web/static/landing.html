@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Dev Assistant — a multi-agent dev team for your projects</title>
+  <meta name="description" content="Plans work into a DAG, runs specialist Claude agents in parallel git worktrees, reviews every subtask objectively, and delivers on ada/* branches for your acceptance." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <script>
+    /* set theme before first paint to avoid flash (same convention as the console) */
+    (function () {
+      try {
+        var pref = localStorage.getItem('ada-theme') || 'system';
+        var dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.setAttribute('data-theme', pref === 'system' ? (dark ? 'dark' : 'light') : pref);
+      } catch (e) {}
+    })();
+  </script>
+  <style>
+    /* Standalone Modernist sheet — the landing page must not depend on the console's
+       styles.css (it is public-safe and served before any auth). */
+    @import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&display=swap');
+
+    :root {
+      --sans: 'Archivo', system-ui, sans-serif;
+      --red: #ec3013;
+      --paper: #f4f1ec;
+      --ink: #16130f;
+      --ink-2: #5c554b;
+      --line: #16130f;
+      --panel: #efeae2;
+    }
+    :root[data-theme="dark"] {
+      --paper: #16130f;
+      --ink: #f4f1ec;
+      --ink-2: #a89f92;
+      --line: #f4f1ec;
+      --panel: #201c17;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: var(--sans);
+      background: var(--paper);
+      color: var(--ink);
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap { width: min(100% - 96px, 1280px); margin-inline: auto; }
+    @media (max-width: 900px) { .wrap { width: min(100% - 40px, 1280px); } }
+
+    /* top bar */
+    header {
+      border-bottom: 2px solid var(--line);
+      position: sticky; top: 0; background: var(--paper); z-index: 5;
+    }
+    .bar { display: flex; align-items: center; justify-content: space-between; padding: 18px 0; }
+    .wordmark { display: flex; align-items: center; gap: 10px; font-weight: 800; letter-spacing: .12em; font-size: 14px; }
+    .mark { width: 22px; height: 22px; background: var(--red); color: #fff; display: grid; place-items: center; font-size: 12px; }
+    .bar nav { display: flex; gap: 26px; align-items: center; }
+    .bar nav a { color: var(--ink-2); text-decoration: none; font-size: 13px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+    .bar nav a:hover { color: var(--red); }
+    .btn {
+      display: inline-block; background: var(--red); color: #fff; text-decoration: none;
+      font-weight: 700; letter-spacing: .08em; text-transform: uppercase; font-size: 13px;
+      padding: 12px 22px; border: 2px solid var(--red);
+    }
+    .btn:hover { background: transparent; color: var(--red); }
+    .btn.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+    .btn.ghost:hover { color: var(--red); border-color: var(--red); }
+
+    /* hero */
+    .hero { padding: 96px 0 72px; border-bottom: 2px solid var(--line); }
+    .kicker { color: var(--red); font-weight: 700; letter-spacing: .18em; text-transform: uppercase; font-size: 12px; margin-bottom: 22px; }
+    h1 { font-size: clamp(40px, 6vw, 76px); line-height: 1.02; font-weight: 800; letter-spacing: -.02em; max-width: 18ch; }
+    h1 em { font-style: normal; color: var(--red); }
+    .sub { margin-top: 26px; max-width: 62ch; color: var(--ink-2); font-size: 17px; line-height: 1.6; }
+    .cta { margin-top: 36px; display: flex; gap: 14px; flex-wrap: wrap; }
+    .hero-note { margin-top: 18px; font-size: 13px; color: var(--ink-2); }
+    .hero-note b { color: var(--ink); }
+
+    /* how it works */
+    section { padding: 72px 0; border-bottom: 2px solid var(--line); }
+    h2 { font-size: 13px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; margin-bottom: 34px; }
+    h2::before { content: "◆ "; color: var(--red); }
+    .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; border: 2px solid var(--line); }
+    .step { padding: 26px 22px 30px; border-right: 2px solid var(--line); }
+    .step:last-child { border-right: 0; }
+    .step .n { font-size: 34px; font-weight: 800; color: var(--red); }
+    .step h3 { font-size: 15px; margin: 12px 0 8px; letter-spacing: .04em; text-transform: uppercase; }
+    .step p { font-size: 13.5px; line-height: 1.55; color: var(--ink-2); }
+    @media (max-width: 900px) {
+      .steps { grid-template-columns: 1fr 1fr; }
+      .step:nth-child(2) { border-right: 0; }
+      .step:nth-child(-n+2) { border-bottom: 2px solid var(--line); }
+    }
+
+    /* features */
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; }
+    @media (max-width: 1200px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+    .tile { border: 2px solid var(--line); padding: 22px 20px 26px; background: var(--panel); }
+    .tile h3 { font-size: 14.5px; letter-spacing: .04em; text-transform: uppercase; margin-bottom: 10px; }
+    .tile h3::before { content: "■ "; color: var(--red); font-size: 11px; vertical-align: 2px; }
+    .tile p { font-size: 13.5px; line-height: 1.55; color: var(--ink-2); }
+
+    /* quick start */
+    .qs { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    @media (max-width: 900px) { .qs { grid-template-columns: 1fr; } }
+    .qs .card { border: 2px solid var(--line); padding: 24px 22px; }
+    .qs h3 { font-size: 14.5px; letter-spacing: .04em; text-transform: uppercase; margin-bottom: 8px; }
+    .qs p { font-size: 13.5px; color: var(--ink-2); line-height: 1.55; margin-bottom: 14px; }
+    pre {
+      background: var(--ink); color: var(--paper); padding: 16px 18px; overflow-x: auto;
+      font-size: 12.5px; line-height: 1.6; font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    }
+    /* the ink/paper vars invert in dark mode, so pin the code colors explicitly */
+    :root[data-theme="dark"] pre { background: #000; color: #f4f1ec; }
+    pre .c { opacity: .55; }
+
+    footer { padding: 40px 0 56px; display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; align-items: center; }
+    footer .fine { font-size: 13px; color: var(--ink-2); max-width: 60ch; line-height: 1.6; }
+    footer a { color: var(--ink); font-weight: 600; }
+    footer a:hover { color: var(--red); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap bar">
+      <div class="wordmark"><span class="mark">◆</span> AI DEV ASSISTANT</div>
+      <nav>
+        <a href="#how">How it works</a>
+        <a href="#features">Features</a>
+        <a href="#start">Quick start</a>
+        <a class="btn" href="/app">Open console →</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="hero">
+    <div class="wrap">
+      <div class="kicker">Self-hosted · Multi-agent · Built on the Claude Agent SDK</div>
+      <h1>A dev team of agents, working <em>inside your projects.</em></h1>
+      <p class="sub">
+        Describe the work. The assistant plans it into a dependency graph, runs specialist
+        Claude agents in parallel git worktrees, reviews every subtask against objective
+        test gates, and hands you the result on an <code>ada/*</code> branch — nothing
+        lands without your acceptance.
+      </p>
+      <div class="cta">
+        <a class="btn" href="/app">Open console →</a>
+        <a class="btn ghost" href="https://github.com/Mayank-240/dev-assistant">Source on GitHub</a>
+      </div>
+      <p class="hero-note"><b>Runs on your Claude Code login.</b> No API key required.</p>
+    </div>
+  </div>
+
+  <section id="how">
+    <div class="wrap">
+      <h2>How it works</h2>
+      <div class="steps">
+        <div class="step"><div class="n">01</div><h3>Plan</h3>
+          <p>The orchestrator decomposes your prompt into subtasks with dependencies, routed to specialist agents — reviewable and steerable before anything runs.</p></div>
+        <div class="step"><div class="n">02</div><h3>Execute in parallel</h3>
+          <p>Independent subtasks run concurrently, each in its own git worktree with per-subtask commits. Live transcripts show every thought, tool call, and result.</p></div>
+        <div class="step"><div class="n">03</div><h3>Objective review</h3>
+          <p>A reviewer scores each subtask against acceptance criteria and baseline-delta tests. Failures self-heal with bounded repair attempts.</p></div>
+        <div class="step"><div class="n">04</div><h3>Deliver</h3>
+          <p>Accepted work lands on an <code>ada/*</code> branch — cherry-pick per subtask or take the whole task. Your repo is never touched without you.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="features">
+    <div class="wrap">
+      <h2>Features</h2>
+      <div class="grid">
+        <div class="tile"><h3>Project-first</h3><p>Create greenfield projects or import an existing repo in place under a strict read-only contract — the assistant only ever writes to its own branches.</p></div>
+        <div class="tile"><h3>Attention screens</h3><p>Agents can ask you questions and request permission mid-run; asks and grants are first-class screens in the console.</p></div>
+        <div class="tile"><h3>Self-healing runs</h3><p>Review-failed, errored, and timed-out subtasks get bounded automatic repair subtasks — retries are visible, never silent.</p></div>
+        <div class="tile"><h3>Live transcripts</h3><p>Full per-subtask agent conversations — thinking, tool calls, tool results — streamed live and browsable for every past run.</p></div>
+        <div class="tile"><h3>Sandboxed execution</h3><p>Agent shell commands run under rlimits, bwrap, or a container — configurable from the settings console. The model loop stays on your login.</p></div>
+        <div class="tile"><h3>Cost analytics</h3><p>Per-run and per-subtask spend, budgets that stop work mid-subtask, cost-per-outcome across projects.</p></div>
+        <div class="tile"><h3>Playbooks &amp; schedules</h3><p>One-click pre-tuned task templates, plus recurring runs on a timer with their own budgets.</p></div>
+        <div class="tile"><h3>Memory &amp; knowledge</h3><p>Project memory, a knowledge graph built from every run, drag-and-drop knowledge base, and global search under ⌘K.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="wrap">
+      <h2>Quick start</h2>
+      <div class="qs">
+        <div class="card">
+          <h3>Local (recommended)</h3>
+          <p>Requires <b>uv</b> and a logged-in <b>Claude Code</b> — the SDK reuses your login, no API key.</p>
+          <pre>git clone https://github.com/Mayank-240/dev-assistant
+cd dev-assistant
+uv run ai-dev-assistant server
+<span class="c"># console at http://localhost:8000/app</span></pre>
+        </div>
+        <div class="card">
+          <h3>Docker (one line)</h3>
+          <p>Published to GHCR on every commit. The container can't reach your host login, so it takes an API key instead.</p>
+          <pre>docker run -d --name ada -p 8000:8000 -v ada-data:/data \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  ghcr.io/mayank-240/dev-assistant:latest</pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="wrap">
+    <div class="wordmark"><span class="mark">◆</span> AI DEV ASSISTANT</div>
+    <p class="fine">
+      Self-hosted and yours: projects, memory, and artifacts live on your machine.
+      Remote deployments sit behind a token sign-in — see
+      <a href="https://github.com/Mayank-240/dev-assistant/blob/main/docs/DEPLOYMENT.md">deployment docs</a>.
+    </p>
+  </footer>
+</body>
+</html>
